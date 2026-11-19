@@ -47,17 +47,21 @@ MIN_CROP_SPAN = 32
 class _GuardedStatePublisher:
     """Recheck a camera grant after the ledger's ownership bookkeeping awaits."""
 
-    def __init__(self, mqtt: MqttClient, topic: str, allowed: Callable[[], bool]) -> None:
+    def __init__(self, mqtt: MqttClient, topic: str, render: Callable[[], str | None]) -> None:
         self._mqtt = mqtt
         self._topic = topic
-        self._allowed = allowed
+        self._render = render
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._mqtt, name)
 
     async def publish(self, topic: str, payload: str, retain: bool = False, qos: int = 0) -> None:
-        if topic != self._topic or self._allowed():
-            await self._mqtt.publish(topic, payload, retain=retain, qos=qos)
+        if topic == self._topic:
+            current = self._render()
+            if current is None:
+                return
+            payload = current
+        await self._mqtt.publish(topic, payload, retain=retain, qos=qos)
 
 
 async def retire_ambilight_topics(
@@ -577,6 +581,7 @@ class AmbilightController:
         self._auto_crop_enabled = default_auto_crop_enabled
         self._last_sample: AmbilightSample | None = None
         self._last_sample_epoch: PrivacyEpoch | None = None
+        self._published_topics: set[str] = set()
         self._poll_task: asyncio.Task[None] | None = None
         self._closed = False
         self._camera_tasks: set[asyncio.Task[Any]] = set()
@@ -686,7 +691,15 @@ class AmbilightController:
             await self._publish_state()
             self._sync_poll_task()
         except BaseException:
-            await self.shutdown()
+            try:
+                await self.shutdown()
+                if self._owned_topics is not None:
+                    await retire_ambilight_topics(self._mqtt, self._panel, self._owned_topics)
+                else:
+                    for topic in sorted(self._published_topics):
+                        await self._mqtt.publish(topic, "", retain=True)
+            except Exception:
+                logger.exception("Ambilight startup rollback failed; session must rebuild")
             raise
 
     async def shutdown(self) -> None:
@@ -904,9 +917,12 @@ class AmbilightController:
             await self._publish_state()
         elif cmd in ("crop_top", "crop_bottom", "crop_left", "crop_right"):
             try:
-                px = round(float(val))
+                margin = float(val)
             except ValueError:
                 return
+            if not math.isfinite(margin):
+                return
+            px = round(margin)
             field_name = cmd[5:]
             self._crop = replace(self._crop, **{field_name: px}).normalized()
             self._saved_crop = self._crop
@@ -931,6 +947,7 @@ class AmbilightController:
         return f"brilliant/{self._panel}/ambilight/set_{suffix}"
 
     async def _publish_retained(self, topic: str, payload: str) -> None:
+        self._published_topics.add(topic)
         if self._owned_topics is not None:
             await self._owned_topics.async_publish(self._mqtt, topic, payload)
         else:
@@ -1086,11 +1103,28 @@ class AmbilightController:
             return
         if sample is not None and self._is_blocked_by_privacy(epoch):
             return
-        c = self._crop.normalized()
-        saved = self._saved_crop.normalized()
         if sample is None:
             sample = self.last_sample
             epoch = self._last_sample_epoch
+        topic = self._state_topic()
+        self._published_topics.add(topic)
+        publisher = _GuardedStatePublisher(
+            self._mqtt, topic, lambda: self._render_state(sample, epoch)
+        )
+        if self._owned_topics is not None:
+            await self._owned_topics.async_publish(publisher, topic, "")
+        else:
+            await publisher.publish(topic, "", retain=True)
+
+    def _render_state(
+        self, sample: AmbilightSample | None, epoch: PrivacyEpoch | None
+    ) -> str | None:
+        if self._closed:
+            return None
+        c = self._crop.normalized()
+        saved = self._saved_crop.normalized()
+        if self._is_blocked_by_privacy(epoch):
+            sample = None
         s = sample or AmbilightSample(r=0, g=0, b=0, brightness=1, hex_color="#000000")
         payload = {
             "enabled": self._enabled,
@@ -1119,14 +1153,4 @@ class AmbilightController:
                 "hex_color": s.hex_color,
             },
         }
-        topic = self._state_topic()
-        publisher = _GuardedStatePublisher(
-            self._mqtt,
-            topic,
-            lambda: not self._closed and (sample is None or not self._is_blocked_by_privacy(epoch)),
-        )
-        encoded = json.dumps(payload, sort_keys=True)
-        if self._owned_topics is not None:
-            await self._owned_topics.async_publish(publisher, topic, encoded)
-        else:
-            await publisher.publish(topic, encoded, retain=True)
+        return json.dumps(payload, sort_keys=True)

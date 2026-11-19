@@ -452,8 +452,8 @@ async def _run_session(
                 )
                 await ambilight_controller.start()
             except Exception:
-                log.exception("ambilight controller startup failed; continuing without it")
-                ambilight_controller = None
+                log.exception("ambilight controller startup failed; rebuilding session")
+                raise
         else:
             await retire_ambilight_topics(mqtt, settings.panel, owned_topics)
 

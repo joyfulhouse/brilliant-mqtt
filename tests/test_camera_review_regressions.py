@@ -278,5 +278,103 @@ async def test_state_grant_rechecked_after_ledger_wait(tmp_path: Path, cached: b
     release.set()
     await work
     assert controller.last_sample is None
-    assert not any(t.endswith(("/ambilight/state", "/color")) for t, _, _ in mqtt.published)
+    states = [json.loads(p) for t, p, _ in mqtt.published if t.endswith("/ambilight/state")]
+    assert states
+    assert states[-1]["interval_s"] == (2.0 if cached else 1.0)
+    assert states[-1]["color"]["rgb_color"] == [0, 0, 0]
+    assert not any(t.endswith("/color") for t, _, _ in mqtt.published)
     await controller.shutdown()
+
+
+@pytest.mark.parametrize("failure", ["discovery", "subscription"])
+async def test_startup_rollback_retires_partial_discovery(tmp_path: Path, failure: str) -> None:
+    ledger = RetainedTopicLedger("office", tmp_path / "ledger.json")
+    await ledger.async_load()
+    unrelated = "brilliant/office/light/state"
+
+    class FailingMqtt(FakeMqtt):
+        async def publish(
+            self, topic: str, payload: str, retain: bool = False, qos: int = 0
+        ) -> None:
+            if failure == "discovery" and topic.endswith("_camera/config") and payload:
+                raise OSError("discovery failed")
+            await super().publish(topic, payload, retain=retain, qos=qos)
+
+        async def subscribe(self, topic: str) -> None:
+            if failure == "subscription":
+                raise OSError("subscription failed")
+            await super().subscribe(topic)
+
+    mqtt = FailingMqtt()
+    await ledger.async_publish(mqtt, unrelated, "ON")
+    controller = AmbilightController(mqtt, "office", HeldCamera(), owned_topics=ledger)
+    with pytest.raises(OSError, match=f"{failure} failed"):
+        await controller.start()
+    assert controller._closed
+    configs = {t for t, p, _ in mqtt.published if t.startswith("homeassistant/") and p}
+    tombstones = {t for t, p, _ in mqtt.published if not p}
+    assert configs and configs <= tombstones
+    assert ledger.topics == {unrelated}
+
+
+@pytest.mark.parametrize("value", ["inf", "-inf", "nan"])
+async def test_nonfinite_crop_command_is_ignored(value: str) -> None:
+    mqtt = FakeMqtt()
+    controller = AmbilightController(mqtt, "office", HeldCamera())
+    original = controller.crop
+    await controller.on_mqtt_command("brilliant/office/ambilight/set_crop_top", value)
+    assert controller.crop == original
+    assert not mqtt.published
+
+
+async def test_session_rebuilds_after_optional_camera_start_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = session_tests._SessionHarness(monkeypatch)
+    monkeypatch.setattr(harness.bridge_type, "is_privacy_off", lambda self: True, raising=False)
+    monkeypatch.setattr(
+        harness.bridge_type, "camera_privacy_epoch", lambda self: (1, -1, 0), raising=False
+    )
+    error = OSError("camera startup failed")
+
+    class FailedController:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        async def start(self) -> None:
+            raise error
+
+        async def shutdown(self) -> None:
+            harness.events.append("camera_shutdown")
+
+    monkeypatch.setattr(main_mod, "AmbilightController", FailedController)
+    settings = session_tests._settings()
+    object.__setattr__(settings, "ambilight_enabled", True)
+    object.__setattr__(settings, "retained_topics_file", str(tmp_path / "ledger.json"))
+    with pytest.raises(OSError) as raised:
+        await asyncio.wait_for(main_mod._run_session(settings, None, None), 1)
+    assert raised.value is error
+    assert harness.events[-3:] == ["camera_shutdown", "bus_shutdown", "mqtt_disconnect"]
+
+
+async def test_failed_retirement_preserves_primary_start_error(tmp_path: Path) -> None:
+    ledger = RetainedTopicLedger("office", tmp_path / "ledger.json")
+    await ledger.async_load()
+    original = OSError("subscription unavailable")
+
+    class FailingMqtt(FakeMqtt):
+        async def subscribe(self, topic: str) -> None:
+            raise original
+
+        async def publish(
+            self, topic: str, payload: str, retain: bool = False, qos: int = 0
+        ) -> None:
+            if topic.startswith("homeassistant/") and not payload:
+                raise OSError("broker clear failed")
+            await super().publish(topic, payload, retain=retain, qos=qos)
+
+    controller = AmbilightController(FailingMqtt(), "office", HeldCamera(), owned_topics=ledger)
+    with pytest.raises(OSError) as raised:
+        await controller.start()
+    assert raised.value is original
+    assert controller._closed
