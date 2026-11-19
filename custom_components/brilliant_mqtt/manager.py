@@ -56,6 +56,7 @@ from .const import (
     CONF_HOST,
     CONF_HOT_POLL_SECONDS,
     CONF_HUE_CA_CERT,
+    CONF_IDENTITY_FINGERPRINT,
     CONF_MESH_PRIORITY,
     CONF_PANEL,
     CONF_RESYNC_SECONDS,
@@ -279,6 +280,14 @@ class _ConnectTrace:
     # Set when a failed connect had reached SSH user authentication, so the
     # password may have been offered: never retried (lockout avoidance).
     reached_auth: bool = False
+
+
+class _CanaryOperationError(Exception):
+    """Canary refusal that keeps a stable ``code`` for the user and the log."""
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
 
 
 class _PanelConnectFailed(Exception):
@@ -1783,27 +1792,55 @@ class PanelManager:
 
         try:
             transaction = UUID(name)
-            retained = await ProvisioningJournal(self.hass).async_retained(transaction)
+            journal = ProvisioningJournal(self.hass)
+            retained = await journal.async_retained(transaction)
             if retained is None:
-                raise ValueError("baseline_missing")
+                raise _CanaryOperationError("baseline_missing")
             request = retained.record.panel_request
+            pinned_key = self.store.data.get(DATA_SSH_HOST_KEY)
+            pinned_fingerprint = self.store.data.get(CONF_IDENTITY_FINGERPRINT)
+            host = str(self.store.data[CONF_HOST])
             if (
                 request.slug != self.panel
-                or request.host != self.store.data[CONF_HOST]
-                or request.public_key != self.store.data.get(DATA_SSH_HOST_KEY)
+                or request.public_key != pinned_key
+                or request.fingerprint != pinned_fingerprint
             ):
-                raise ValueError("baseline_owner_mismatch")
+                raise _CanaryOperationError("baseline_owner_mismatch")
+            # A verified address change keeps the pin and slug. The retained
+            # capture may still name the previous host; point it at the current
+            # subentry before SSH and credential lookup.
+            if request.host != host:
+                await journal.async_adopt_verified_host(
+                    slug=self.panel,
+                    public_key=str(pinned_key),
+                    fingerprint=str(pinned_fingerprint),
+                    host=host,
+                )
+                retained = await journal.async_retained(transaction)
+                if (
+                    retained is None
+                    or retained.record.panel_request.host != host
+                    or retained.record.panel_request.slug != self.panel
+                    or retained.record.panel_request.public_key != pinned_key
+                ):
+                    raise _CanaryOperationError("baseline_owner_mismatch")
             provisioner = _get_recovery_provisioner(self.hass)
             if operation == "rollback":
                 await provisioner.async_rollback(transaction)
             elif operation == "finalize":
                 await provisioner.async_finalize(transaction)
             else:
-                raise ValueError("invalid_canary_operation")
+                raise _CanaryOperationError("invalid_canary_operation")
         except Exception as error:
             code = getattr(error, "code", "canary_operation_failed")
             if not isinstance(code, str) or re.fullmatch(r"[a-z_]{1,64}", code) is None:
                 code = "canary_operation_failed"
+            _LOGGER.error(
+                "Canary %s for panel %s failed: %s",
+                operation,
+                self.panel,
+                code,
+            )
             raise HomeAssistantError(f"{code}: see docs/canary-rollback.md") from None
 
     async def async_update_agent(
