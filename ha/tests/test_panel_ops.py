@@ -4286,6 +4286,10 @@ async def test_uninstall_restore_accepts_confirmed_absence_of_payload_and_state(
         "stop_timeout",
         "query_timeout",
         "absent",
+        "absent_without_pid_properties",
+        "absent_nonzero_query",
+        "stop_unknown_exit",
+        "absent_unknown_query",
         "stopped",
     ],
 )
@@ -4302,14 +4306,24 @@ async def test_uninstall_requires_positive_writer_quiescence_before_any_restore(
         status = status.replace("ControlPID=0", "ControlPID=42")
     elif case == "bad_load":
         status = status.replace("LoadState=loaded", "LoadState=bad-setting")
-    elif case == "absent":
+    elif case.startswith("absent"):
         status = status.replace("LoadState=loaded", "LoadState=not-found")
+        if case == "absent_without_pid_properties":
+            status = "LoadState=not-found\nActiveState=inactive\n"
     elif case == "unknown":
         status = ""
     responses = {
-        stop: RunResult(1 if case.startswith("stop_failed") or case == "absent" else 0, "", ""),
+        stop: RunResult(
+            -1
+            if case == "stop_unknown_exit"
+            else (1 if case.startswith(("stop_failed", "absent")) else 0),
+            "",
+            "",
+        ),
         panel_ops._UNINSTALL_BRIDGE_STATE_COMMAND: RunResult(
-            1 if case == "query_failed" else (-1 if case == "query_unknown_exit" else 0),
+            1
+            if case in ("query_failed", "absent_nonzero_query")
+            else (-1 if case in ("query_unknown_exit", "absent_unknown_query") else 0),
             status,
             "",
         ),
@@ -4320,7 +4334,7 @@ async def test_uninstall_requires_positive_writer_quiescence_before_any_restore(
     elif case == "query_timeout":
         errors[panel_ops._UNINSTALL_BRIDGE_STATE_COMMAND] = TimeoutError()
     shell = await _connected(FakeShell(responses=responses, run_errors=errors))
-    if case in ("absent", "stopped"):
+    if case in ("absent", "absent_without_pid_properties", "absent_nonzero_query", "stopped"):
         await panel_ops.uninstall(shell)
         assert shell.virtual_sliders_restored
         assert any(command.startswith("rm -rf") for command in shell.commands)

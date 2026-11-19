@@ -3168,19 +3168,28 @@ _UNINSTALL_BRIDGE_STATE_COMMAND = (
 
 async def _quiesce_bridge_for_uninstall(shell: PanelShell) -> None:
     stopped = await shell.run(f"systemctl disable --now {SERVICE_NAME}")
-    result = await _checked(shell, _UNINSTALL_BRIDGE_STATE_COMMAND)
+    result = await shell.run(_UNINSTALL_BRIDGE_STATE_COMMAND)
     pairs = [line.partition("=") for line in result.stdout.splitlines() if line.strip()]
     state = {key: value.strip() for key, separator, value in pairs if separator}
-    if len(pairs) != 4 or set(state) != {"LoadState", "ActiveState", "MainPID", "ControlPID"}:
+    properties = {"LoadState", "ActiveState", "MainPID", "ControlPID"}
+    if (
+        len(pairs) != len(state)
+        or not {"LoadState", "ActiveState"} <= state.keys()
+        or not state.keys() <= properties
+        or stopped.exit_status < 0
+        or result.exit_status < 0
+    ):
         raise PanelOpError("slider_recovery_writer_state_unknown")
     absent = state["LoadState"] == "not-found" and state["ActiveState"] == "inactive"
-    if not absent and stopped.exit_status != 0:
+    if not absent and (stopped.exit_status != 0 or result.exit_status != 0):
         raise PanelOpError("slider_recovery_stop_failed")
+    if not absent and state.keys() != properties:
+        raise PanelOpError("slider_recovery_writer_state_unknown")
     if (
         state["LoadState"] not in {"loaded", "masked", "not-found"}
         or state["ActiveState"] != "inactive"
-        or state["MainPID"] != "0"
-        or state["ControlPID"] != "0"
+        or state.get("MainPID", "0") != "0"
+        or state.get("ControlPID", "0") != "0"
         or (state["LoadState"] == "not-found" and not absent)
     ):
         raise PanelOpError("slider_recovery_writer_not_quiescent")
