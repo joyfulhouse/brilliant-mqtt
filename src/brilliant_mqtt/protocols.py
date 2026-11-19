@@ -10,7 +10,8 @@ No panel imports, no MQTT library imports: pure stdlib + project types.
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from typing import Protocol
+from dataclasses import dataclass
+from typing import Any, Protocol
 
 from brilliant_mqtt.commands import VarSet
 from brilliant_mqtt.model import BrilliantDevice
@@ -169,4 +170,31 @@ class MqttClient(Protocol):
         Needed by the mesh leader's step-down: a panel that loses the mesh
         leader election must stop consuming the mesh command topics.
         """
+        ...
+
+
+@dataclass(frozen=True)
+class VirtualPeripheralSpec:
+    """Specification for a local virtual peripheral hosted on the panel bus."""
+
+    peripheral_id: str
+    display_name: str
+    peripheral_type: int
+    initial_variables: dict[str, Any]
+    settable_variables: frozenset[str]
+
+
+class VirtualPeripheralHostProtocol(Protocol):
+    """Protocol for hosting a local virtual peripheral on the panel's Thrift bus."""
+
+    async def start(self) -> None:
+        """Register and start hosting the virtual peripheral on the local bus."""
+        ...
+
+    async def set_variable(self, name: str, value: Any) -> None:
+        """Update a variable on the hosted peripheral without firing command callbacks."""
+        ...
+
+    async def shutdown(self) -> None:
+        """Delete and stop hosting the virtual peripheral cleanly."""
         ...
