@@ -2671,11 +2671,15 @@ async def test_install_journal_disk_failure_keeps_captured_baseline_recoverable(
     monkeypatch.setattr(harness, "journal", journal)
     finalize = AsyncMock()
     stage = AsyncMock()
+    capture = AsyncMock(wraps=harness.operations.capture_baseline)
+    harness.ids = iter((_TRANSACTION_ID, _SETUP_ID, _OTHER_TRANSACTION_ID, _SETUP_ID))
     monkeypatch.setattr(harness.operations, "finalize_baseline", finalize)
     monkeypatch.setattr(harness.operations, "stage_release", stage)
+    monkeypatch.setattr(harness.operations, "capture_baseline", capture)
+    provisioner = harness.provisioner()
 
     with pytest.raises(PanelProvisioningError) as raised:
-        await harness.provisioner().async_install(_request(), _fleet(), harness.progress)
+        await provisioner.async_install(_request(), _fleet(), harness.progress)
 
     assert raised.value.code == "journal_failed"
     restarted = ProvisioningJournal(hass)
@@ -2685,6 +2689,73 @@ async def test_install_journal_disk_failure_keeps_captured_baseline_recoverable(
     assert retained.record.prior_snapshot.baseline == harness.operations.snapshot.baseline
     finalize.assert_not_awaited()
     stage.assert_not_awaited()
+    monkeypatch.setattr(Store, "_async_write_data", original_write)
+    with pytest.raises(PanelProvisioningError, match="baseline_retained_finalize_first"):
+        await provisioner.async_install(_request(), _fleet(), harness.progress)
+    assert capture.await_count == 1
+    assert await restarted.async_retained_records() == (retained,)
+    monkeypatch.setattr(provisioner, "_retained_owner_exists", AsyncMock(return_value=False))
+    await provisioner.async_discard_unactivated_ownerless_baseline(
+        retained, _request().host, _request().root_password, HostIdentity(_PUBLIC_KEY, _FINGERPRINT)
+    )
+    assert await restarted.async_retained_records() == ()
+    assert finalize.await_count == 1
+
+
+async def test_ownerless_discard_marker_does_not_block_another_panels_recovery(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from tests.test_config_flow import _OTHER_FINGERPRINT, _OTHER_PUBLIC_KEY
+    from tests.test_provisioning_journal import _install_real_store
+
+    _install_real_store(hass, monkeypatch, tmp_path)
+    journal = ProvisioningJournal(hass)
+    first = _record(ProvisioningPhase.STAGED)
+    await journal.async_create(first)
+    await journal.async_complete_cleanup(first.transaction_id)
+    retained = await journal.async_retained(first.transaction_id)
+    assert retained is not None
+    marked = await journal.async_begin_ownerless_unactivated_discard(retained)
+    other = replace(
+        first,
+        transaction_id=_OTHER_TRANSACTION_ID,
+        operation=ProvisioningOperation.UPDATE,
+        panel_request=replace(
+            first.panel_request,
+            host="second.local",
+            slug="second",
+            public_key=_OTHER_PUBLIC_KEY,
+            fingerprint=_OTHER_FINGERPRINT,
+        ),
+    )
+    await journal.async_create(other)
+    harness = _Harness()
+    monkeypatch.setattr(harness, "journal", journal)
+    provisioner = harness.provisioner()
+    resolver = AsyncMock(side_effect=AssertionError("ownerless marker needs fresh authority"))
+    monkeypatch.setattr(provisioner, "_credential_resolver", resolver)
+    recovered: list[ProvisioningRecord] = []
+
+    async def recover(record: ProvisioningRecord, _progress: object) -> None:
+        recovered.append(record)
+        await journal.async_complete_cleanup(record.transaction_id)
+
+    monkeypatch.setattr(provisioner, "_async_recover_record", recover)
+    await provisioner.async_recover()
+    assert recovered == [other]
+    assert await journal.async_load() is None
+    assert await journal.async_retained(first.transaction_id) == marked
+    resolver.assert_not_awaited()
+    monkeypatch.setattr(provisioner, "_retained_owner_exists", AsyncMock(return_value=False))
+    await provisioner.async_discard_unactivated_ownerless_baseline(
+        marked, _request().host, _request().root_password, HostIdentity(_PUBLIC_KEY, _FINGERPRINT)
+    )
+    assert await journal.async_retained(first.transaction_id) is None
+    assert await journal.async_retained(other.transaction_id) is not None
 
 
 @pytest.mark.parametrize("journal_write_fails", (False, True))

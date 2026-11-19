@@ -1232,6 +1232,12 @@ class PanelProvisioner:
             raise PanelProvisioningError("inspection_failed")
         if await self._duplicate_fingerprint(identity.fingerprint):
             raise PanelProvisioningError("duplicate_panel")
+        # A retry must discover the first capture before publishing another one.
+        if any(
+            item.record.panel_request.fingerprint == identity.fingerprint
+            for item in await self._journal.async_retained_records()
+        ):
+            raise PanelProvisioningError("baseline_retained_finalize_first")
 
         state.transaction_id = self._next_id()
         state.setup_id = self._next_id()
@@ -1713,10 +1719,14 @@ class PanelProvisioner:
         progress: ProgressReporter,
     ) -> None:
         await _report(progress, ProvisioningProgressStage.RECOVERING)
+        ownerless_pending = False
         for retained in await self._journal.async_retained_records():
             if retained.state == "finalizing":
-                if retained.finalization_origin == "ownerless_restored":
-                    raise PanelProvisioningError("ownerless_finalize_reauthentication_required")
+                if retained.finalization_origin in {"ownerless_restored", "ownerless_unactivated"}:
+                    # These markers need fresh flow authority. They must not
+                    # consume credentials or obstruct another panel's journal.
+                    ownerless_pending = True
+                    continue
                 await self._async_finalize(retained)
             elif retained.state == "restore_requested":
                 password = retained.compensation_password(await self._journal.async_load())
@@ -1726,6 +1736,8 @@ class PanelProvisioner:
         record = await self._journal.async_load()
         if record is not None:
             await self._async_recover_record(record, progress)
+        elif ownerless_pending:
+            raise PanelProvisioningError("ownerless_finalize_reauthentication_required")
 
     async def _async_recover_record(
         self,
