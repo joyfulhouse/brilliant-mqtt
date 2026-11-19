@@ -25,6 +25,7 @@ from custom_components.brilliant_mqtt.provisioning_journal import (
     ProvisioningOperation,
     ProvisioningPhase,
     ProvisioningRecord,
+    StorageFailure,
     StoredFileSnapshot,
     StoredFleetProfile,
     StoredJournalError,
@@ -36,6 +37,7 @@ from custom_components.brilliant_mqtt.provisioning_journal import (
 from custom_components.brilliant_mqtt.provisioning_journal import (
     Store as DurableProvisioningStore,
 )
+from custom_components.brilliant_mqtt.release_identity import RollbackBaseline
 
 _PUBLIC_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKIykuTed7zNwJwn20eCelcKcHKJ9c/pGFfvulRWazuC"
 _FINGERPRINT = "SHA256:JfCon51dCgE/yWGkyroh3Ne+ONLMm6QmHMQnEoPSLx0"
@@ -789,7 +791,9 @@ async def test_store_normal_return_without_durable_save_fails_closed(
 
     assert raised.value.code == "journal_save_failed"
     assert raised.value.__context__ is None
-    assert raised.value.__cause__ is None
+    assert isinstance(raised.value.__cause__, StorageFailure)
+    assert raised.value.reason is not None
+    assert "read-back" in raised.value.reason
 
 
 async def test_cancelled_save_settles_and_verifies_before_releasing_lock(
@@ -901,9 +905,14 @@ async def test_store_failures_do_not_retain_secret_exception_objects(
     hass: HomeAssistant,
     memory_store: _MemoryStore,
     boundary: str,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     journal = _journal(hass, memory_store)
-    secret_error = OSError(f"{boundary}-{_ROOT_PASSWORD}")
+    caplog.set_level("ERROR")
+    secret_error = OSError(
+        f"{boundary}-{_ROOT_PASSWORD} at {_record().panel_request.host} "
+        f"{_FINGERPRINT} {_PUBLIC_KEY}"
+    )
     if boundary == "load":
         memory_store.load_error = secret_error
         operation = journal.async_load()
@@ -918,9 +927,24 @@ async def test_store_failures_do_not_retain_secret_exception_objects(
 
     assert raised.value.code == expected_code
     assert raised.value.__context__ is None
-    assert raised.value.__cause__ is None
     assert _ROOT_PASSWORD not in str(raised.value)
     assert _ROOT_PASSWORD not in repr(raised.value)
+    if boundary == "load":
+        assert raised.value.__cause__ is None
+    else:
+        assert isinstance(raised.value.__cause__, OSError)
+        assert raised.value.reason is not None
+        assert "OSError" in raised.value.reason
+        for secret in (_ROOT_PASSWORD, "office.iot.example", _FINGERPRINT, _PUBLIC_KEY):
+            assert secret not in raised.value.reason
+            assert secret not in str(raised.value.__cause__)
+            assert secret not in repr(raised.value.__cause__)
+            assert secret not in caplog.text
+        assert "Traceback" in caplog.text
+        assert "Provisioning journal storage failed (OSError)" in caplog.text
+        diagnostics = await journal.async_diagnostics()
+        assert diagnostics["storage_error"] == raised.value.reason
+        assert _ROOT_PASSWORD not in json.dumps(diagnostics)
 
 
 async def test_unexpected_parser_failure_does_not_retain_secret_exception_object(
@@ -1330,3 +1354,180 @@ async def test_diagnostics_do_not_publish_arbitrary_error_tokens(
         "stage": "unknown",
         "code": "unknown",
     }
+
+
+def _baselined_record() -> ProvisioningRecord:
+    return replace(
+        _record(),
+        prior_snapshot=replace(
+            _record().prior_snapshot,
+            baseline=RollbackBaseline("c" * 32, "d" * 64, {}),
+        ),
+    )
+
+
+def _install_real_store(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Persist the production Store envelope so read-back uses the real loader."""
+    from homeassistant.helpers import json as json_util
+
+    hass.config.config_dir = str(tmp_path)
+
+    async def write(store: DurableProvisioningStore, data: dict[str, object]) -> None:
+        if getattr(store, "fail_write", False):
+            raise OSError("disk")
+
+        def persist() -> None:
+            Path(store.path).parent.mkdir(parents=True, exist_ok=True)
+            json_util.save_json(store.path, data, private=True, atomic_writes=True)
+
+        await hass.async_add_executor_job(persist)
+
+    async def remove(store: DurableProvisioningStore) -> None:
+        await hass.async_add_executor_job(Path(store.path).unlink, True)
+
+    monkeypatch.setattr(DurableProvisioningStore, "_async_write_data", write)
+    monkeypatch.setattr(DurableProvisioningStore, "async_remove", remove)
+
+
+async def test_create_with_baseline_persists_journal_and_armed_retained(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _install_real_store(hass, monkeypatch, tmp_path)
+    journal = ProvisioningJournal(hass)
+
+    created = await journal.async_create(_baselined_record())
+
+    assert created == _baselined_record()
+    assert await journal.async_load() == _baselined_record()
+    retained = await journal.async_retained(_TRANSACTION_ID)
+    assert retained is not None
+    assert retained.state == "armed"
+    assert retained.recovery_deployment_id is None
+    assert _ROOT_PASSWORD not in json.dumps(retained._to_storage())
+
+
+async def test_journal_payload_differs_from_retained_only_by_the_root_password(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The active journal is the retained record plus the panel root password.
+
+    Both writes use the same Store path. A content failure that hits only the
+    journal has to be that password; a normal password persists in both files.
+    """
+    _install_real_store(hass, monkeypatch, tmp_path)
+    journal = ProvisioningJournal(hass)
+    record = replace(
+        _baselined_record(),
+        panel_request=replace(
+            _baselined_record().panel_request,
+            root_password="p@ss/word \u00e9",
+        ),
+    )
+
+    await journal.async_create(record)
+
+    def read_storage(name: str) -> dict[str, Any]:
+        loaded = json.loads(Path(hass.config.path(".storage", name)).read_text(encoding="utf-8"))
+        assert isinstance(loaded, dict)
+        return loaded
+
+    journal_file = await hass.async_add_executor_job(read_storage, JOURNAL_STORAGE_KEY)
+    retained_file = await hass.async_add_executor_job(
+        read_storage, JOURNAL_STORAGE_KEY + ".retained"
+    )
+    stored = journal_file["data"]["record"]
+    retained_record = next(iter(retained_file["data"]["records"].values()))["record"]
+    assert stored["panel_request"]["root_password"] == "p@ss/word \u00e9"
+    without_password = copy.deepcopy(stored)
+    del without_password["panel_request"]["root_password"]
+    assert without_password == retained_record
+
+
+async def test_journal_save_failure_after_arm_leaves_no_ownerless_baseline(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _install_real_store(hass, monkeypatch, tmp_path)
+    journal = ProvisioningJournal(hass)
+    original_write = DurableProvisioningStore._async_write_data
+
+    async def fail_journal_only(
+        store: DurableProvisioningStore,
+        data: dict[str, object],
+    ) -> None:
+        if store.key == JOURNAL_STORAGE_KEY:
+            raise OSError(f"disk-{_ROOT_PASSWORD}")
+        await original_write(store, data)
+
+    monkeypatch.setattr(DurableProvisioningStore, "_async_write_data", fail_journal_only)
+
+    with pytest.raises(ProvisioningJournalError) as raised:
+        await journal.async_create(_baselined_record())
+
+    assert raised.value.code == "journal_save_failed"
+    assert raised.value.__context__ is None
+    assert isinstance(raised.value.__cause__, OSError)
+    assert raised.value.reason is not None
+    assert _ROOT_PASSWORD not in str(raised.value.__cause__)
+    assert _ROOT_PASSWORD not in str(raised.value)
+    assert await journal.async_load() is None
+    assert await journal.async_retained_records() == ()
+
+
+async def test_unroundtrippable_journal_never_writes_an_armed_baseline(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _install_real_store(hass, monkeypatch, tmp_path)
+    journal = ProvisioningJournal(hass)
+
+    def refuse(payload: object) -> bytes:
+        del payload
+        raise TypeError(f"not-json-{_ROOT_PASSWORD}")
+
+    monkeypatch.setattr(
+        "custom_components.brilliant_mqtt.provisioning_journal.json_bytes",
+        refuse,
+    )
+
+    with pytest.raises(ProvisioningJournalError) as raised:
+        await journal.async_create(_baselined_record())
+
+    assert raised.value.code == "journal_save_failed"
+    assert raised.value.__context__ is None
+    assert _ROOT_PASSWORD not in str(raised.value)
+    assert await journal.async_load() is None
+    assert await journal.async_retained_records() == ()
+
+
+async def test_tuple_in_journal_payload_does_not_arm_a_baseline(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _install_real_store(hass, monkeypatch, tmp_path)
+    journal = ProvisioningJournal(hass)
+    original = ProvisioningRecord._to_storage
+
+    def with_tuple(self: ProvisioningRecord) -> dict[str, object]:
+        payload = original(self)
+        payload["not_round_trippable"] = ("bridge",)
+        return payload
+
+    monkeypatch.setattr(ProvisioningRecord, "_to_storage", with_tuple)
+
+    with pytest.raises(ProvisioningJournalError) as raised:
+        await journal.async_create(_baselined_record())
+
+    assert raised.value.code == "journal_save_failed"
+    assert await journal.async_retained_records() == ()

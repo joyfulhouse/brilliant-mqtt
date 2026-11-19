@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import logging
 import re
 from collections.abc import Coroutine, Mapping
 from dataclasses import dataclass, field, replace
@@ -14,8 +15,10 @@ from typing import Any, Self
 from uuid import RFC_4122, UUID
 
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.json import json_bytes
 from homeassistant.helpers.storage import Store as HomeAssistantStore
 from homeassistant.util import json as json_util
+from homeassistant.util.json import json_loads
 
 from .broker import BrokerKind
 from .release_identity import RollbackBaseline
@@ -26,6 +29,7 @@ JOURNAL_STORAGE_KEY = "brilliant_mqtt.provisioning"
 _JOURNAL_COORDINATOR_KEY = "brilliant_mqtt.provisioning_journal.coordinator"
 _STORE_LOAD_TIMEOUT_SECONDS = 30.0
 _MISSING = object()
+_LOGGER = logging.getLogger(__name__)
 
 _MAX_SECRET_BYTES = 16 * 1024
 _MAX_FILE_BYTES = 1024 * 1024
@@ -138,6 +142,7 @@ PROVISIONING_ERROR_CODES = frozenset(
         "identity_failed",
         "panel_identity_mismatch",
         "ownerless_recovery_unavailable",
+        "unactivated_baseline_not_proven",
         "ownerless_finalize_reauthentication_required",
         "inspection_failed",
         "invalid_panel_install_request",
@@ -206,18 +211,126 @@ _JOURNAL_ERROR_CODES = frozenset(
 
 
 class ProvisioningJournalError(ValueError):
-    """One stable error code which never retains persisted data or an exception."""
+    """One stable error code. A storage failure may chain a redacted cause."""
 
-    __slots__ = ("code",)
+    __slots__ = ("code", "reason")
 
-    def __init__(self, code: str) -> None:
+    def __init__(self, code: str, *, reason: str | None = None) -> None:
         if code not in _JOURNAL_ERROR_CODES:
             raise ValueError("invalid_provisioning_journal_error_code")
         self.code = code
+        self.reason = _bounded_storage_reason(reason)
         super().__init__(code)
 
     def __repr__(self) -> str:
-        return f"ProvisioningJournalError({self.code!r})"
+        if self.reason is None:
+            return f"ProvisioningJournalError({self.code!r})"
+        return f"ProvisioningJournalError({self.code!r}, reason={self.reason!r})"
+
+
+class StorageFailure(Exception):
+    """Redacted storage failure that is safe to chain and to log."""
+
+
+_FINGERPRINT_TEXT = re.compile(r"SHA256:[A-Za-z0-9+/]{8,}={0,2}")
+_SSH_KEY_TEXT = re.compile(r"ssh-(?:ed25519|rsa|dss|ecdsa)\s+\S+")
+_IPV4_TEXT = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+
+
+def _bounded_storage_reason(reason: str | None) -> str | None:
+    if reason is None:
+        return None
+    if not isinstance(reason, str):
+        return None
+    cleaned = "".join(char if char.isprintable() else " " for char in reason)
+    cleaned = " ".join(cleaned.split())
+    if not cleaned:
+        return None
+    return cleaned[:180]
+
+
+def _exception_text(err: BaseException) -> str:
+    try:
+        text = str(err)
+    except Exception:
+        text = ""
+    if not text:
+        return type(err).__name__
+    return text
+
+
+def _redact_text(text: str, secrets: tuple[str, ...]) -> str:
+    redacted = text
+    for secret in sorted((item for item in secrets if item), key=len, reverse=True):
+        redacted = redacted.replace(secret, "[redacted]")
+    redacted = _FINGERPRINT_TEXT.sub("[redacted]", redacted)
+    redacted = _SSH_KEY_TEXT.sub("[redacted]", redacted)
+    redacted = _IPV4_TEXT.sub("[redacted]", redacted)
+    return redacted
+
+
+def _storage_secrets(record: ProvisioningRecord) -> tuple[str, ...]:
+    found = [
+        record.panel_request.root_password,
+        record.panel_request.host,
+        record.panel_request.public_key,
+        record.panel_request.fingerprint,
+        record.fleet_profile.host,
+    ]
+    snapshot = record.prior_snapshot
+    for blob in (
+        snapshot.environment_file.content,
+        snapshot.version_file.content,
+        snapshot.bridge_service.unit_file.content,
+        snapshot.wifi_watchdog_service.unit_file.content,
+        snapshot.bus_watchdog_service.unit_file.content,
+    ):
+        if isinstance(blob, bytes) and blob:
+            found.append(blob.decode("utf-8", "replace"))
+    return tuple(item for item in found if isinstance(item, str) and item)
+
+
+def _redacted_exception(err: BaseException, secrets: tuple[str, ...]) -> BaseException:
+    message = _redact_text(_exception_text(err), secrets)
+    prefix = f"{type(err).__name__}:"
+    if type(err) is StorageFailure or message.startswith(prefix):
+        summary = message
+    else:
+        summary = f"{prefix} {message}"
+    summary = _bounded_storage_reason(summary) or type(err).__name__
+    try:
+        redacted: BaseException = type(err)(summary)
+    except Exception:
+        redacted = StorageFailure(summary)
+    else:
+        if any(secret and secret in f"{redacted}" for secret in secrets):
+            redacted = StorageFailure(_redact_text(summary, secrets))
+    redacted.__traceback__ = err.__traceback__
+    return redacted
+
+
+def _raise_storage_failure(
+    coordinator: _JournalCoordinator,
+    err: BaseException,
+    secrets: tuple[str, ...],
+    *,
+    store: str,
+) -> None:
+    """Log one redacted storage failure and raise it as journal_save_failed."""
+    redacted = _redacted_exception(err, secrets)
+    rendered = _bounded_storage_reason(_redact_text(f"{redacted}", secrets)) or type(err).__name__
+    _LOGGER.error(
+        "Provisioning %s storage failed (%s): %s",
+        store,
+        type(err).__name__,
+        rendered,
+        exc_info=(type(redacted), redacted, redacted.__traceback__),
+    )
+    coordinator.last_storage_error = rendered
+    error = ProvisioningJournalError("journal_save_failed", reason=rendered)
+    error.__cause__ = redacted
+    error.__suppress_context__ = True
+    raise error
 
 
 class ProvisioningOperation(StrEnum):
@@ -321,7 +434,37 @@ def _safe_ascii_text(value: object, *, maximum_bytes: int) -> str:
 
 
 def _secret_text(value: object) -> str:
-    return _utf8_text(value, maximum_bytes=_MAX_SECRET_BYTES)
+    text = _utf8_text(value, maximum_bytes=_MAX_SECRET_BYTES)
+    # Storage equality is against JSON's exact str. A str subclass can survive
+    # validation and then fail, or disagree with, the HA JSON encoder.
+    if type(text) is str:
+        return text
+    return str(text)
+
+
+def _require_storage_round_trip(
+    payload: Mapping[str, object],
+    coordinator: _JournalCoordinator,
+    secrets: tuple[str, ...],
+    *,
+    store: str,
+) -> None:
+    """Refuse a payload Home Assistant cannot write and read back unchanged.
+
+    The disk check compares the loaded object with the original dict. A tuple,
+    mapping proxy, or other encoder conversion would arm a baseline and then
+    fail that check, so reject it before any write.
+    """
+    caught: BaseException | None = None
+    decoded: object = _MISSING
+    try:
+        decoded = json_loads(json_bytes(payload))
+    except (TypeError, ValueError) as err:
+        caught = err
+    if caught is not None or decoded is _MISSING or decoded != payload:
+        if caught is None:
+            caught = StorageFailure("json round-trip mismatch")
+        _raise_storage_failure(coordinator, caught, secrets, store=store)
 
 
 def _string(value: object) -> str:
@@ -866,6 +1009,7 @@ class _JournalCoordinator:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     loaded: bool = False
     record: ProvisioningRecord | None = None
+    last_storage_error: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -937,9 +1081,16 @@ class RetainedRollback:
         if self.state not in _RETAINED_STATES or self.record.prior_snapshot.baseline is None:
             raise _invalid()
         if self.finalization_origin is not None and (
-            self.finalization_origin != "ownerless_restored"
-            or self.state != "finalizing"
-            or not self.ownerless_finalization_allowed
+            self.state != "finalizing"
+            or self.finalization_origin not in {"ownerless_restored", "ownerless_unactivated"}
+            or (
+                self.finalization_origin == "ownerless_restored"
+                and not self.ownerless_finalization_allowed
+            )
+            or (
+                self.finalization_origin == "ownerless_unactivated"
+                and not self.unactivated_discard_shape
+            )
         ):
             raise _invalid()
         if (
@@ -965,6 +1116,25 @@ class RetainedRollback:
 
     def __repr__(self) -> str:
         return "RetainedRollback(<redacted>)"
+
+    @property
+    def unactivated_discard_shape(self) -> bool:
+        """Onboarding captured a baseline and never left the pre-activation phase."""
+        return (
+            self.record.operation in {ProvisioningOperation.INSTALL, ProvisioningOperation.UPGRADE}
+            and self.record.phase is ProvisioningPhase.STAGED
+            and self.record.prior_snapshot.baseline is not None
+            and self.recovery_deployment_id is None
+        )
+
+    @property
+    def ownerless_unactivated_discard_allowed(self) -> bool:
+        """An armed pre-activation baseline, or cleanup already marked for it."""
+        if not self.unactivated_discard_shape:
+            return False
+        if self.state == "armed" and self.finalization_origin is None:
+            return True
+        return self.state == "finalizing" and self.finalization_origin == "ownerless_unactivated"
 
     @property
     def ownerless_finalization_allowed(self) -> bool:
@@ -1148,9 +1318,29 @@ class ProvisioningJournal:
             await self._async_reload()
             if self._coordinator.record is not None:
                 raise ProvisioningJournalError("journal_transaction_in_progress")
+            # Prove the active journal can round-trip before any retained arm.
+            # A later disk failure still rolls that arm back.
+            _require_storage_round_trip(
+                {"record": record._to_storage()},
+                self._coordinator,
+                _storage_secrets(record),
+                store="journal",
+            )
+            armed_here = False
             if record.prior_snapshot.baseline is not None:
-                await self._async_arm(record)
-            await self._async_save(record)
+                armed_here = await self._async_arm(record)
+            error: BaseException | None = None
+            try:
+                await self._async_save(record)
+            except BaseException as caught:
+                error = caught
+            if error is not None and armed_here and self._coordinator.record is None:
+                try:
+                    await self._async_rollback_unproven_arm(record)
+                except BaseException:
+                    _LOGGER.debug("provisioning arm rollback failed after journal_save_failed")
+            if error is not None:
+                raise error
             return record
 
     async def _async_retained_load(self) -> dict[str, RetainedRollback]:
@@ -1175,21 +1365,31 @@ class ProvisioningJournal:
             raise ProvisioningJournalError("journal_load_failed")
         return result
 
-    async def _async_retained_save(self, records: dict[str, RetainedRollback]) -> None:
+    async def _async_retained_save(
+        self,
+        records: dict[str, RetainedRollback],
+        *,
+        secrets: tuple[str, ...] = (),
+    ) -> None:
         payload = {"records": {key: record._to_storage() for key, record in records.items()}}
+        known = secrets + tuple(
+            secret for record in records.values() for secret in _storage_secrets(record.record)
+        )
+        _require_storage_round_trip(payload, self._coordinator, known, store="retained")
         outcome = await _async_settle_storage(
             self._hass, self._retained_storage().async_save(payload)
         )
         verified = await _async_settle_storage(self._hass, self._retained_storage().async_load())
-        failed = (
-            outcome.error is not None or verified.error is not None or verified.result != payload
-        )
+        failure = outcome.error if outcome.error is not None else verified.error
+        mismatch = verified.error is None and verified.result != payload
         cancellation = outcome.cancellation or verified.cancellation
         del outcome, verified, payload
         if cancellation is not None:
             raise cancellation from None
-        if failed:
-            raise ProvisioningJournalError("journal_save_failed")
+        if failure is not None or mismatch:
+            if failure is None:
+                failure = StorageFailure("read-back did not match the written retained record")
+            _raise_storage_failure(self._coordinator, failure, known, store="retained")
 
     def _retained_storage(self) -> Store:
         if self._retained_store is None:
@@ -1198,20 +1398,59 @@ class ProvisioningJournal:
             )
         return self._retained_store
 
-    async def _async_arm(self, record: ProvisioningRecord) -> None:
+    async def _async_arm(self, record: ProvisioningRecord) -> bool:
+        """Persist a new armed baseline. Return whether this call inserted it."""
         records = await self._async_retained_load()
         key = str(record.transaction_id)
         proposed = RetainedRollback(record)
         if key in records:
             if records[key].record != proposed.record:
                 raise ProvisioningJournalError("journal_transaction_mismatch")
-            return
+            return False
         if any(
             item.record.panel_request.fingerprint == record.panel_request.fingerprint
             for item in records.values()
         ):
             raise ProvisioningJournalError("journal_transaction_in_progress")
         records[key] = proposed
+        try:
+            await self._async_retained_save(records, secrets=_storage_secrets(record))
+        except BaseException:
+            try:
+                await self._async_drop_exact_armed(record)
+            except BaseException:
+                _LOGGER.debug("provisioning arm cleanup failed after retained save error")
+            raise
+        return True
+
+    async def _async_rollback_unproven_arm(self, record: ProvisioningRecord) -> None:
+        """Drop an arm created for a journal save that did not become durable.
+
+        If the journal file itself landed but did not verify, remove it first.
+        Keep the baseline when that journal file cannot be cleared: the pair is
+        then the existing interrupted-onboarding recovery, not an ownerless arm.
+        """
+        if self._coordinator.record is not None:
+            return
+        await self._async_remove()
+        if self._coordinator.record is not None:
+            return
+        await self._async_drop_exact_armed(record)
+
+    async def _async_drop_exact_armed(self, record: ProvisioningRecord) -> None:
+        records = await self._async_retained_load()
+        key = str(record.transaction_id)
+        current = records.get(key)
+        proposed = RetainedRollback(record)
+        if (
+            current is None
+            or current != proposed
+            or current.state != "armed"
+            or current.recovery_deployment_id is not None
+            or current.finalization_origin is not None
+        ):
+            return
+        del records[key]
         await self._async_retained_save(records)
 
     async def async_arm(self, record: ProvisioningRecord) -> None:
@@ -1241,6 +1480,32 @@ class ProvisioningJournal:
             ):
                 raise ProvisioningJournalError("invalid_journal_transition")
             marked = replace(current, state="finalizing", finalization_origin="ownerless_restored")
+            records[key] = marked
+            await self._async_retained_save(records)
+            return marked
+
+    async def async_begin_ownerless_unactivated_discard(
+        self, expected: RetainedRollback
+    ) -> RetainedRollback:
+        """Mark fresh intent to drop one exact armed, pre-activation baseline."""
+        async with self._coordinator.lock:
+            await self._async_reload()
+            records = await self._async_retained_load()
+            key = str(expected.record.transaction_id)
+            current = records.get(key)
+            if (
+                self._coordinator.record is not None
+                or current is None
+                or current != expected
+                or current.state != "armed"
+                or not current.ownerless_unactivated_discard_allowed
+            ):
+                raise ProvisioningJournalError("invalid_journal_transition")
+            marked = replace(
+                current,
+                state="finalizing",
+                finalization_origin="ownerless_unactivated",
+            )
             records[key] = marked
             await self._async_retained_save(records)
             return marked
@@ -1444,6 +1709,8 @@ class ProvisioningJournal:
             "count": 0 if record is None else 1,
             "phase": None if record is None else record.phase.value,
         }
+        if self._coordinator.last_storage_error is not None:
+            output["storage_error"] = self._coordinator.last_storage_error
         if record is not None:
             error = record.last_error
             output.update(
@@ -1506,29 +1773,37 @@ class ProvisioningJournal:
 
     async def _async_save(self, record: ProvisioningRecord) -> None:
         payload = {"record": record._to_storage()}
+        secrets = _storage_secrets(record)
+        _require_storage_round_trip(payload, self._coordinator, secrets, store="journal")
         save_outcome = await _async_settle_storage(
             self._hass,
             self._store.async_save(payload),
         )
         cancellation = save_outcome.cancellation
-        save_failed = save_outcome.error is not None
+        failure = save_outcome.error
         del save_outcome
-        verification_failed = True
-        if not save_failed:
+        mismatch = False
+        if failure is None:
             verification = await _async_settle_storage(
                 self._hass,
                 self._store.async_load(),
             )
             if cancellation is None:
                 cancellation = verification.cancellation
-            verification_failed = verification.error is not None or verification.result != payload
+            if verification.error is not None:
+                failure = verification.error
+            elif verification.result != payload:
+                mismatch = True
             del verification
-        if save_failed or verification_failed:
+        if failure is not None or mismatch:
             if cancellation is not None:
                 raise cancellation from None
-            raise ProvisioningJournalError("journal_save_failed")
+            if failure is None:
+                failure = StorageFailure("read-back did not match the written provisioning journal")
+            _raise_storage_failure(self._coordinator, failure, secrets, store="journal")
         self._coordinator.record = record
         self._coordinator.loaded = True
+        self._coordinator.last_storage_error = None
         if cancellation is not None:
             raise cancellation from None
 
