@@ -656,7 +656,7 @@ class _ShellOperations:
             timeout=_OPERATION_TIMEOUT,
         )
         return RunResult(
-            exit_status=result.exit_status or 0,
+            exit_status=result.exit_status if result.exit_status is not None else -1,
             stdout=str(result.stdout or ""),
             stderr=str(result.stderr or ""),
         )

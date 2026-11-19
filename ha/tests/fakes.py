@@ -169,7 +169,15 @@ class FakeShell:
         self.commands.append(command)  # recorded even when it raises: proves it was attempted
         if command in self.run_errors:
             raise self.run_errors[command]
-        return self.responses.get(command, _OK)
+        default = _OK
+        if command == (
+            "systemctl show brilliant-mqtt --property=LoadState --property=ActiveState "
+            "--property=MainPID --property=ControlPID"
+        ):
+            default = RunResult(
+                0, "LoadState=loaded\nActiveState=inactive\nMainPID=0\nControlPID=0\n", ""
+            )
+        return self.responses.get(command, default)
 
     async def start(self, command: str) -> PanelProcess:
         self._require_connected()
