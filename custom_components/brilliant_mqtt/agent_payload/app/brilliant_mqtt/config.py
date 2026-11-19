@@ -15,6 +15,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 from brilliant_mqtt.ha_control_protocol import is_panel_slug
+from brilliant_mqtt.virtual_sliders import parse_virtual_slider_specs
 
 # Recognized spellings for boolean env vars. Anything else raises ValueError at
 # startup — an operator writing "false" must never silently get "enabled".
@@ -122,6 +123,8 @@ class Settings:
 
     # Exit the process after this many consecutive unresolved-close fences.
     bus_fenced_start_limit: int = 3
+    # JSON list of VirtualSliderSpec definitions (empty disables virtual sliders).
+    virtual_sliders_json: str = ""
 
     def __post_init__(self) -> None:
         if (
@@ -263,6 +266,12 @@ class Settings:
             raise ValueError(
                 "MOTION_DEFAULT_LOW_THRESHOLD must be <= MOTION_DEFAULT_HIGH_THRESHOLD"
             )
+        virtual_sliders_json = env.get("VIRTUAL_SLIDERS_JSON", "")
+        if virtual_sliders_json.strip():
+            try:
+                parse_virtual_slider_specs(virtual_sliders_json)
+            except Exception as error:
+                raise ValueError(f"Invalid VIRTUAL_SLIDERS_JSON: {error}") from error
 
         return cls(
             panel=panel,
@@ -297,4 +306,5 @@ class Settings:
             motion_native_passthrough=motion_native_passthrough,
             motion_default_high_threshold=motion_default_high_threshold,
             motion_default_low_threshold=motion_default_low_threshold,
+            virtual_sliders_json=virtual_sliders_json,
         )
