@@ -2647,20 +2647,83 @@ async def _unused_preflight(_raw_request: str) -> FakePanelProcess:
     return FakePanelProcess()
 
 
-async def test_discard_unactivated_baseline_requires_matching_capture_and_no_candidate(
+async def test_install_journal_disk_failure_keeps_captured_baseline_recoverable(
     hass: HomeAssistant,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     from unittest.mock import AsyncMock
 
+    from custom_components.brilliant_mqtt.provisioning_journal import JOURNAL_STORAGE_KEY, Store
+    from tests.test_provisioning_journal import _install_real_store
+
+    _install_real_store(hass, monkeypatch, tmp_path)
+    original_write = Store._async_write_data
+
+    async def fail_journal(store: Store, data: dict[str, object]) -> None:
+        if store.key == JOURNAL_STORAGE_KEY:
+            raise OSError("journal disk failure")
+        await original_write(store, data)
+
+    monkeypatch.setattr(Store, "_async_write_data", fail_journal)
+    harness = _Harness()
+    journal = ProvisioningJournal(hass)
+    monkeypatch.setattr(harness, "journal", journal)
+    finalize = AsyncMock()
+    stage = AsyncMock()
+    monkeypatch.setattr(harness.operations, "finalize_baseline", finalize)
+    monkeypatch.setattr(harness.operations, "stage_release", stage)
+
+    with pytest.raises(PanelProvisioningError) as raised:
+        await harness.provisioner().async_install(_request(), _fleet(), harness.progress)
+
+    assert raised.value.code == "journal_failed"
+    restarted = ProvisioningJournal(hass)
+    assert await restarted.async_load() is None
+    retained = await restarted.async_retained(_TRANSACTION_ID)
+    assert retained is not None and retained.ownerless_unactivated_discard_allowed
+    assert retained.record.prior_snapshot.baseline == harness.operations.snapshot.baseline
+    finalize.assert_not_awaited()
+    stage.assert_not_awaited()
+
+
+@pytest.mark.parametrize("journal_write_fails", (False, True))
+@pytest.mark.parametrize("finalize_fault", (None, "error", "cancel"))
+async def test_discard_unactivated_baseline_requires_matching_capture_and_no_candidate(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    journal_write_fails: bool,
+    finalize_fault: str | None,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from custom_components.brilliant_mqtt.provisioning_journal import (
+        JOURNAL_STORAGE_KEY,
+        ProvisioningJournalError,
+        Store,
+    )
     from tests.test_provisioning_journal import _install_real_store
 
     _install_real_store(hass, monkeypatch, tmp_path)
     journal = ProvisioningJournal(hass)
     record = _record(ProvisioningPhase.STAGED)
-    await journal.async_create(record)
-    await journal.async_complete_cleanup(record.transaction_id)
+    if journal_write_fails:
+        original_write = Store._async_write_data
+
+        async def fail_journal(store: Store, data: dict[str, object]) -> None:
+            if store.key == JOURNAL_STORAGE_KEY:
+                raise OSError("journal disk failure")
+            await original_write(store, data)
+
+        monkeypatch.setattr(Store, "_async_write_data", fail_journal)
+        with pytest.raises(ProvisioningJournalError):
+            await journal.async_create(record)
+        monkeypatch.setattr(Store, "_async_write_data", original_write)
+        journal = ProvisioningJournal(hass)
+    else:
+        await journal.async_create(record)
+        await journal.async_complete_cleanup(record.transaction_id)
     retained = await journal.async_retained(record.transaction_id)
     assert retained is not None and retained.state == "armed"
     events: list[str] = []
@@ -2686,6 +2749,10 @@ async def test_discard_unactivated_baseline_requires_matching_capture_and_no_can
             self, _shell: PanelShell, _snapshot: panel_ops.PanelSnapshot
         ) -> None:
             events.append("finalize")
+            if finalize_fault == "error":
+                raise panel_ops.PanelOpError("baseline_finalize_failed")
+            if finalize_fault == "cancel":
+                raise asyncio.CancelledError
 
     class _Reporter:
         async def async_report_rollback_failure(self, *_args: object, **_kwargs: object) -> None:
@@ -2715,16 +2782,31 @@ async def test_discard_unactivated_baseline_requires_matching_capture_and_no_can
     )
     identity = HostIdentity(_PUBLIC_KEY, _FINGERPRINT)
 
-    await provisioner.async_discard_unactivated_ownerless_baseline(
-        retained, "office.iot.example", "SECRET-root-password", identity
-    )
+    async def discard(expected: RetainedRollback) -> None:
+        await provisioner.async_discard_unactivated_ownerless_baseline(
+            expected, "office.iot.example", "SECRET-root-password", identity
+        )
+
+    if finalize_fault is not None:
+        expected = asyncio.CancelledError if finalize_fault == "cancel" else panel_ops.PanelOpError
+        with pytest.raises(expected):
+            await discard(retained)
+        restarted = ProvisioningJournal(hass)
+        marked = await restarted.async_retained(record.transaction_id)
+        assert marked is not None and marked.state == "finalizing"
+        assert marked.ownerless_unactivated_discard_allowed
+        assert not shell.connected
+        finalize_fault = None
+        await discard(marked)
+    else:
+        await discard(retained)
 
     assert await journal.async_load() is None
     assert await journal.async_retained_records() == ()
     assert events[0] == "snapshot"
     assert events[1] == f"prove:{_VERSION}:{record.transaction_id}"
     assert "finalize" in events
-    assert shell.connect_count == 1
+    assert shell.connect_count == (2 if events.count("finalize") == 2 else 1)
     assert not shell.connected
 
 
