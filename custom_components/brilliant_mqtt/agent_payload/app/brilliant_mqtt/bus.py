@@ -20,7 +20,7 @@ import math
 import secrets
 import time
 from collections import deque
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Any, NamedTuple
@@ -30,6 +30,7 @@ from brilliant_mqtt.diagnostics import ResponseDiagnostics, WriteOutcome
 from brilliant_mqtt.model import (
     BrilliantDevice,
     CaptureProvenance,
+    DeviceKind,
     Variable,
     kind_for_peripheral_type,
 )
@@ -288,17 +289,19 @@ class _PendingPeripheral:
     peripheral id.
     """
 
-    __slots__ = ("capture_provenance", "peripheral_id", "snapshot", "normalized")
+    __slots__ = ("capture_provenance", "peripheral_id", "snapshot", "normalized", "hardware_count")
 
     def __init__(
         self,
         peripheral_id: str,
         snapshot: _PeripheralSnapshot,
         capture_provenance: CaptureProvenance,
+        hardware_count: int,
     ) -> None:
         self.peripheral_id = peripheral_id
         self.snapshot = snapshot
         self.capture_provenance = capture_provenance
+        self.hardware_count = hardware_count
         self.normalized: BrilliantDevice | None = None
 
 
@@ -515,6 +518,7 @@ class RpcBusAdapter:
         # starts a new incomparable source generation.
         self._capture_generation = 0
         self._capture_sequence = 0
+        self._privacy_revocation: CaptureProvenance | None = None
         self._field_eras: dict[tuple[str, str, str], int] = {}
         # Multiple consumers (panel bridge + mesh publisher) may each register
         # a change callback; every change fans out to all of them. Each entry is
@@ -624,6 +628,7 @@ class RpcBusAdapter:
     def _advance_capture_generation(self) -> None:
         self._capture_generation += 1
         self._capture_sequence = 0
+        self._privacy_revocation = None
         self._field_eras.clear()
 
     @property
@@ -634,6 +639,38 @@ class RpcBusAdapter:
     def own_device_id(self) -> str | None:
         """Return the local panel's bus device_id once start() has committed."""
         return self._own_device_id
+
+    @property
+    def capture_sequence(self) -> int:
+        """Latest allocated boundary, including undelivered pushes and empty reads."""
+        return self._capture_sequence
+
+    @property
+    def privacy_revocation(self) -> CaptureProvenance | None:
+        if self._shutting_down:
+            return CaptureProvenance(self._capture_generation, self._capture_sequence)
+        return self._privacy_revocation
+
+    def _capture_privacy_revocation(
+        self, device_id: str, boundary: CaptureProvenance, peripherals: Iterable[Any]
+    ) -> None:
+        """Retain denial ordering even when its callbacks are delayed or coalesced away."""
+        if (
+            device_id != self._own_device_id
+            or boundary.source_generation != self._capture_generation
+        ):
+            return
+        hardware = [
+            p
+            for p in peripherals
+            if kind_for_peripheral_type(int(p.peripheral_type)) is DeviceKind.HARDWARE
+        ]
+        var = hardware[0].variables.get("privacy_toggle") if len(hardware) == 1 else None
+        if var is not None and str(_coerce_scalar(var.value)).strip() == "0":
+            return
+        previous = self._privacy_revocation
+        if previous is None or boundary.sequence > previous.sequence:
+            self._privacy_revocation = boundary
 
     def _next_capture_provenance(self) -> CaptureProvenance:
         self._capture_sequence += 1
@@ -777,8 +814,8 @@ class RpcBusAdapter:
         """Normalize a wanted changed device and dispatch by callback policy.
 
         A live per-callback scope predicate (``want_device``) is evaluated on
-        the raw device id FIRST: if no registered callback wants this device the
-        push is dropped before any peripheral is even snapshotted (issue #98).
+        the raw device id FIRST. Unwanted extra devices are dropped before
+        snapshotting (issue #98); own-panel privacy denial is always captured.
         For a wanted device, every peripheral is captured into an IMMUTABLE
         primitive snapshot here and now (synchronously — the raw structs come
         from a mutable mirror, poc-findings §8b), but the expensive normalization
@@ -806,8 +843,6 @@ class RpcBusAdapter:
         if self._shutting_down or session != self._session:
             return
         cbs = list(self._change_cbs)
-        if not cbs:
-            return
         raw_id = getattr(raw_device, "id", None)
         device_id = str(raw_id) if raw_id else self._own_device_id
         if device_id is None:
@@ -817,14 +852,14 @@ class RpcBusAdapter:
         # consumer currently wants — a mesh push while this panel is a mesh
         # standby, or the mesh device seen by the panel bridge — is dropped here
         # having done zero normalization and zero Variable allocation. Each
-        # want_device predicate is opaque (str -> bool): the adapter never
-        # learns about panels, "ble_mesh", or leadership.
+        # want_device predicate is opaque (str -> bool). The own-panel exception
+        # preserves synchronous camera revocation independently of delivery.
         admitted = [
             (cb, coalesce_pushes)
             for cb, coalesce_pushes, want_device in cbs
             if want_device is None or want_device(device_id)
         ]
-        if not admitted:
+        if not admitted and device_id != self._own_device_id:
             return
         # Same defensive access as get_all(): a peripheral-less housekeeping
         # notification is routine, not worth a logger.exception from the
@@ -845,6 +880,11 @@ class RpcBusAdapter:
         # bridge AND the lossless scene bridge on the own device) is normalized
         # at most once total — like main, which shared one BrilliantDevice.
         capture_provenance = self._next_capture_provenance()
+        raw_peripherals = dict(peripherals)
+        hardware_count = sum(
+            kind_for_peripheral_type(int(raw.peripheral_type)) is DeviceKind.HARDWARE
+            for raw in raw_peripherals.values()
+        )
         snapshot = tuple(
             _PendingPeripheral(
                 peripheral_id,
@@ -855,8 +895,12 @@ class RpcBusAdapter:
                     peripheral_id,
                     dict(raw_peripheral.variables),
                 ),
+                hardware_count,
             )
-            for peripheral_id, raw_peripheral in dict(peripherals).items()
+            for peripheral_id, raw_peripheral in raw_peripherals.items()
+        )
+        self._capture_privacy_revocation(
+            device_id, capture_provenance, (p.snapshot for p in snapshot)
         )
         for cb, coalesce_pushes in admitted:
             key = (device_id if coalesce_pushes else None, cb)
@@ -928,6 +972,7 @@ class RpcBusAdapter:
                                 ),
                                 capture_provenance=pending_peripheral.capture_provenance,
                                 capture_complete=False,
+                                capture_hardware_count=pending_peripheral.hardware_count,
                             )
                             pending_peripheral.normalized = device
                         await cb(device)
@@ -1067,9 +1112,12 @@ class RpcBusAdapter:
                 timeout=_READ_DEADLINE_S,
             )
             if raw_device is None or getattr(raw_device, "peripherals", None) is None:
+                self._capture_privacy_revocation(device_id, boundary, ())
                 label = "own device" if device_id == own_id else "extra device"
                 logger.warning("%s id=%s not returned by get_device()", label, device_id)
                 continue
+            raw_peripherals = dict(raw_device.peripherals)
+            self._capture_privacy_revocation(device_id, boundary, raw_peripherals.values())
             devices.extend(
                 replace(
                     normalize_peripheral(device_id, peripheral_id, raw_peripheral),
@@ -1081,7 +1129,7 @@ class RpcBusAdapter:
                         complete=True,
                     ),
                 )
-                for peripheral_id, raw_peripheral in dict(raw_device.peripherals).items()
+                for peripheral_id, raw_peripheral in raw_peripherals.items()
             )
         return devices
 
