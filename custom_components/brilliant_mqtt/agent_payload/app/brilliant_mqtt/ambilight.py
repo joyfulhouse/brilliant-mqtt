@@ -782,26 +782,30 @@ class AmbilightController:
             await self._publish_state_unlocked(sample, epoch)
             if self._is_blocked_by_privacy(epoch):
                 return None
-            await self._mqtt.publish(
-                self._color_topic(),
-                json.dumps(
-                    {
-                        "r": sample.r,
-                        "g": sample.g,
-                        "b": sample.b,
-                        "rgb_color": [sample.r, sample.g, sample.b],
-                        "brightness": sample.brightness,
-                        "hex_color": sample.hex_color,
-                        "state": "ON" if sample.brightness > 1 else "OFF",
-                    },
-                    sort_keys=True,
-                ),
-                retain=False,
-            )
+            try:
+                await self._mqtt.publish(
+                    self._color_topic(),
+                    json.dumps(
+                        {
+                            "r": sample.r,
+                            "g": sample.g,
+                            "b": sample.b,
+                            "rgb_color": [sample.r, sample.g, sample.b],
+                            "brightness": sample.brightness,
+                            "hex_color": sample.hex_color,
+                            "state": "ON" if sample.brightness > 1 else "OFF",
+                        },
+                        sort_keys=True,
+                    ),
+                    retain=False,
+                )
+            finally:
+                # Retained state succeeded; keep its valid sample even if transient output fails.
+                if not self._is_blocked_by_privacy(epoch):
+                    self._last_sample = sample
+                    self._last_sample_epoch = epoch
             if self._is_blocked_by_privacy(epoch):
                 return None
-            self._last_sample = sample
-            self._last_sample_epoch = epoch
             return sample
 
     async def trigger_snapshot(self) -> bool:

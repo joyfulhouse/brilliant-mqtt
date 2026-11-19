@@ -434,3 +434,70 @@ async def test_poll_color_and_concurrent_settings_finish_in_agreement(
         assert controller.last_sample is not None
         assert states[-1]["color"]["hex_color"] == controller.last_sample.hex_color
     await controller.shutdown()
+
+
+@pytest.mark.parametrize("publication", ["state", "color"])
+@pytest.mark.parametrize("failure", ["error", "cancel"])
+@pytest.mark.parametrize("revoke_and_regrant", [False, True])
+async def test_sample_publication_fault_keeps_retained_cache_coherent(
+    tmp_path: Path, publication: str, failure: str, revoke_and_regrant: bool
+) -> None:
+    epoch = (1, -1, 0)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class FaultMqtt(FakeMqtt):
+        armed = False
+
+        async def publish(
+            self, topic: str, payload: str, retain: bool = False, qos: int = 0
+        ) -> None:
+            if self.armed and topic == f"brilliant/office/ambilight/{publication}":
+                self.armed = False
+                entered.set()
+                await release.wait()
+                raise OSError("publication unavailable")
+            await super().publish(topic, payload, retain=retain, qos=qos)
+
+    ledger = RetainedTopicLedger("office", tmp_path / "ledger.json")
+    await ledger.async_load()
+    mqtt, camera = FaultMqtt(), HeldCamera()
+    camera.release.set()
+    controller = AmbilightController(
+        mqtt,
+        "office",
+        camera,
+        owned_topics=ledger,
+        privacy_off=lambda: True,
+        privacy_epoch=lambda: epoch,
+    )
+    await controller.start()
+    mqtt.armed = True
+    work = asyncio.create_task(controller.sample_once())
+    await asyncio.wait_for(entered.wait(), 1)
+    command = asyncio.create_task(
+        controller.on_mqtt_command("brilliant/office/ambilight/set_interval", "2")
+    )
+    await asyncio.sleep(0)
+    if revoke_and_regrant:
+        epoch = (1, 10, 0)
+    if failure == "cancel":
+        work.cancel()
+    else:
+        release.set()
+    with pytest.raises(asyncio.CancelledError if failure == "cancel" else OSError):
+        await work
+    await asyncio.wait_for(command, 1)
+    states = [json.loads(p) for t, p, _ in mqtt.published if t.endswith("/ambilight/state")]
+    assert states[-1]["interval_s"] == 2.0
+    if publication == "color" and not revoke_and_regrant:
+        assert controller.last_sample is not None
+        assert states[-1]["color"]["hex_color"] == controller.last_sample.hex_color
+        assert states[-1]["color"]["hex_color"] != "#000000"
+    else:
+        assert controller.last_sample is None
+        assert states[-1]["color"]["hex_color"] == "#000000"
+    assert await controller.sample_once() is not None
+    assert controller.last_sample is not None
+    states = [json.loads(p) for t, p, _ in mqtt.published if t.endswith("/ambilight/state")]
+    assert states[-1]["color"]["hex_color"] == controller.last_sample.hex_color
+    await controller.shutdown()
