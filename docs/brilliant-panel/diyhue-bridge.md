@@ -20,7 +20,7 @@ component — see [CONFIGURATION.md → Hue CA recovery](../CONFIGURATION.md#hue
  Wall slider ─▶ Brilliant panel's native Hue client (per-home, leader-elected)
                           │  HTTPS Hue API v1, TLS pinned
                           ▼
-        diyHue  (Hue-bridge emulator, in k3s on the IoT VLAN, 10.100.0.97)
+        diyHue  (Hue-bridge emulator, in k3s on the IoT VLAN, <diyhue-vip>)
                           │  Home Assistant WebSocket
                           ▼
                  Home Assistant ─▶ Tuya / WiZ / any HA-driven bulb
@@ -79,8 +79,8 @@ behind diyHue issues #322/#339 and every prior attempt).
 
 | Piece | Where |
 |---|---|
-| **diyHue** | k3s app `diyhue` (GitOps: `k3s-infra/k8s/diyhue/`), image `diyhue/core:latest`, HA-WebSocket backend, our-CA leaf seeded as `cert.pem` (SealedSecret). |
-| **Reachability** | On the **IoT VLAN (10.100.0.0/20)** so the Brilliant panels reach it same-subnet with **no inter-VLAN firewall rule**. `server1` carries a netplan VLAN-52 leg (`enp1s0.52`); MetalLB **L2-only** pool announces the VIP **`10.100.0.97`** on it (`k3s-infra/k8s/metallb/` `iot-pool`/`iot-l2`). |
+| **diyHue** | k3s app `diyhue` (GitOps, in the operator's private infra repo), image `diyhue/core:latest`, HA-WebSocket backend, our-CA leaf seeded as `cert.pem` (SealedSecret). |
+| **Reachability** | On the **IoT VLAN** (`<iot-vlan-subnet>`) so the Brilliant panels reach it same-subnet with **no inter-VLAN firewall rule**. A k3s node carries a netplan leg on the IoT VLAN (`<node-iface>.<vlan-id>`); a MetalLB **L2-only** pool announces a VIP on the IoT VLAN (`<diyhue-vip>`) through it, via a dedicated IP pool + L2 advertisement. |
 | **Panel trust** | Operator CA appended to **every** bridged panel's `hue-bridge-ca-certs.pem` (leadership moves — all panels need it). |
 | **Credential** | One `HueBridgeCredential` (diyHue IP + a diyHue API username) injected into the home-wide `hue_bridge_configuration`. |
 | **Durability** | The **Hue CA recovery** agent component re-appends the CA + restarts the Hue coordinator after every OTA — see below. |
@@ -128,7 +128,7 @@ diyHue's HA-WebSocket backend only maps two HA domains — **`light.`** and
 ## Leadership moves
 
 The Brilliant Hue integration is hosted by one **elected** panel. It re-elects
-on disruption (e.g. a diyHue pod restart) — observed moving `.30 → .15 → .22`
+on disruption (e.g. a diyHue pod restart) — observed moving across three panels
 across a session. Consequences:
 
 - The **CA must be on every bridged panel**, not just the current leader.
@@ -167,7 +167,13 @@ A firmware OTA wipes **both** `/data` (the CA bundle) and `/etc/systemd/system/`
   be inferred from these intervals. See the
   [measure-first event-reflection proposal](diyhue-event-reflection-proposal.md)
   for conditional predictions, the shorter-poll comparator, and separate upstream
-  qualification. No physical slider latency fix is claimed. Brightness is approximate
+  qualification. Upstream diyHue now has an **opt-in event-reflection mode**
+  (`homeAssistantEventReflection: true`, HTTPS to HA required; diyHue#1147). It
+  reflects HA events straight into the served cache, with a 60 s full-read repair.
+  The default mode is unchanged. Its gaps, the live measurement, and the remaining
+  benchmarks are in the
+  [status update](diyhue-event-reflection-proposal.md#status-update-upstream-candidate-merged-2026-10).
+  No physical slider latency fix is claimed. Brightness is approximate
   (intensity 0–1000 ↔ HA 0–255, localtuya calibration slop); on/off is exact.
 
 ## Operational runbook
@@ -238,7 +244,7 @@ Freshly enumerated hue lights have an **empty `room_assignment`**
    one room id per light. **Validate the encoder against a known physical light's
    `room_assignment` value first.**
 3. Write it (external base64-string write; **first arg is the light's diyHue
-   uniqueid**, e.g. `00:17:88:01:00:1F:40:C5-0B`, not `"hue_bridge"`):
+   uniqueid**, e.g. `00:17:88:01:00:XX:XX:XX-0B`, not `"hue_bridge"`):
    ```python
    await obs.request_set_variables_in_peripheral(
        light_uniqueid, {"room_assignment": BLOB}, device_id="hue_bridge")
@@ -250,8 +256,8 @@ Freshly enumerated hue lights have an **empty `room_assignment`**
 `hue_bridge_configuration`; map the device id to a panel IP via each panel's
 `/var/device_variables/device_id`.
 
-**Teardown** — `kubectl delete ns diyhue`; revert `k3s-infra` metallb `iot-pool`/
-`iot-l2` + the server1 netplan leg; restore each panel's
+**Teardown** — `kubectl delete ns diyhue`; revert the MetalLB IoT pool and L2
+advertisement + the node's IoT VLAN netplan leg; restore each panel's
 `hue-bridge-ca-certs.pem.orig`; remove the diyHue credential from the type-25
 config.
 

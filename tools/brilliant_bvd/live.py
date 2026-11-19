@@ -29,7 +29,6 @@ from brilliant_mqtt.ha_control_protocol import manifest_topic, stable_id, state_
 from tools.brilliant_bvd.single_light_pilot import (
     BVD_CONFIGURATION_PERIPHERAL_ID,
     BVD_DEVICE_ID,
-    OFFICE_DEVICE_ID,
     TARGET_ENTITY_ID,
     BvdBus,
     BvdTopology,
@@ -172,8 +171,50 @@ def _variable_value(raw: object) -> str:
     return value
 
 
+_STOCK_UWSGI_EXECUTABLE = "/data/switch-embedded/env/bin/uwsgi"
+# The exact stock BVD vassal argv observed on v26.10.21.1 (firmware-gated).
+_STOCK_BVD_VASSAL_ARGV: tuple[bytes, ...] = (
+    _STOCK_UWSGI_EXECUTABLE.encode(),
+    b"--set",
+    b"fork_server_socket=/var/run/brilliant/fork_server.socket",
+    b"--ini",
+    b"brilliant_virtual_device_peripherals.ini",
+    b"--include",
+    b"/data/switch-embedded//lib/process_management/process-default.ini",
+)
+# uwsgi rewrites its process title into this one space-joined argument (the
+# captured cmdline ends with a trailing space before the terminating NUL).
+_STOCK_BVD_VASSAL_TITLE = b" ".join(_STOCK_BVD_VASSAL_ARGV) + b" "
+
+
+def _is_stock_bvd_cmdline(cmdline: bytes) -> bool:
+    """Match only an exact stock BVD uwsgi vassal cmdline.
+
+    The cmdline must be either the exact genuine argv vector (NUL boundaries
+    preserved) or the exact captured rewritten title.  Look-alike paths, extra
+    or conflicting ``--ini`` options, and BVD text embedded inside another
+    argument's value never match.
+    """
+
+    if not cmdline.endswith(b"\0"):
+        return False
+    argv = tuple(cmdline[:-1].split(b"\0"))
+    if len(argv) == 1:
+        return argv[0] == _STOCK_BVD_VASSAL_TITLE
+    return argv == _STOCK_BVD_VASSAL_ARGV
+
+
 def _stock_host_identity(proc_root: Path = Path("/proc")) -> str:
-    """Return PID:start-ticks for the one stock BVD vassal, else empty."""
+    """Return PID:start-ticks for the one verified stock BVD vassal, else empty.
+
+    A process is a *candidate* only when its cmdline is an exact stock form.
+    Processes whose cmdline is unreadable (they exited) or not a stock form are
+    never candidates, so their inspection errors cannot block detection.  Once
+    a cmdline matches, the candidate must be verified: its ``exe`` must be the
+    firmware uwsgi by full path, and its ``stat`` must yield a start time.  If
+    a candidate cannot be verified (permission error, disappearance, malformed
+    stat) the whole scan refuses rather than choosing another candidate.
+    """
 
     matches: list[str] = []
     try:
@@ -184,22 +225,22 @@ def _stock_host_identity(proc_root: Path = Path("/proc")) -> str:
         if not entry.name.isdigit():
             continue
         try:
-            argv = tuple(
-                argument for argument in (entry / "cmdline").read_bytes().split(b"\0") if argument
-            )
-            if not argv or Path(os.fsdecode(argv[0])).name != "uwsgi":
-                continue
-            expected_config = (
-                b"/var/run/brilliant/startable_configs/brilliant_virtual_device_peripherals"
-            )
-            if expected_config not in argv:
+            cmdline = (entry / "cmdline").read_bytes()
+        except OSError:
+            continue
+        if not _is_stock_bvd_cmdline(cmdline):
+            continue
+        try:
+            if os.readlink(entry / "exe") != _STOCK_UWSGI_EXECUTABLE:
                 continue
             process_stat = (entry / "stat").read_text(encoding="ascii")
             close_parenthesis = process_stat.rfind(")")
             fields_after_name = process_stat[close_parenthesis + 2 :].split()
             start_ticks = fields_after_name[19]
         except (IndexError, OSError, UnicodeError):
-            continue
+            return ""
+        if close_parenthesis < 0 or not start_ticks.isdigit():
+            return ""
         matches.append(f"{entry.name}:{start_ticks}")
     return matches[0] if len(matches) == 1 else ""
 
@@ -1419,6 +1460,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--mqtt-port", type=int, default=1883)
     parser.add_argument("--mqtt-username")
     parser.add_argument("--mqtt-password-file", type=Path)
+    parser.add_argument(
+        "--approved-owner-device-id",
+        action="append",
+        metavar="DEVICE_ID",
+        help=(
+            "operator-approved panel device ID that may host the pilot as the current "
+            "natural BVD owner (repeat once per approved healthy panel)"
+        ),
+    )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--apply", action="store_true")
     mode.add_argument("--cleanup-only", action="store_true")
@@ -1439,6 +1489,32 @@ def _parser() -> argparse.ArgumentParser:
         help="assert the required non-writing health observer is armed and recording",
     )
     return parser
+
+
+async def _dry_run(
+    config: PilotConfig, bus: BvdBus, *, now_ms: int | None = None
+) -> dict[str, object]:
+    """Run the read-only admission once through a fresh peer and always close it."""
+
+    await bus.start()
+    try:
+        topology = await bus.snapshot()
+        validate_preflight(
+            config,
+            topology,
+            now_ms=time.time_ns() // 1_000_000 if now_ms is None else now_ms,
+        )
+        if config.room_assignment_id not in await bus.room_ids():
+            raise PilotGuardError("requested room is absent from the scoped room catalog")
+    finally:
+        await bus.shutdown()
+    return {
+        "event": "DRY_RUN_OK",
+        "bvd_owner": topology.configuration_owner,
+        "owner_approved": True,
+        "peripheral_id": peripheral_id_for_entity(TARGET_ENTITY_ID),
+        "lease_release": "not_applicable",
+    }
 
 
 async def _async_cli(args: argparse.Namespace) -> int:
@@ -1476,36 +1552,21 @@ async def _async_cli(args: argparse.Namespace) -> int:
 
     if not args.room_assignment_id:
         raise PilotGuardError("--room-assignment-id is required outside cleanup-only")
+    if not args.approved_owner_device_id:
+        raise PilotGuardError(
+            "--approved-owner-device-id is required outside cleanup-only and owner-status"
+        )
     config = PilotConfig(
         room_assignment_id=args.room_assignment_id,
         display_name=args.display_name,
         active_runtime_s=args.active_runtime_s,
+        approved_owner_device_ids=frozenset(args.approved_owner_device_id),
     )
     if not args.apply:
-        bus = NativeBvdBus()
-        await bus.start()
-        try:
-            topology = await bus.snapshot()
-            validate_preflight(config, topology, now_ms=time.time_ns() // 1_000_000)
-            if config.room_assignment_id not in await bus.room_ids():
-                raise PilotGuardError("requested room is absent from the scoped room catalog")
-        finally:
-            await bus.shutdown()
-        print(
-            json.dumps(
-                {
-                    "event": "DRY_RUN_OK",
-                    "office_device_id": OFFICE_DEVICE_ID,
-                    "bvd_owner": topology.configuration_owner,
-                    "peripheral_id": peripheral_id_for_entity(TARGET_ENTITY_ID),
-                    "lease_release": "not_applicable",
-                },
-                sort_keys=True,
-            )
-        )
+        print(json.dumps(await _dry_run(config, NativeBvdBus()), sort_keys=True))
         return 0
     if os.geteuid() != 0:
-        raise PilotGuardError("live apply must run as root on Office")
+        raise PilotGuardError("live apply must run as root on the approved current BVD owner")
     if not args.cross_owner_cleanup_staged:
         raise PilotGuardError(
             "live apply is NO-GO until exact cleanup-only is staged on every possible BVD owner"
