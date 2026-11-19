@@ -1220,6 +1220,16 @@ class FleetManager:
                 ProvisioningPhase.COMMITTED,
             }:
                 raise EntryDataError("provisioning_ownership_mismatch")
+        elif record.operation is ProvisioningOperation.ROLLBACK:
+            password = await _async_rollback_credential(self.hass, record.panel_request)
+            if password is None or password != record.panel_request.root_password:
+                raise EntryDataError("rollback_credentials_unavailable")
+        elif record.operation is ProvisioningOperation.ONBOARDING_ROLLBACK:
+            retained = await ProvisioningJournal(self.hass).async_retained(record.transaction_id)
+            if retained is None or retained.compensation_password(record) is None:
+                raise EntryDataError("rollback_credentials_unavailable")
+        else:
+            raise EntryDataError("provisioning_ownership_mismatch")
 
     def _async_schedule_background_recovery(
         self,
