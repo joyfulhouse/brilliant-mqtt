@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A verified panel address change, and a later canary finalize or rollback,
+  keep retained baselines and the active provisioning record on the new host
+  when the slug and pinned SSH identity still match. A different slug or SSH
+  identity is still refused. `baseline_owner_mismatch` is shown and logged
+  instead of the generic `canary_operation_failed`.
+
 ## [0.12.2] - 2026-11-17
 
 This is a Home Assistant integration release only. The bundled on-panel agent

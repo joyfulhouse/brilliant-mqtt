@@ -280,6 +280,36 @@ class PanelSubentryFlow(ConfigSubentryFlow, _PanelOnboardingMixin):
             return _panel_failure("inspection_failed", stage="panel_inspection")
         return None
 
+    async def _async_sync_verified_address(
+        self,
+        panel: PanelConfig,
+        host: str,
+    ) -> _FlowFailure | None:
+        """Keep this panel's journal and retained baseline on a proven new host.
+
+        The SSH pin and slug are unchanged. Records for any other panel stay put.
+        A storage failure leaves the subentry on its previous address.
+        """
+        if host == panel.host:
+            return None
+        from ..provisioning_journal import ProvisioningJournal, ProvisioningJournalError
+
+        try:
+            await ProvisioningJournal(self.hass).async_adopt_verified_host(
+                slug=panel.panel,
+                public_key=panel.ssh_host_key,
+                fingerprint=panel.identity_fingerprint,
+                host=host,
+            )
+        except ProvisioningJournalError as error:
+            _LOGGER.error(
+                "Verified address change for panel %s could not update provisioning records: %s",
+                panel.panel,
+                error.code,
+            )
+            return _panel_failure("journal_failed", stage="panel_reconfigure")
+        return None
+
     async def async_step_rename(
         self,
         user_input: dict[str, Any] | None = None,
@@ -350,11 +380,13 @@ class PanelSubentryFlow(ConfigSubentryFlow, _PanelOnboardingMixin):
                     entry, subentry, latest = target
                     if not self._capture_or_compare_reconfigure(latest):
                         return self.async_abort(reason="parent_changed")
-                    return self.async_update_and_abort(
-                        entry,
-                        subentry,
-                        data={**subentry.data, CONF_HOST: host},
-                    )
+                    failure = await self._async_sync_verified_address(latest, host)
+                    if failure is None:
+                        return self.async_update_and_abort(
+                            entry,
+                            subentry,
+                            data={**subentry.data, CONF_HOST: host},
+                        )
         source = {CONF_HOST: self._reconfigure_host or current.host}
         return self.async_show_form(
             step_id="address",
@@ -396,15 +428,17 @@ class PanelSubentryFlow(ConfigSubentryFlow, _PanelOnboardingMixin):
                     entry, subentry, latest = target
                     if not self._capture_or_compare_reconfigure(latest):
                         return self.async_abort(reason="parent_changed")
-                    return self.async_update_and_abort(
-                        entry,
-                        subentry,
-                        data={
-                            **subentry.data,
-                            CONF_HOST: host,
-                            CONF_ROOT_PASSWORD: password,
-                        },
-                    )
+                    failure = await self._async_sync_verified_address(latest, host)
+                    if failure is None:
+                        return self.async_update_and_abort(
+                            entry,
+                            subentry,
+                            data={
+                                **subentry.data,
+                                CONF_HOST: host,
+                                CONF_ROOT_PASSWORD: password,
+                            },
+                        )
         return self.async_show_form(
             step_id="repair_credentials",
             data_schema=panel_ssh_credentials_schema(),
