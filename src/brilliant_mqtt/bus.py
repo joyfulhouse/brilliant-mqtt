@@ -30,6 +30,7 @@ from brilliant_mqtt.diagnostics import ResponseDiagnostics, WriteOutcome
 from brilliant_mqtt.model import (
     BrilliantDevice,
     CaptureProvenance,
+    DeviceKind,
     Variable,
     kind_for_peripheral_type,
 )
@@ -288,17 +289,19 @@ class _PendingPeripheral:
     peripheral id.
     """
 
-    __slots__ = ("capture_provenance", "peripheral_id", "snapshot", "normalized")
+    __slots__ = ("capture_provenance", "peripheral_id", "snapshot", "normalized", "hardware_count")
 
     def __init__(
         self,
         peripheral_id: str,
         snapshot: _PeripheralSnapshot,
         capture_provenance: CaptureProvenance,
+        hardware_count: int,
     ) -> None:
         self.peripheral_id = peripheral_id
         self.snapshot = snapshot
         self.capture_provenance = capture_provenance
+        self.hardware_count = hardware_count
         self.normalized: BrilliantDevice | None = None
 
 
@@ -850,6 +853,11 @@ class RpcBusAdapter:
         # bridge AND the lossless scene bridge on the own device) is normalized
         # at most once total — like main, which shared one BrilliantDevice.
         capture_provenance = self._next_capture_provenance()
+        raw_peripherals = dict(peripherals)
+        hardware_count = sum(
+            kind_for_peripheral_type(int(raw.peripheral_type)) is DeviceKind.HARDWARE
+            for raw in raw_peripherals.values()
+        )
         snapshot = tuple(
             _PendingPeripheral(
                 peripheral_id,
@@ -860,8 +868,9 @@ class RpcBusAdapter:
                     peripheral_id,
                     dict(raw_peripheral.variables),
                 ),
+                hardware_count,
             )
-            for peripheral_id, raw_peripheral in dict(peripherals).items()
+            for peripheral_id, raw_peripheral in raw_peripherals.items()
         )
         for cb, coalesce_pushes in admitted:
             key = (device_id if coalesce_pushes else None, cb)
@@ -933,6 +942,7 @@ class RpcBusAdapter:
                                 ),
                                 capture_provenance=pending_peripheral.capture_provenance,
                                 capture_complete=False,
+                                capture_hardware_count=pending_peripheral.hardware_count,
                             )
                             pending_peripheral.normalized = device
                         await cb(device)
