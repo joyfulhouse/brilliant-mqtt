@@ -644,7 +644,7 @@ class VirtualSliderController:
 
     def _save_state_if_changed(self) -> bool:
         if self._state_path is None:
-            return True
+            return False
         snapshot = self._build_persisted_snapshot()
         if snapshot == self._last_persisted_snapshot:
             return True

@@ -1401,3 +1401,31 @@ async def test_truncated_original_cannot_be_written_or_retired(tmp_path: Path) -
     assert not await restore_all_persisted_slider_bindings(rig.path, bus=rig.bus)
     assert rig.path.read_text() == saved
     assert rig.bus.commands == commands
+
+
+@pytest.mark.parametrize("mode", [SliderMode.VIRTUAL, SliderMode.PASSTHROUGH])
+async def test_missing_durable_state_path_cannot_admit_a_physical_binding(
+    tmp_path: Path, mode: SliderMode
+) -> None:
+    rig = _RecoveryRig(tmp_path / "unused")
+    spec = VirtualSliderSpec.for_panel_slider(
+        "A",
+        "A",
+        PANEL_DEV_ID,
+        slider_index=0,
+        default_mode=mode,
+    )
+    ctrl = VirtualSliderController(
+        rig.bus,
+        rig.mqtt,
+        "test",
+        PANEL_DEV_ID,
+        [spec],
+        FakeVirtualPeripheralHost,
+        state_path=None,
+    )
+    await ctrl.start()
+    assert not rig.bus.commands
+    assert rig.face.variables["slider_config:0"].value == REAL_PANEL_SLIDER_CONFIG_0_B64
+    assert not ctrl.state_for("A").binding_ready
+    await ctrl.shutdown()
