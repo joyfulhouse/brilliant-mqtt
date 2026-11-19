@@ -3032,21 +3032,52 @@ def _swap_command() -> str:
 
 async def _restore_virtual_sliders_on_uninstall(shell: PanelShell) -> None:
     """Require verified restoration before removing backups and retry code."""
+    environment = await _checked(
+        shell, f"if [ -e {PANEL_ENV_FILE} ]; then cat {PANEL_ENV_FILE}; fi"
+    )
+    configured_dir = parse_env(environment.stdout).get("MOTION_DESIRED_STATE_DIR")
+    state_paths = [f"{PANEL_VAR_DIR}/state/virtual-sliders.json"]
+    if configured_dir:
+        state_paths.append(f"{configured_dir.rstrip('/')}/virtual-sliders.json")
     await _checked(
         shell,
         f"{_PANEL_PYTHON} - <<'BRILLIANT_RESTORE_VIRTUAL_SLIDERS'\n"
-        "import asyncio, sys\n"
+        "import asyncio, json, sys\n"
         "from pathlib import Path\n"
         f"var_dir = Path({PANEL_VAR_DIR!r})\n"
-        "state_path = var_dir / 'state' / 'virtual-sliders.json'\n"
-        "if state_path.exists():\n"
-        "    for sub in ('current/app', 'app', 'current/vendor', 'vendor'):\n"
-        "        p = var_dir / sub\n"
-        "        if p.is_dir():\n"
-        "            sys.path.insert(0, str(p))\n"
+        f"state_paths = list(dict.fromkeys({state_paths!r}))\n"
+        "def backups(path):\n"
+        "    data = json.loads(path.read_text())\n"
+        "    if not isinstance(data, dict):\n"
+        "        raise ValueError('Invalid slider recovery state')\n"
+        "    for row in data.values():\n"
+        "        if not isinstance(row, dict) or 'original_slider_config' not in row:\n"
+        "            raise ValueError('Invalid slider recovery row')\n"
+        "        original = row['original_slider_config']\n"
+        "        if original is not None and (not isinstance(original, str) or not original):\n"
+        "            raise ValueError('Invalid original slider backup')\n"
+        "        if not all(isinstance(row.get(k), str) and row[k] for k in\n"
+        "                   ('config_device_id', 'config_peripheral_id', 'config_var_name')):\n"
+        "            raise ValueError('Incomplete slider recovery coordinates')\n"
+        "    targets = {(r['config_device_id'], r['config_peripheral_id'],\n"
+        "                r['config_var_name']) for r in data.values()}\n"
+        "    if len(targets) != len(data):\n"
+        "        raise ValueError('Conflicting slider recovery coordinates')\n"
+        "    return any(row['original_slider_config'] is not None for row in data.values())\n"
+        "paths = [Path(p) for p in state_paths if Path(p).exists()]\n"
+        "pending = [p for p in paths if backups(p)]\n"
+        "if pending:\n"
+        "    root = var_dir / 'current' if (var_dir / 'current').exists() else var_dir\n"
+        "    if not (root / 'app').is_dir():\n"
+        "        raise ValueError('Slider recovery payload missing')\n"
+        "    sys.path[:0] = [str(root / sub) for sub in ('app', 'vendor')\n"
+        "                    if (root / sub).is_dir()]\n"
         "    from brilliant_mqtt.virtual_sliders import restore_all_persisted_slider_bindings\n"
-        "    if not asyncio.run(restore_all_persisted_slider_bindings(state_path)):\n"
-        "        sys.exit('Virtual slider restoration incomplete; retry uninstall')\n"
+        "    for state_path in pending:\n"
+        "        if not asyncio.run(restore_all_persisted_slider_bindings(state_path)):\n"
+        "            sys.exit('Virtual slider restoration incomplete; retry uninstall')\n"
+        "        if not state_path.exists() or backups(state_path):\n"
+        "            sys.exit('Virtual slider recovery was not retired; retry uninstall')\n"
         "BRILLIANT_RESTORE_VIRTUAL_SLIDERS",
     )
 

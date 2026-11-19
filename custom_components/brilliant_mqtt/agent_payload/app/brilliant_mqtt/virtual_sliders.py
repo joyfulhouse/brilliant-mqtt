@@ -490,6 +490,7 @@ class VirtualSliderState:
     last_event: SliderEventType | None = None
     event_seq: int = 0
     original_slider_config: str | None = None
+    binding_ready: bool = False
 
 
 @dataclass(frozen=True)
@@ -663,6 +664,12 @@ VirtualHostFactory = Callable[
 ]
 
 
+def _validate_spec_ownership(specs: list[VirtualSliderSpec]) -> None:
+    targets = {(s.config_device_id, s.config_peripheral_id, s.config_var_name) for s in specs}
+    if len(targets) != len(specs) or len({s.slider_id for s in specs}) != len(specs):
+        raise ValueError("Virtual sliders must have unique IDs and physical targets")
+
+
 class VirtualSliderController:
     """Manages virtual peripherals, slider bindings, gesture classification, and MQTT entities."""
 
@@ -686,6 +693,7 @@ class VirtualSliderController:
         self._mqtt = mqtt
         self._panel = panel
         self._own_device_id = own_device_id
+        _validate_spec_ownership(specs)
         self._specs: dict[str, VirtualSliderSpec] = {s.slider_id: s for s in specs}
         self._host_factory = host_factory
         self._state_path = state_path
@@ -738,10 +746,9 @@ class VirtualSliderController:
         try:
             data = json.loads(self._state_path.read_text(encoding="utf-8"))
         except Exception as exc:
-            logger.warning("Failed to load virtual slider state from %s: %s", self._state_path, exc)
-            return
-        if not isinstance(data, dict):
-            return
+            raise ValueError("Cannot safely load virtual slider recovery state") from exc
+        if not _valid_persisted_state(data):
+            raise ValueError("Invalid virtual slider recovery state; preserve it for recovery")
         self._last_persisted_snapshot = data
         for sid, entry in data.items():
             if not isinstance(entry, dict):
@@ -794,6 +801,12 @@ class VirtualSliderController:
         data: dict[str, Any] = {}
         for sid, st in self._states.items():
             spec = self._specs[sid]
+            if any(
+                (orphan.config_device_id, orphan.config_peripheral_id, orphan.config_var_name)
+                == (spec.config_device_id, spec.config_peripheral_id, spec.config_var_name)
+                for orphan in self._orphaned_bindings.values()
+            ):
+                continue
             data[sid] = {
                 "mode": st.mode.value,
                 "brightness": st.brightness,
@@ -935,7 +948,7 @@ class VirtualSliderController:
                 await host.start()
                 self._hosts[sid] = host
 
-                await self._apply_slider_binding(spec, st.mode)
+                st.binding_ready = await self._apply_slider_binding(spec, st.mode)
                 self._save_state_if_changed()
 
                 await self._publish_discovery(spec)
@@ -949,10 +962,11 @@ class VirtualSliderController:
         """Apply deferred ``ble_mesh`` slider bindings once mesh leadership is won."""
         await self._restore_orphaned_bindings()
         for sid, spec in self._specs.items():
-            if spec.config_device_id != "ble_mesh":
-                continue
             st = self._states[sid]
-            await self._apply_slider_binding(spec, st.mode)
+            if spec.config_device_id != "ble_mesh" and st.binding_ready:
+                continue
+            st.binding_ready = await self._apply_slider_binding(spec, st.mode)
+            await self._publish_state(sid)
         self._save_state_if_changed()
 
     async def shutdown(self) -> None:
@@ -973,11 +987,8 @@ class VirtualSliderController:
 
     async def _apply_slider_binding(self, spec: VirtualSliderSpec, mode: SliderMode) -> bool:
         """Write ``CapTouchSliderConfig`` to the target peripheral after backing up original."""
-        if any(
-            (orphan.config_device_id, orphan.config_peripheral_id, orphan.config_var_name)
-            == (spec.config_device_id, spec.config_peripheral_id, spec.config_var_name)
-            for orphan in self._orphaned_bindings.values()
-        ):
+        if self._orphaned_bindings:
+            logger.warning("Deferring slider binding until pending originals are restored")
             return False
         if spec.config_device_id == "ble_mesh" and not self._is_mesh_leader():
             logger.debug(
@@ -1048,12 +1059,10 @@ class VirtualSliderController:
         else:
             if st.original_slider_config:
                 target_b64 = st.original_slider_config
-            elif spec.load_peripheral_id:
-                target_b64 = spec.passthrough_slider_config_b64(self._own_device_id)
             else:
                 logger.warning(
                     "Cannot switch virtual slider %s to passthrough: no original_slider_config "
-                    "captured and no load_peripheral_id configured",
+                    "captured",
                     spec.slider_id,
                 )
                 return False
@@ -1162,7 +1171,10 @@ class VirtualSliderController:
         st = self._states[slider_id]
         spec = self._specs[slider_id]
         if not await self._apply_slider_binding(spec, new_mode):
+            st.binding_ready = False
+            await self._publish_state(slider_id)
             return
+        st.binding_ready = True
         st.mode = new_mode
         self._save_state_if_changed()
         await self._publish_state(slider_id, event=None)
@@ -1254,6 +1266,13 @@ class VirtualSliderController:
         sid = spec.slider_id
         avail = availability_topic(self._panel)
         st_topic = self._state_topic(sid)
+        availability = [
+            {"topic": avail},
+            {
+                "topic": st_topic,
+                "value_template": "{{ 'online' if value_json.binding_ready else 'offline' }}",
+            },
+        ]
         ev_topic = self._event_topic(sid)
         dev_block = device_block(self._panel)
         uid_base = f"brilliant_{self._panel}_vs_{sid}"
@@ -1261,7 +1280,8 @@ class VirtualSliderController:
         # 1. Select entity: Mode (virtual vs passthrough)
         select_uid = f"{uid_base}_mode"
         select_cfg = {
-            "availability": [{"topic": avail}],
+            "availability": availability,
+            "availability_mode": "all",
             "command_topic": self._mode_cmd_topic(sid),
             "device": dev_block,
             "entity_category": "config",
@@ -1280,7 +1300,8 @@ class VirtualSliderController:
         # 2. Number entity: Virtual Brightness (1-255)
         number_uid = f"{uid_base}_brightness"
         number_cfg = {
-            "availability": [{"topic": avail}],
+            "availability": availability,
+            "availability_mode": "all",
             "command_topic": self._brightness_cmd_topic(sid),
             "device": dev_block,
             "icon": "mdi:brightness-6",
@@ -1301,7 +1322,8 @@ class VirtualSliderController:
         # 3. Light entity: Virtual Dimmer Light (JSON schema)
         light_uid = f"{uid_base}_light"
         light_cfg = {
-            "availability": [{"topic": avail}],
+            "availability": availability,
+            "availability_mode": "all",
             "brightness": True,
             "command_topic": self._light_cmd_topic(sid),
             "device": dev_block,
@@ -1319,7 +1341,8 @@ class VirtualSliderController:
         # 4. Sensor entity: Step (1..num_steps)
         step_uid = f"{uid_base}_step"
         step_cfg = {
-            "availability": [{"topic": avail}],
+            "availability": availability,
+            "availability_mode": "all",
             "device": dev_block,
             "icon": "mdi:stairs",
             "name": f"{spec.name} Slider Step",
@@ -1335,7 +1358,8 @@ class VirtualSliderController:
         # 5. Event entity: Multi-Tap & Gesture Events
         event_uid = f"{uid_base}_event"
         event_cfg = {
-            "availability": [{"topic": avail}],
+            "availability": availability,
+            "availability_mode": "all",
             "device": dev_block,
             "event_types": list(ALL_SLIDER_EVENT_TYPES),
             "icon": "mdi:gesture-tap-button",
@@ -1356,6 +1380,7 @@ class VirtualSliderController:
             "raw_intensity": st.raw_intensity,
             "step": st.step,
             "mode": st.mode.value,
+            "binding_ready": st.binding_ready,
             "last_event": st.last_event,
             "event_seq": st.event_seq,
         }
@@ -1461,6 +1486,7 @@ def parse_virtual_slider_specs(raw_json: str, own_device_id: str = "") -> list[V
                     **opt_kwargs,
                 )
             )
+    _validate_spec_ownership(specs)
     return specs
 
 
@@ -1472,6 +1498,32 @@ def _read_persisted_state_dict(state_path: Path | None) -> dict[str, Any] | None
     except Exception:
         return None
     return data if isinstance(data, dict) else None
+
+
+def _valid_persisted_state(data: Any) -> bool:
+    """Validate every recovery row before anything can replace or retire it."""
+    valid_rows = isinstance(data, dict) and all(
+        isinstance(entry, dict)
+        and "original_slider_config" in entry
+        and (
+            entry["original_slider_config"] is None
+            or (
+                isinstance(entry["original_slider_config"], str) and entry["original_slider_config"]
+            )
+        )
+        and all(
+            isinstance(entry.get(key), str) and entry[key]
+            for key in ("config_device_id", "config_peripheral_id", "config_var_name")
+        )
+        for entry in data.values()
+    )
+    if not valid_rows:
+        return False
+    targets = {
+        (row["config_device_id"], row["config_peripheral_id"], row["config_var_name"])
+        for row in data.values()
+    }
+    return len(targets) == len(data)
 
 
 def has_persisted_slider_backups(state_path: Path | None) -> bool:
@@ -1507,9 +1559,10 @@ async def restore_all_persisted_slider_bindings(
     if not await asyncio.to_thread(state_path.exists):
         return True
     data = _read_persisted_state_dict(state_path)
-    if data is None:
+    if not _valid_persisted_state(data):
         return False
-    if not data:
+    assert data is not None
+    if not any(entry["original_slider_config"] is not None for entry in data.values()):
         return True
 
     own_bus = False

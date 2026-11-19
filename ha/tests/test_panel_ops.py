@@ -1455,6 +1455,7 @@ async def test_uninstall_sequence_and_paths() -> None:
     assert shell.virtual_sliders_restored is True
     assert shell.commands == [
         "systemctl disable --now brilliant-mqtt 2>/dev/null || true",
+        "if [ -e /etc/brilliant-mqtt.env ]; then cat /etc/brilliant-mqtt.env; fi",
         "rm -f /etc/systemd/system/brilliant-mqtt.service /etc/brilliant-mqtt.env",
         "rm -rf /var/brilliant-mqtt /var/brilliant-mqtt.staging /var/brilliant-mqtt.staging.tar.gz",
         "systemctl daemon-reload",
@@ -3921,7 +3922,18 @@ async def test_uninstall_restore_script_propagates_result_and_runtime_failures(
     var_dir = tmp_path / "panel"
     state = var_dir / "state" / "virtual-sliders.json"
     state.parent.mkdir(parents=True)
-    state.write_text("{}")
+    state.write_text(
+        json.dumps(
+            {
+                "same": {
+                    "original_slider_config": "exact",
+                    "config_device_id": "panel",
+                    "config_peripheral_id": "faceplate_peripheral",
+                    "config_var_name": "slider_config:0",
+                }
+            }
+        )
+    )
     package = var_dir / "app" / "brilliant_mqtt"
     package.mkdir(parents=True)
     (package / "__init__.py").write_text("")
@@ -3929,7 +3941,7 @@ async def test_uninstall_restore_script_propagates_result_and_runtime_failures(
         operation = (
             "raise RuntimeError('bus startup failed')"
             if outcome == "bus_failure"
-            else f"return {outcome == 'success'!r}"
+            else ("path.write_text('{}'); return True" if outcome == "success" else "return False")
         )
         (package / "virtual_sliders.py").write_text(
             f"async def restore_all_persisted_slider_bindings(path):\n    {operation}\n"
@@ -3938,6 +3950,8 @@ async def test_uninstall_restore_script_propagates_result_and_runtime_failures(
 
     class ExecuteShell(FakeShell):
         async def run(self, command: str) -> RunResult:
+            if "BRILLIANT_RESTORE_VIRTUAL_SLIDERS" not in command:
+                return RunResult(0, "", "")
             body = command.split("\n", 1)[1].rsplit("\n", 1)[0]
             result = await asyncio.to_thread(
                 subprocess.run,
@@ -3955,3 +3969,94 @@ async def test_uninstall_restore_script_propagates_result_and_runtime_failures(
         with pytest.raises(panel_ops.PanelOpError, match="exited 1"):
             await panel_ops._restore_virtual_sliders_on_uninstall(shell)
     assert state.exists()
+
+
+@pytest.mark.parametrize(
+    "case", ["old_malformed", "scalar", "missing", "custom", "mixed", "unretired"]
+)
+async def test_uninstall_validates_ledger_independently_and_uses_effective_layout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    var_dir = tmp_path / "panel"
+    directory = var_dir / ("alternate" if case == "custom" else "state")
+    directory.mkdir(parents=True)
+    state = directory / "virtual-sliders.json"
+    valid_row = {
+        "original_slider_config": "exact",
+        "config_device_id": "panel",
+        "config_peripheral_id": "faceplate_peripheral",
+        "config_var_name": "slider_config:0",
+    }
+    contents = {
+        "old_malformed": "invalid JSON",
+        "scalar": json.dumps({"A": "exact"}),
+        "missing": json.dumps({"A": {"config_var_name": "slider_config:0"}}),
+    }.get(case, json.dumps({"A": valid_row}))
+    state.write_text(contents)
+    legacy = var_dir / "app" / "brilliant_mqtt"
+    legacy.mkdir(parents=True)
+    (legacy / "__init__.py").write_text("")
+    # Models old helpers which incorrectly report success without retiring a backup.
+    (legacy / "virtual_sliders.py").write_text(
+        "async def restore_all_persisted_slider_bindings(path):\n    return True\n"
+    )
+    if case == "mixed":
+        active = var_dir / "current" / "app" / "brilliant_mqtt"
+        active.mkdir(parents=True)
+        (active / "__init__.py").write_text("")
+        (active / "virtual_sliders.py").write_text(
+            "async def restore_all_persisted_slider_bindings(path):\n"
+            "    path.write_text('{}')\n    return True\n"
+        )
+    monkeypatch.setattr(panel_ops, "PANEL_VAR_DIR", str(var_dir))
+
+    class LocalRestoreShell(FakeShell):
+        async def run(self, command: str) -> RunResult:
+            self.commands.append(command)
+            if "BRILLIANT_RESTORE_VIRTUAL_SLIDERS" not in command:
+                env = f'MOTION_DESIRED_STATE_DIR="{directory}"' if case == "custom" else ""
+                return RunResult(0, env, "")
+            body = command.split("\n", 1)[1].rsplit("\n", 1)[0]
+            result = await asyncio.to_thread(
+                subprocess.run,
+                [sys.executable, "-I", "-c", body],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            return RunResult(result.returncode, result.stdout, result.stderr)
+
+    shell = LocalRestoreShell()
+    if case == "mixed":
+        await panel_ops._restore_virtual_sliders_on_uninstall(shell)
+        assert state.read_text() == "{}"
+    else:
+        with pytest.raises(panel_ops.PanelOpError):
+            await panel_ops._restore_virtual_sliders_on_uninstall(shell)
+        assert state.read_text() == contents
+
+
+async def test_uninstall_requires_confirmed_ssh_exit_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from custom_components.brilliant_mqtt.shell import _LegacyAsyncsshShell
+
+    commands: list[str] = []
+
+    class Connection:
+        async def run(self, command: str, **kwargs: object) -> SimpleNamespace:
+            commands.append(command)
+            status = None if "BRILLIANT_RESTORE_VIRTUAL_SLIDERS" in command else 0
+            return SimpleNamespace(exit_status=status, stdout="", stderr="")
+
+    async def no_baseline(shell: object) -> bool:
+        return False
+
+    monkeypatch.setattr(panel_ops, "baseline_retained", no_baseline)
+    shell = _LegacyAsyncsshShell("test", "", None)
+    monkeypatch.setattr(shell, "_conn", Connection())
+    with pytest.raises(panel_ops.PanelOpError, match="exited -1"):
+        await panel_ops.uninstall(shell)
+    assert not any(command.startswith("rm ") for command in commands)
