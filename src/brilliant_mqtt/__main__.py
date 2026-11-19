@@ -386,12 +386,16 @@ async def _run_session(
                 ambilight_controller = AmbilightController(
                     mqtt=mqtt,
                     panel=settings.panel,
-                    camera=GStreamerCameraAdapter(privacy_off=panel_bridge.is_privacy_off),
+                    camera=GStreamerCameraAdapter(
+                        privacy_off=panel_bridge.is_privacy_off,
+                        privacy_epoch=panel_bridge.camera_privacy_epoch,
+                    ),
                     state_path=amb_state_path,
                     default_enabled=False,
                     default_interval_s=settings.ambilight_interval_s,
                     owned_topics=owned_topics,
                     privacy_off=panel_bridge.is_privacy_off,
+                    privacy_epoch=panel_bridge.camera_privacy_epoch,
                 )
                 await ambilight_controller.start()
             except Exception:

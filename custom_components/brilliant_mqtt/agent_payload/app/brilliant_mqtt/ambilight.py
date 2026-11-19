@@ -34,6 +34,7 @@ from brilliant_mqtt.protocols import MqttClient
 from brilliant_mqtt.retained_topics import RetainedTopicLedger
 
 _T = TypeVar("_T")
+PrivacyEpoch = tuple[int, int, int]
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +62,28 @@ def is_privacy_shutter_closed(
     if privacy_toggle is None:
         return True
     return privacy_toggle.strip() != "0"
+
+
+def _read_privacy_epoch(provider: Callable[[], PrivacyEpoch] | None) -> PrivacyEpoch | None:
+    try:
+        return provider() if provider is not None else None
+    except Exception:
+        return None
+
+
+def _privacy_capture_blocked(
+    privacy_off: Callable[[], bool] | None,
+    provider: Callable[[], PrivacyEpoch] | None,
+    epoch: PrivacyEpoch | None,
+) -> bool:
+    if is_privacy_shutter_closed(privacy_off=privacy_off):
+        return True
+    if provider is None or epoch is None:
+        return True
+    try:
+        return provider() != epoch
+    except Exception:
+        return True
 
 
 @dataclass(frozen=True)
@@ -382,14 +405,17 @@ class GStreamerCameraAdapter(CameraCaptureProtocol):
         timeout_s: float = 4.0,
         *,
         privacy_off: Callable[[], bool] | None = None,
+        privacy_epoch: Callable[[], PrivacyEpoch] | None = None,
     ) -> None:
         self._device = device
         self._timeout_s = timeout_s
         self._privacy_off = privacy_off
+        self._privacy_epoch = privacy_epoch
         self._lock = asyncio.Lock()
 
     async def _run_gst_capture(self, args: list[str], out_path: Path) -> bytes | None:
-        if is_privacy_shutter_closed(privacy_off=self._privacy_off):
+        epoch = _read_privacy_epoch(self._privacy_epoch)
+        if _privacy_capture_blocked(self._privacy_off, self._privacy_epoch, epoch):
             logger.info("Camera capture skipped: bus privacy_toggle is not positively off")
             _cleanup_capture_output(out_path)
             return None
@@ -400,9 +426,9 @@ class GStreamerCameraAdapter(CameraCaptureProtocol):
 
         async with self._lock:
             try:
-                if is_privacy_shutter_closed(privacy_off=self._privacy_off):
+                if _privacy_capture_blocked(self._privacy_off, self._privacy_epoch, epoch):
                     logger.info(
-                        "Camera capture skipped: bus privacy_toggle turned on before launch"
+                        "Camera capture skipped: privacy authorization changed before launch"
                     )
                     return None
                 proc = await asyncio.create_subprocess_exec(
@@ -426,9 +452,9 @@ class GStreamerCameraAdapter(CameraCaptureProtocol):
                     err_txt = (stderr or b"").decode("utf-8", errors="replace").strip()
                     logger.warning("gst-launch-1.0 exited with %s: %s", proc.returncode, err_txt)
                     return None
-                if is_privacy_shutter_closed(privacy_off=self._privacy_off):
+                if _privacy_capture_blocked(self._privacy_off, self._privacy_epoch, epoch):
                     logger.info(
-                        "Camera capture dropped: bus privacy_toggle turned on during capture"
+                        "Camera capture dropped: privacy authorization changed during capture"
                     )
                     return None
                 return _read_capture_output(out_path)
@@ -478,6 +504,7 @@ class AmbilightController:
         default_auto_crop_enabled: bool = False,
         owned_topics: RetainedTopicLedger | None = None,
         privacy_off: Callable[[], bool] | None = None,
+        privacy_epoch: Callable[[], PrivacyEpoch] | None = None,
         sleep: Callable[[float], Any] = asyncio.sleep,
     ) -> None:
         self._mqtt = mqtt
@@ -486,6 +513,7 @@ class AmbilightController:
         self._state_path = state_path
         self._owned_topics = owned_topics
         self._privacy_off = privacy_off
+        self._privacy_epoch = privacy_epoch
         self._sleep = sleep
 
         self._enabled = default_enabled
@@ -642,8 +670,10 @@ class AmbilightController:
             except asyncio.CancelledError:
                 return
 
-    def _is_blocked_by_privacy(self) -> bool:
-        return self._closed or is_privacy_shutter_closed(privacy_off=self._privacy_off)
+    def _is_blocked_by_privacy(self, epoch: PrivacyEpoch | None) -> bool:
+        return self._closed or _privacy_capture_blocked(
+            self._privacy_off, self._privacy_epoch, epoch
+        )
 
     async def _run_camera_work(
         self, operation: Callable[[], Coroutine[Any, Any, _T]], stopped_result: _T
@@ -666,11 +696,12 @@ class AmbilightController:
         return await self._run_camera_work(self._sample_once, None)
 
     async def _sample_once(self) -> AmbilightSample | None:
-        if self._is_blocked_by_privacy():
+        epoch = _read_privacy_epoch(self._privacy_epoch)
+        if self._is_blocked_by_privacy(epoch):
             return None
         c = self._crop.normalized()
         frame = await self._camera.capture_i420_frame(c)
-        if frame is None or self._is_blocked_by_privacy():
+        if frame is None or self._is_blocked_by_privacy(epoch):
             return None
         try:
             sample = extract_ambilight_sample_from_i420(frame, c.width, c.height)
@@ -679,7 +710,7 @@ class AmbilightController:
             return None
         self._last_sample = sample
         await self._publish_state()
-        if self._is_blocked_by_privacy():
+        if self._is_blocked_by_privacy(epoch):
             return None
         await self._mqtt.publish(
             self._color_topic(),
@@ -704,11 +735,12 @@ class AmbilightController:
         return await self._run_camera_work(self._trigger_snapshot, False)
 
     async def _trigger_snapshot(self) -> bool:
-        if self._is_blocked_by_privacy():
+        epoch = _read_privacy_epoch(self._privacy_epoch)
+        if self._is_blocked_by_privacy(epoch):
             return False
         c = self._crop.normalized()
         jpeg = await self._camera.capture_jpeg_snapshot(c)
-        if jpeg is None or self._is_blocked_by_privacy():
+        if jpeg is None or self._is_blocked_by_privacy(epoch):
             return False
         payload_str = base64.b64encode(jpeg).decode("ascii")
         await self._mqtt.publish(self._snapshot_topic(), payload_str, retain=False)
@@ -749,11 +781,12 @@ class AmbilightController:
         return await self._run_camera_work(self._auto_calibrate_crop, None)
 
     async def _auto_calibrate_crop(self) -> AmbilightCrop | None:
-        if self._is_blocked_by_privacy():
+        epoch = _read_privacy_epoch(self._privacy_epoch)
+        if self._is_blocked_by_privacy(epoch):
             return None
         base = self._saved_crop.normalized()
         frame = await self._camera.capture_i420_frame(base)
-        if frame is None or self._is_blocked_by_privacy():
+        if frame is None or self._is_blocked_by_privacy(epoch):
             return None
         bbox = estimate_i420_active_bbox_norm(frame, base.width, base.height)
         self._auto_crop_enabled = True
