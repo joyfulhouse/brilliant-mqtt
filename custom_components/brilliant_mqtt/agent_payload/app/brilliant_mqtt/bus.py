@@ -626,6 +626,11 @@ class RpcBusAdapter:
     def capture_generation(self) -> int:
         return self._capture_generation
 
+    @property
+    def capture_sequence(self) -> int:
+        """Latest allocated boundary, including undelivered pushes and empty reads."""
+        return self._capture_sequence
+
     def _next_capture_provenance(self) -> CaptureProvenance:
         self._capture_sequence += 1
         return CaptureProvenance(self._capture_generation, self._capture_sequence)

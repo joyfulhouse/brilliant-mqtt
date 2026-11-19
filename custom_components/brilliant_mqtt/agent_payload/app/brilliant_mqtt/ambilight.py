@@ -444,7 +444,11 @@ class GStreamerCameraAdapter(CameraCaptureProtocol):
         os.close(fd)
         out_path = Path(tmp_name)
         args = _build_gstreamer_args(crop, str(out_path), jpeg=jpeg, device=self._device)
-        return await self._run_gst_capture(args, out_path)
+        try:
+            return await self._run_gst_capture(args, out_path)
+        finally:
+            # Own cleanup from allocation, including cancellation before lock acquisition.
+            _cleanup_capture_output(out_path)
 
     async def capture_i420_frame(self, crop: AmbilightCrop) -> bytes | None:
         return await self._capture_file(crop, jpeg=False)
@@ -675,7 +679,7 @@ class AmbilightController:
             return None
         self._last_sample = sample
         await self._publish_state()
-        if self._closed:
+        if self._is_blocked_by_privacy():
             return None
         await self._mqtt.publish(
             self._color_topic(),

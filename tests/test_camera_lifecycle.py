@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from collections.abc import Coroutine
 from dataclasses import replace
 from pathlib import Path
@@ -10,7 +11,7 @@ from typing import Any
 
 import pytest
 
-from brilliant_mqtt.ambilight import AmbilightController, AmbilightCrop
+from brilliant_mqtt.ambilight import AmbilightController, AmbilightCrop, GStreamerCameraAdapter
 from brilliant_mqtt.bridge import Bridge
 from brilliant_mqtt.model import BrilliantDevice, CaptureProvenance, DeviceKind, Variable
 from tests.fakes import FakeBus, FakeMqtt
@@ -143,6 +144,27 @@ async def test_hardware_push_without_entities_and_bridge_shutdown_revoke_permiss
     assert not bridge.is_privacy_off()
 
 
+@pytest.mark.parametrize("ambiguous", [False, True])
+async def test_omission_fences_captured_but_undelivered_same_generation_push(
+    ambiguous: bool,
+) -> None:
+    bus = FakeBus([hardware()])
+    bridge = Bridge(bus, FakeMqtt(), "living_room")
+    await bridge.reconcile()
+    delayed = replace(hardware(), capture_provenance=bus._next_provenance())
+    # Captured after the last applied evidence, but queued before an authoritative read.
+    bus._devices = [delayed, replace(delayed)] if ambiguous else []
+    await bridge.poll_once()
+    assert not bridge.is_privacy_off()
+    await bridge._on_change(delayed)
+    assert not bridge.is_privacy_off()
+    # A later complete read supplies new explicit evidence and restores permission.
+    bus._devices = [hardware()]
+    await bridge.poll_once()
+    assert bridge.is_privacy_off()
+    await bridge.shutdown_wired_feedback()
+
+
 @pytest.mark.parametrize("operation", ["snapshot", "auto_crop", "sample", "direct_snapshot"])
 @pytest.mark.parametrize("ignore_cancel", [False, True])
 async def test_shutdown_settles_camera_work_and_rejects_new_commands(
@@ -207,3 +229,111 @@ async def test_shutdown_settles_poll_without_sleeping_again() -> None:
     assert camera.settled.is_set()
     assert not sleeps
     assert controller._poll_task is None
+
+
+async def test_privacy_revoked_during_state_publish_suppresses_color() -> None:
+    privacy_off = True
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class HeldMqtt(FakeMqtt):
+        async def publish(
+            self, topic: str, payload: str, retain: bool = False, qos: int = 0
+        ) -> None:
+            if topic.endswith("/ambilight/state"):
+                entered.set()
+                await release.wait()
+            await super().publish(topic, payload, retain=retain, qos=qos)
+
+    mqtt = HeldMqtt()
+    camera = HeldCamera()
+    camera.release.set()
+    controller = AmbilightController(mqtt, "living_room", camera, privacy_off=lambda: privacy_off)
+    task = asyncio.create_task(controller.sample_once())
+    await asyncio.wait_for(entered.wait(), 1)
+    privacy_off = False
+    release.set()
+    assert await task is None
+    assert not any(topic.endswith("/color") for topic, _, _ in mqtt.published)
+    await controller.shutdown()
+
+
+async def test_cancelled_camera_lock_waiter_cleans_allocated_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    allocated = asyncio.Event()
+    output = tmp_path / "camera.jpg"
+
+    def mkstemp(*args: Any, **kwargs: Any) -> tuple[int, str]:
+        fd = os.open(output, os.O_CREAT | os.O_WRONLY, 0o600)
+        allocated.set()
+        return fd, str(output)
+
+    monkeypatch.setattr("brilliant_mqtt.ambilight.tempfile.mkstemp", mkstemp)
+    monkeypatch.setattr("brilliant_mqtt.ambilight._device_exists_on_panel", lambda _: True)
+    adapter = GStreamerCameraAdapter(privacy_off=lambda: True)
+    await adapter._lock.acquire()
+    task = asyncio.create_task(adapter.capture_jpeg_snapshot(AmbilightCrop()))
+    try:
+        await asyncio.wait_for(allocated.wait(), 1)
+        assert output.exists()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not output.exists()
+    finally:
+        adapter._lock.release()
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_real_bus_empty_read_fences_push_waiting_for_delivery() -> None:
+    from brilliant_mqtt.bus import RpcBusAdapter
+    from tests.fakes import _RawDevice, _RawPeripheral
+
+    raw_hardware = _RawPeripheral("0", "privacy_toggle")
+    raw_hardware.peripheral_type = 22
+    raw = _RawDevice("panel_1", {"hardware": raw_hardware})
+
+    class Observer:
+        current = raw
+
+        async def get_device(self, device_id: str) -> _RawDevice:
+            return self.current
+
+    observer = Observer()
+    adapter = RpcBusAdapter()
+    adapter._obs = observer
+    adapter._own_device_id = "panel_1"
+    bridge = Bridge(adapter, FakeMqtt(), "living_room")
+    await bridge.reconcile()
+    assert bridge.is_privacy_off()
+    callback, coalesce, want = adapter._change_cbs[0]
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def held_callback(device: BrilliantDevice) -> None:
+        entered.set()
+        await release.wait()
+        await callback(device)
+
+    adapter._change_cbs[0] = (held_callback, coalesce, want)
+    adapter._dispatch_raw_device(raw)
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        push_sequence = adapter.capture_sequence
+        observer.current = _RawDevice("panel_1", {})
+        await bridge.poll_once()
+        assert adapter.capture_sequence > push_sequence
+        assert not bridge.is_privacy_off()
+        release.set()
+        await asyncio.gather(*adapter._pending_tasks)
+        assert not bridge.is_privacy_off()
+        observer.current = raw
+        await bridge.poll_once()
+        assert bridge.is_privacy_off()
+    finally:
+        release.set()
+        await asyncio.gather(*adapter._pending_tasks, return_exceptions=True)
+        await bridge.shutdown_wired_feedback()

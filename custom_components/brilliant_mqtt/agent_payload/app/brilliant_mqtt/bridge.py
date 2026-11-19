@@ -282,6 +282,7 @@ class Bridge:
         self._privacy_off = False
         self._privacy_source_generation = getattr(bus, "capture_generation", 0)
         self._privacy_sequence = -1
+        self._privacy_invalid_through = -1
         # command topic → (peripheral_id, descriptor). descriptor is None for the
         # PRIMARY JSON light/switch topic; an EntityDescriptor for each aux topic.
         self._by_cmd_topic: dict[str, tuple[str, EntityDescriptor | None]] = {}
@@ -371,17 +372,36 @@ class Bridge:
         if generation != self._privacy_source_generation:
             self._privacy_off = False
             self._privacy_sequence = -1
+            self._privacy_invalid_through = -1
             self._privacy_source_generation = generation
+
+    def _invalidate_privacy(self, devices: list[BrilliantDevice] | None = None) -> None:
+        self._sync_privacy_generation()
+        self._privacy_off = False
+        # Delivery can lag capture. Fence the live source's high-water mark,
+        # including empty reads that have no peripheral to carry provenance.
+        sequences = [self._privacy_invalid_through, self._bus.capture_sequence]
+        sequences.extend(
+            d.capture_provenance.sequence
+            for d in devices or ()
+            if d.capture_provenance is not None
+            and d.capture_provenance.source_generation == self._privacy_source_generation
+        )
+        self._privacy_invalid_through = max(sequences)
 
     def _observe_privacy(self, device: BrilliantDevice) -> None:
         if device.kind is not DeviceKind.HARDWARE:
             return
         self._sync_privacy_generation()
         provenance = device.capture_provenance
+        if provenance is None and self._privacy_invalid_through >= 0:
+            return
         if provenance is not None:
             if provenance.source_generation != self._privacy_source_generation:
                 return
             if provenance.sequence < self._privacy_sequence:
+                return
+            if provenance.sequence <= self._privacy_invalid_through:
                 return
             self._privacy_sequence = provenance.sequence
         var = device.variables.get("privacy_toggle")
@@ -396,13 +416,13 @@ class Bridge:
         self._sync_privacy_generation()
         hardware = [d for d in devices if self._included(d) and d.kind is DeviceKind.HARDWARE]
         if len(hardware) != 1:
-            self._privacy_off = False
+            self._invalidate_privacy(devices)
             return
         provenance = hardware[0].capture_provenance
         if provenance is not None and (
             provenance.source_generation != self._privacy_source_generation
         ):
-            self._privacy_off = False
+            self._invalidate_privacy(devices)
             return
         self._observe_privacy(hardware[0])
 
@@ -604,7 +624,7 @@ class Bridge:
 
     async def reconcile_after_reconnect(self) -> None:
         """Retire session-local wired evidence before reading a new bus generation."""
-        self._privacy_off = False
+        self._invalidate_privacy()
         if not self._wired_feedback_enabled:
             return
         lifecycle = self._wired_lifecycle
