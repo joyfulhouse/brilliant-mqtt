@@ -1706,6 +1706,15 @@ class HostedVirtualPeripheralAdapter(VirtualPeripheralHostProtocol):
                     default_value=default_val,
                     push_func=_make_push(k) if is_settable else None,
                 )
+            if spec.room_ids:
+                from thrift_types.configuration.ttypes import RoomAssignment
+
+                specs["room_assignment"] = VariableSpec(
+                    RoomAssignment,
+                    True,
+                    default_value=RoomAssignment(room_ids=list(spec.room_ids)),
+                    push_func=_make_push("room_assignment"),
+                )
             return specs
 
         class _DynamicVirtualPeripheral(Peripheral):
@@ -1715,7 +1724,7 @@ class HostedVirtualPeripheralAdapter(VirtualPeripheralHostProtocol):
 
             @property
             def name(self) -> str:
-                return spec.peripheral_id
+                return spec.display_name if spec.room_ids else spec.peripheral_id
 
             @property
             def peripheral_type(self) -> int:
