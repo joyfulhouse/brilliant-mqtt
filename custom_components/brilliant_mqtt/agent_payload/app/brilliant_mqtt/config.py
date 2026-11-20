@@ -15,6 +15,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 
+from brilliant_mqtt.atmosphere import is_allowed_personal_album_url
 from brilliant_mqtt.ha_control_protocol import is_panel_slug
 from brilliant_mqtt.virtual_sliders import parse_virtual_slider_specs
 
@@ -129,6 +130,22 @@ class Settings:
     # Enable panel camera snapshot & TV Ambilight entities on this panel.
     ambilight_enabled: bool = False
     ambilight_interval_s: float = 1.0
+    # Enable on-panel Atmosphere ambient TV photography & virtual light/slider.
+    atmosphere_enabled: bool = False
+    atmosphere_cast_host: str = ""
+    atmosphere_cast_port: int = 8009
+    atmosphere_name: str = "Atmosphere"
+    atmosphere_peripheral_id: str = "tv_atmosphere"
+    atmosphere_room_id: str = ""
+    atmosphere_ambiled_peripheral_id: str = "auto"
+    atmosphere_ambiled_brightness_pct: int = 85
+    atmosphere_mic_device: str = "default"
+    atmosphere_gemini_api_key: str = ""
+    atmosphere_gemini_model: str = "gemini-2.5-flash"
+    atmosphere_pexels_api_key: str = ""
+    atmosphere_personal_album_url: str = ""
+    atmosphere_stt_url: str = ""
+    atmosphere_curate_url: str = ""
 
     def __post_init__(self) -> None:
         if (
@@ -280,6 +297,37 @@ class Settings:
         ambilight_interval_s = float(env.get("AMBILIGHT_INTERVAL_S", "1.0"))
         if not math.isfinite(ambilight_interval_s) or not 0.25 <= ambilight_interval_s <= 10:
             raise ValueError("AMBILIGHT_INTERVAL_S must be finite and in 0.25..10 seconds")
+        atmosphere_enabled = _env_bool(env, "ATMOSPHERE_ENABLED", "0")
+        atmosphere_cast_host = env.get("ATMOSPHERE_CAST_HOST", "").strip()
+        atmosphere_cast_port = int(env.get("ATMOSPHERE_CAST_PORT", "8009"))
+        if not 1 <= atmosphere_cast_port <= 65535:
+            raise ValueError("ATMOSPHERE_CAST_PORT must be in 1..65535")
+        atmosphere_name = env.get("ATMOSPHERE_NAME", "Atmosphere").strip() or "Atmosphere"
+        atmosphere_peripheral_id = (
+            env.get("ATMOSPHERE_PERIPHERAL_ID", "tv_atmosphere").strip() or "tv_atmosphere"
+        )
+        atmosphere_room_id = env.get("ATMOSPHERE_ROOM_ID", "").strip()
+        atmosphere_ambiled_peripheral_id = env.get(
+            "ATMOSPHERE_AMBILED_PERIPHERAL_ID", "auto"
+        ).strip()
+        atmosphere_ambiled_brightness_pct = int(env.get("ATMOSPHERE_AMBILED_BRIGHTNESS_PCT", "85"))
+        if not 0 <= atmosphere_ambiled_brightness_pct <= 100:
+            raise ValueError("ATMOSPHERE_AMBILED_BRIGHTNESS_PCT must be in 0..100")
+        atmosphere_mic_device = env.get("ATMOSPHERE_MIC_DEVICE", "default").strip() or "default"
+        atmosphere_gemini_api_key = env.get("ATMOSPHERE_GEMINI_API_KEY", "").strip()
+        atmosphere_gemini_model = (
+            env.get("ATMOSPHERE_GEMINI_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
+        )
+        atmosphere_pexels_api_key = env.get("ATMOSPHERE_PEXELS_API_KEY", "").strip()
+        atmosphere_personal_album_url = env.get("ATMOSPHERE_PERSONAL_ALBUM_URL", "").strip()
+        if atmosphere_personal_album_url and not is_allowed_personal_album_url(
+            atmosphere_personal_album_url
+        ):
+            raise ValueError(
+                "ATMOSPHERE_PERSONAL_ALBUM_URL must be an https:// Google Photos or iCloud link"
+            )
+        atmosphere_stt_url = env.get("ATMOSPHERE_STT_URL", "").strip()
+        atmosphere_curate_url = env.get("ATMOSPHERE_CURATE_URL", "").strip()
 
         return cls(
             panel=panel,
@@ -317,4 +365,19 @@ class Settings:
             virtual_sliders_json=virtual_sliders_json,
             ambilight_enabled=ambilight_enabled,
             ambilight_interval_s=ambilight_interval_s,
+            atmosphere_enabled=atmosphere_enabled,
+            atmosphere_cast_host=atmosphere_cast_host,
+            atmosphere_cast_port=atmosphere_cast_port,
+            atmosphere_name=atmosphere_name,
+            atmosphere_peripheral_id=atmosphere_peripheral_id,
+            atmosphere_room_id=atmosphere_room_id,
+            atmosphere_ambiled_peripheral_id=atmosphere_ambiled_peripheral_id,
+            atmosphere_ambiled_brightness_pct=atmosphere_ambiled_brightness_pct,
+            atmosphere_mic_device=atmosphere_mic_device,
+            atmosphere_gemini_api_key=atmosphere_gemini_api_key,
+            atmosphere_gemini_model=atmosphere_gemini_model,
+            atmosphere_pexels_api_key=atmosphere_pexels_api_key,
+            atmosphere_personal_album_url=atmosphere_personal_album_url,
+            atmosphere_stt_url=atmosphere_stt_url,
+            atmosphere_curate_url=atmosphere_curate_url,
         )
