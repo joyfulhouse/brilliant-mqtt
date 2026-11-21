@@ -306,6 +306,8 @@ AUX_SPECS: dict[DeviceKind, tuple[AuxSpec, ...]] = {
             value_kind="bool",
             entity_category="config",
         ),
+        # Backlight sysfs max_brightness is 15 on IMX6, and panel firmware scales
+        # higher-max backlights against / 15 on a 0–15 bus scale.
         AuxSpec(
             var="screen_brightness",
             component="number",
@@ -313,7 +315,7 @@ AUX_SPECS: dict[DeviceKind, tuple[AuxSpec, ...]] = {
             value_kind="int",
             entity_category="config",
             min_value=0,
-            max_value=10,
+            max_value=15,
             step=1,
         ),
         AuxSpec(
