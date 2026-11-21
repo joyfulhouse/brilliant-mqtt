@@ -685,6 +685,18 @@ class ProvisionedPanel:
         )
 
 
+class PanelInspector(Protocol):
+    """Inspect a connected panel; aarch64 is accepted only on explicit opt-in."""
+
+    async def __call__(
+        self,
+        shell: PanelShell,
+        identity: HostIdentity,
+        *,
+        allow_aarch64: bool = False,
+    ) -> PanelFacts: ...
+
+
 class _Journal(Protocol):
     async def async_begin_ownerless_finalize(
         self, expected: RetainedRollback
@@ -896,7 +908,7 @@ class PanelProvisioner:
         journal: _Journal,
         identity_fetcher: Callable[[str], Awaitable[HostIdentity]],
         shell_factory: Callable[[str, str, str], PanelShell],
-        inspector: Callable[[PanelShell, HostIdentity], Awaitable[PanelFacts]],
+        inspector: PanelInspector,
         duplicate_fingerprint: Callable[[str], Awaitable[bool]],
         operations: PanelOperations,
         snapshot_to_stored: Callable[[PanelSnapshot], StoredPanelSnapshot],
