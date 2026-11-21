@@ -430,9 +430,7 @@ class _PanelOnboardingMixin:
             step_id="experimental_aarch64",
             data_schema=experimental_aarch64_schema(),
             errors=errors,
-            description_placeholders={
-                "documentation_url": _PANEL_ONBOARDING_DOCUMENTATION_URL
-            },
+            description_placeholders={"documentation_url": _PANEL_ONBOARDING_DOCUMENTATION_URL},
         )
 
     async def async_step_panel_discard_unactivated(

@@ -1232,9 +1232,7 @@ class PanelProvisioner:
         await _report(progress, ProvisioningProgressStage.INSPECTING)
         state.failure_code = "inspection_failed"
         state.failure_stage = "inspection"
-        facts = await self._inspector(
-            state.shell, identity, allow_aarch64=request.allow_aarch64
-        )
+        facts = await self._inspector(state.shell, identity, allow_aarch64=request.allow_aarch64)
         if not isinstance(facts, PanelFacts) or facts.fingerprint != identity.fingerprint:
             raise PanelProvisioningError("inspection_failed")
         if await self._duplicate_fingerprint(identity.fingerprint):

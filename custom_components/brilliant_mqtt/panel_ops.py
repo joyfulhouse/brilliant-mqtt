@@ -3300,8 +3300,7 @@ async def deploy_voice_payload(shell: PanelShell, local_tarball_path: str, versi
     arch_check = await shell.run(_VOICE_ARCH_CHECK)
     if arch_check.exit_status != 0:
         raise PanelOpError(
-            "voice satellite payload is armv7l-only; this panel's architecture is "
-            "not supported"
+            "voice satellite payload is armv7l-only; this panel's architecture is not supported"
         )
     await shell.run(f"rm -rf {_VOICE_STAGING_DIR} {_VOICE_STAGING_TARBALL}")
     await shell.put_file(local_tarball_path, _VOICE_STAGING_TARBALL, 0o644)

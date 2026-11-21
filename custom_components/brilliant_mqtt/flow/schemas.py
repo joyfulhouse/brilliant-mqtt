@@ -494,9 +494,7 @@ def panel_connect_form_source(user_input: Mapping[str, object]) -> dict[str, obj
 
 def experimental_aarch64_schema() -> vol.Schema:
     """Explicit i350/aarch64 pilot opt-in; default remains off."""
-    return vol.Schema(
-        {vol.Required(CONF_ALLOW_AARCH64, default=False): bool}
-    )
+    return vol.Schema({vol.Required(CONF_ALLOW_AARCH64, default=False): bool})
 
 
 def normalize_experimental_aarch64_input(user_input: Mapping[str, object]) -> bool:

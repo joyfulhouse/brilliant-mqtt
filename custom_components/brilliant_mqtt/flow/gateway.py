@@ -312,9 +312,7 @@ async def _async_inspect_candidate(
         primary: BaseException | None = None
         try:
             await shell.connect()
-            return await async_inspect_panel(
-                shell, identity, allow_aarch64=allow_aarch64
-            )
+            return await async_inspect_panel(shell, identity, allow_aarch64=allow_aarch64)
         except BaseException as error:
             primary = error
             raise

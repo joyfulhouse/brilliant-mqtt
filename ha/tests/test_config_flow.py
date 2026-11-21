@@ -1310,8 +1310,14 @@ async def test_panel_connect_fetches_identity_before_password_authentication(
         events.append("authenticated_shell")
         return shell
 
-    async def inspect(candidate_shell: Any, identity: HostIdentity) -> PanelFacts:
+    async def inspect(
+        candidate_shell: Any,
+        identity: HostIdentity,
+        *,
+        allow_aarch64: bool = False,
+    ) -> PanelFacts:
         assert candidate_shell is shell
+        assert allow_aarch64 is False
         assert identity == _identity()
         events.append("inspection")
         return _facts(identity)
@@ -5373,7 +5379,7 @@ async def test_combined_credential_repair_preserves_configuration_on_failure(
     identity = _identity()
     expected = original
 
-    async def inspect(*_args: object) -> PanelFacts:
+    async def inspect(*_args: object, **_kwargs: object) -> PanelFacts:
         nonlocal expected
         if failure == "authentication":
             raise asyncssh.PermissionDenied("SECRET rejected password")

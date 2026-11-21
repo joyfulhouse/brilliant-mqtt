@@ -64,7 +64,6 @@ def test_gpio_reset_then_reboot() -> None:
     assert result == 0
 
 
-
 def test_gpio_reset_skipped_off_imx_but_still_reboots(caplog: pytest.LogCaptureFixture) -> None:
     """Issue #155: the GPIO 2/5 + sdhci-esdhc-imx reset is i.MX6-specific."""
     r = Rec()

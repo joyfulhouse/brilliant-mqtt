@@ -1118,6 +1118,7 @@ def test_panel_feature_overrides_reject_unknown_or_unsafe_values(
     assert dict(raised.value.errors) == {expected_field: expected_error}
     assert repr(value) not in repr(raised.value)
 
+
 def test_experimental_aarch64_schema_defaults_off() -> None:
     schema = experimental_aarch64_schema()
     serialized = _serialized(schema)
@@ -1133,4 +1134,3 @@ def test_experimental_aarch64_normalization_requires_explicit_true() -> None:
     assert dict(raised.value.errors) == {CONF_ALLOW_AARCH64: "aarch64_opt_in_required"}
     with pytest.raises(FlowInputError):
         normalize_experimental_aarch64_input({})
-
