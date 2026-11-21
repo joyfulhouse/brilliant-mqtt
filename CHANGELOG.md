@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Experimental, per-panel opt-in for aarch64 / i350 panels during Add panel.
+  Official support remains armv7l only; the architecture gate is unchanged
+  unless that panel's opt-in is checked (default off). Voice is refused on
+  aarch64. The i.MX6 Wi-Fi last-resort reset is skipped when
+  `sdhci-esdhc-imx` is absent (same guard as #230).
+
 ### Fixed
 
 - Removing an unactivated onboarding baseline now checks candidate release

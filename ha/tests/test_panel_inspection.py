@@ -568,3 +568,24 @@ async def test_inspection_rejects_shell_for_a_different_identity_before_command(
 
     assert raised.value.code == "host_key_changed"
     assert shell.commands == []
+
+async def test_aarch64_is_accepted_only_with_explicit_opt_in() -> None:
+    shell = await _connected_shell(RunResult(0, _output(architecture="aarch64"), ""))
+
+    with pytest.raises(PanelCompatibilityError) as raised:
+        await async_inspect_panel(shell, _IDENTITY)
+    assert raised.value.code == "unsupported_architecture"
+    assert raised.value.architecture == "aarch64"
+
+    facts = await async_inspect_panel(shell, _IDENTITY, allow_aarch64=True)
+    assert facts.architecture == "aarch64"
+
+
+async def test_opt_in_does_not_admit_other_unqualified_architectures() -> None:
+    shell = await _connected_shell(RunResult(0, _output(architecture="x86_64"), ""))
+
+    with pytest.raises(PanelCompatibilityError) as raised:
+        await async_inspect_panel(shell, _IDENTITY, allow_aarch64=True)
+    assert raised.value.code == "unsupported_architecture"
+    assert raised.value.architecture == "x86_64"
+

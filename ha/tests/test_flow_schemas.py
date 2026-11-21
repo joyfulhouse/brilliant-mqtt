@@ -15,6 +15,7 @@ from homeassistant.helpers import data_entry_flow as flow_helpers
 
 from custom_components.brilliant_mqtt.broker import BrokerKind
 from custom_components.brilliant_mqtt.const import (
+    CONF_ALLOW_AARCH64,
     CONF_BROKER_KIND,
     CONF_FEATURE_OVERRIDES,
     CONF_HA_CONTROL_DOMAINS,
@@ -65,7 +66,9 @@ from custom_components.brilliant_mqtt.flow.schemas import (
     broker_advanced_schema,
     broker_schema,
     control_char_errors,
+    experimental_aarch64_schema,
     normalize_broker_input,
+    normalize_experimental_aarch64_input,
     normalize_panel_connect_input,
     normalize_panel_name,
     panel_confirm_schema,
@@ -1114,3 +1117,20 @@ def test_panel_feature_overrides_reject_unknown_or_unsafe_values(
     )
     assert dict(raised.value.errors) == {expected_field: expected_error}
     assert repr(value) not in repr(raised.value)
+
+def test_experimental_aarch64_schema_defaults_off() -> None:
+    schema = experimental_aarch64_schema()
+    serialized = _serialized(schema)
+    fields = {field["name"]: field for field in serialized}
+    assert set(fields) == {CONF_ALLOW_AARCH64}
+    assert schema({CONF_ALLOW_AARCH64: True}) == {CONF_ALLOW_AARCH64: True}
+
+
+def test_experimental_aarch64_normalization_requires_explicit_true() -> None:
+    assert normalize_experimental_aarch64_input({CONF_ALLOW_AARCH64: True}) is True
+    with pytest.raises(FlowInputError) as raised:
+        normalize_experimental_aarch64_input({CONF_ALLOW_AARCH64: False})
+    assert dict(raised.value.errors) == {CONF_ALLOW_AARCH64: "aarch64_opt_in_required"}
+    with pytest.raises(FlowInputError):
+        normalize_experimental_aarch64_input({})
+

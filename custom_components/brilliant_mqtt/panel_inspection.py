@@ -26,7 +26,11 @@ _MAX_KIB_VALUE = (2**63 - 1) // 1024
 _PANEL_PYTHON = "/data/switch-embedded/env/bin/python3"
 _MODEL_PATH = "/sys/firmware/devicetree/base/model"
 _RELEASE_INFO_PATH = "/etc/release_info.json"
-_SUPPORTED_ARCHITECTURES = frozenset({"armv7l"})
+_QUALIFIED_ARCHITECTURES = frozenset({"armv7l"})
+_EXPERIMENTAL_ARCHITECTURES = frozenset({"aarch64"})
+# Officially qualified hardware only. aarch64/i350 is admitted solely when the
+# caller passes allow_aarch64=True (explicit onboarding opt-in, default off).
+_SUPPORTED_ARCHITECTURES = _QUALIFIED_ARCHITECTURES
 _SERVICE_STATES = frozenset(
     {
         "active",
@@ -310,21 +314,35 @@ PANEL_INSPECTION_COMMAND = "{ " + "; ".join(_PANEL_INSPECTION_PROBES) + "; } 2>&
 class PanelCompatibilityError(ValueError):
     """Redacted inspection or compatibility result with a stable code."""
 
-    __slots__ = ("capability", "code")
+    __slots__ = ("architecture", "capability", "code")
 
-    def __init__(self, code: str, *, capability: str | None = None) -> None:
+    def __init__(
+        self,
+        code: str,
+        *,
+        capability: str | None = None,
+        architecture: str | None = None,
+    ) -> None:
         valid_toolchain_capability = (
             isinstance(capability, str) and capability in PANEL_TOOLCHAIN_CAPABILITIES
+        )
+        valid_architecture = (
+            isinstance(architecture, str)
+            and architecture.isascii()
+            and architecture.isidentifier()
+            and 1 <= len(architecture) <= 32
         )
         if (
             code not in _ERROR_CODES
             or (code == "unsupported_panel_toolchain" and not valid_toolchain_capability)
-            or code != "unsupported_panel_toolchain"
-            and capability is not None
+            or (code != "unsupported_panel_toolchain" and capability is not None)
+            or (architecture is not None and code != "unsupported_architecture")
+            or (architecture is not None and not valid_architecture)
         ):
             raise ValueError("invalid_panel_compatibility_error_code")
         self.code = code
         self.capability = capability
+        self.architecture = architecture
         super().__init__(code)
         self.__suppress_context__ = True
 
@@ -396,7 +414,9 @@ def _validate_toolchain(values: dict[str, str]) -> None:
             )
 
 
-async def async_inspect_panel(shell: PanelShell, identity: HostIdentity) -> PanelFacts:
+async def async_inspect_panel(
+    shell: PanelShell, identity: HostIdentity, *, allow_aarch64: bool = False
+) -> PanelFacts:
     """Run one bounded command and return strictly parsed compatibility facts."""
     if not isinstance(identity, HostIdentity):
         raise TypeError("identity must be a HostIdentity")
@@ -422,8 +442,10 @@ async def async_inspect_panel(shell: PanelShell, identity: HostIdentity) -> Pane
     _validate_toolchain(values)
 
     architecture = values["architecture"]
-    if architecture not in _SUPPORTED_ARCHITECTURES:
-        raise PanelCompatibilityError("unsupported_architecture")
+    qualified = architecture in _QUALIFIED_ARCHITECTURES
+    experimental = architecture in _EXPERIMENTAL_ARCHITECTURES and allow_aarch64 is True
+    if not qualified and not experimental:
+        raise PanelCompatibilityError("unsupported_architecture", architecture=architecture)
     python_match = _PYTHON_VERSION.fullmatch(values["python_version"])
     if python_match is None:
         raise PanelCompatibilityError("unsupported_python")

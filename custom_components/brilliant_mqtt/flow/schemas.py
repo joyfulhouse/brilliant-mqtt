@@ -27,6 +27,7 @@ from ..certificates import canonical_hue_ca_certificate, is_hue_ca_certificate
 from ..certificates import is_public_certificate_chain as _is_public_certificate_chain
 from ..components import optional
 from ..const import (
+    CONF_ALLOW_AARCH64,
     CONF_BROKER_KIND,
     CONF_COMPONENTS,
     CONF_HA_CONTROL_DOMAINS,
@@ -489,6 +490,21 @@ def panel_connect_form_source(user_input: Mapping[str, object]) -> dict[str, obj
         return {}
     assert isinstance(raw_host, str)
     return {CONF_HOST: raw_host.strip()}
+
+
+def experimental_aarch64_schema() -> vol.Schema:
+    """Explicit i350/aarch64 pilot opt-in; default remains off."""
+    return vol.Schema(
+        {vol.Required(CONF_ALLOW_AARCH64, default=False): bool}
+    )
+
+
+def normalize_experimental_aarch64_input(user_input: Mapping[str, object]) -> bool:
+    """Require an explicit True; any other value is rejected."""
+    value = user_input.get(CONF_ALLOW_AARCH64, False)
+    if value is not True:
+        raise FlowInputError({CONF_ALLOW_AARCH64: "aarch64_opt_in_required"})
+    return True
 
 
 def panel_confirm_schema(suggested_name: str, *, allow_override: bool = False) -> vol.Schema:
