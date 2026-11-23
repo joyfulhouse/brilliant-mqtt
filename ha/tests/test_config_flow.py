@@ -36,6 +36,7 @@ from custom_components.brilliant_mqtt.const import (
     COMPONENT_HUE_CA,
     COMPONENT_VOICE,
     COMPONENT_WIFI_WATCHDOG,
+    CONF_ALLOW_AARCH64,
     CONF_BROKER_KIND,
     CONF_COMPONENTS,
     CONF_ENTRY_KIND,
@@ -1311,8 +1312,14 @@ async def test_panel_connect_fetches_identity_before_password_authentication(
         events.append("authenticated_shell")
         return shell
 
-    async def inspect(candidate_shell: Any, identity: HostIdentity) -> PanelFacts:
+    async def inspect(
+        candidate_shell: Any,
+        identity: HostIdentity,
+        *,
+        allow_aarch64: bool = False,
+    ) -> PanelFacts:
         assert candidate_shell is shell
+        assert allow_aarch64 is False
         assert identity == _identity()
         events.append("inspection")
         return _facts(identity)
@@ -3624,12 +3631,130 @@ async def test_panel_address_authenticates_only_after_existing_identity_matches(
         "replacement-office.iot.example",
         original[CONF_ROOT_PASSWORD],
         identity,
+        allow_aarch64=False,
     )
     assert stored.data == {
         **original,
         CONF_HOST: "replacement-office.iot.example",
     }
     assert stored.unique_id == panel.unique_id
+
+
+@pytest.mark.parametrize("step", ["address", "repair_credentials"])
+@pytest.mark.parametrize("consent", [None, False, True], ids=["missing", "off", "on"])
+async def test_aarch64_panel_repair_uses_only_persisted_consent(
+    hass: HomeAssistant, step: str, consent: bool | None
+) -> None:
+    panel = _subentry()
+    entry = _fleet_entry(hass, panel)
+    stored = entry.subentries[panel.subentry_id]
+    if consent is not None:
+        hass.config_entries.async_update_subentry(
+            entry, stored, data={**stored.data, CONF_ALLOW_AARCH64: consent}
+        )
+    original = dict(stored.data)
+    identity = _identity()
+    form = await _start_panel_reconfigure_step(hass, entry, stored, step)
+    user_input = {CONF_HOST: "moved-office.iot.example"}
+    if step == "repair_credentials":
+        user_input[CONF_ROOT_PASSWORD] = "SECRET-repaired-password"
+
+    async def inspect(*_args: object, allow_aarch64: bool = False) -> PanelFacts:
+        if not allow_aarch64:
+            raise PanelCompatibilityError("unsupported_architecture", architecture="aarch64")
+        return replace(_facts(identity), model="i350", architecture="aarch64")
+
+    probe = AsyncMock(side_effect=inspect)
+    with (
+        patch.object(flow_gateway, "async_fetch_host_identity", return_value=identity),
+        patch.object(flow_gateway, "_async_inspect_candidate", probe),
+    ):
+        result = await hass.config_entries.subentries.async_configure(form["flow_id"], user_input)
+
+    if consent is True:
+        assert result["type"] is FlowResultType.ABORT
+        assert result["reason"] == "reconfigure_successful"
+        assert stored.data == {**original, **user_input}
+        probe.assert_awaited_once_with(
+            hass,
+            user_input[CONF_HOST],
+            user_input.get(CONF_ROOT_PASSWORD, original[CONF_ROOT_PASSWORD]),
+            identity,
+            allow_aarch64=True,
+        )
+    else:
+        assert result["step_id"] == step
+        assert result["errors"] == {"base": "unsupported_architecture"}
+        assert stored.data == original
+        assert probe.await_count == 1
+        assert probe.await_args is not None
+        assert probe.await_args.kwargs.get("allow_aarch64", False) is False
+    assert "SECRET-repaired-password" not in repr(result)
+
+
+@pytest.mark.parametrize("step", ["address", "repair_credentials"])
+async def test_aarch64_panel_repair_rejects_replacement_before_consent_or_password(
+    hass: HomeAssistant, step: str
+) -> None:
+    panel = _subentry()
+    entry = _fleet_entry(hass, panel)
+    stored = entry.subentries[panel.subentry_id]
+    hass.config_entries.async_update_subentry(
+        entry, stored, data={**stored.data, CONF_ALLOW_AARCH64: True}
+    )
+    original = dict(stored.data)
+    identity = _identity(other=True)
+    form = await _start_panel_reconfigure_step(hass, entry, stored, step)
+    user_input = {CONF_HOST: "replacement-office.iot.example"}
+    if step == "repair_credentials":
+        user_input[CONF_ROOT_PASSWORD] = "SECRET-replacement-password"
+    probe = AsyncMock()
+    with (
+        patch.object(flow_gateway, "async_fetch_host_identity", return_value=identity),
+        patch.object(flow_gateway, "_async_inspect_candidate", probe),
+    ):
+        result = await hass.config_entries.subentries.async_configure(form["flow_id"], user_input)
+    assert result["step_id"] == step
+    assert result["errors"] == {"base": "panel_identity_mismatch"}
+    probe.assert_not_awaited()
+    assert stored.data == original
+
+
+async def test_aarch64_rebind_does_not_inherit_incumbent_consent(
+    hass: HomeAssistant,
+) -> None:
+    panel = _subentry()
+    entry = _fleet_entry(hass, panel)
+    stored = entry.subentries[panel.subentry_id]
+    hass.config_entries.async_update_subentry(
+        entry, stored, data={**stored.data, CONF_ALLOW_AARCH64: True}
+    )
+    original = dict(stored.data)
+    runtime = FleetManager(hass, entry)
+    entry.runtime_data = runtime
+    candidate = _identity(other=True)
+    form = await _start_panel_reconfigure_step(hass, entry, stored, "rebind")
+
+    async def inspect(*_args: object, allow_aarch64: bool = False) -> PanelFacts:
+        if not allow_aarch64:
+            raise PanelCompatibilityError("unsupported_architecture", architecture="aarch64")
+        return replace(_facts(candidate), model="i350", architecture="aarch64")
+
+    probe = AsyncMock(side_effect=inspect)
+    with (
+        patch.object(flow_gateway, "async_fetch_host_identity", return_value=candidate),
+        patch.object(flow_gateway, "_async_inspect_candidate", probe),
+        patch.object(runtime, "async_rebind_panel", AsyncMock()) as rebind,
+    ):
+        result = await hass.config_entries.subentries.async_configure(
+            form["flow_id"],
+            {CONF_HOST: "replacement-panel.iot.example", CONF_ROOT_PASSWORD: _ROOT_PASSWORD},
+        )
+    assert result["step_id"] == "rebind"
+    assert result["errors"] == {"base": "unsupported_architecture"}
+    probe.assert_awaited_once_with(hass, "replacement-panel.iot.example", _ROOT_PASSWORD, candidate)
+    rebind.assert_not_awaited()
+    assert stored.data == original
 
 
 async def test_panel_credential_repair_rechecks_identity_and_never_redisplays_secret(
@@ -3669,6 +3794,7 @@ async def test_panel_credential_repair_rechecks_identity_and_never_redisplays_se
         original[CONF_HOST],
         replacement_password,
         identity,
+        allow_aarch64=False,
     )
     assert stored.data == {
         **original,
@@ -5351,6 +5477,7 @@ async def test_panel_credential_repair_updates_address_and_password_atomically(
         "moved-office.iot.example",
         replacement_password,
         identity,
+        allow_aarch64=False,
     )
     assert stored.data == {
         **original,
@@ -5374,7 +5501,7 @@ async def test_combined_credential_repair_preserves_configuration_on_failure(
     identity = _identity()
     expected = original
 
-    async def inspect(*_args: object) -> PanelFacts:
+    async def inspect(*_args: object, **_kwargs: object) -> PanelFacts:
         nonlocal expected
         if failure == "authentication":
             raise asyncssh.PermissionDenied("SECRET rejected password")
@@ -5427,6 +5554,127 @@ async def _restored_ownerless_record(hass: HomeAssistant) -> RetainedRollback:
     from custom_components.brilliant_mqtt.provisioning_journal import RetainedRollback
 
     return RetainedRollback(record, "restored", "a" * 32)
+
+
+@pytest.mark.parametrize("candidate_kind", ["journal", "restored", "unactivated"])
+async def test_aarch64_ownerless_recovery_preserves_candidate_and_requires_both_consents(
+    hass: HomeAssistant,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    candidate_kind: str,
+) -> None:
+    retained = await _restored_ownerless_record(hass)
+    record = retained.record
+    if candidate_kind == "journal":
+        record = await _stuck_ownerless_journal(hass, tmp_path, monkeypatch)
+    else:
+        if candidate_kind == "unactivated":
+            retained = replace(retained, state="armed", recovery_deployment_id=None)
+        monkeypatch.setattr(
+            ProvisioningJournal, "async_retained_records", AsyncMock(return_value=(retained,))
+        )
+    step, confirmation, operation = {
+        "journal": ("panel_recover_journal", "confirm_recover", "async_recover_ownerless_journal"),
+        "restored": (
+            "panel_finalize_retained",
+            "confirm_finalize",
+            "async_finalize_ownerless_restored",
+        ),
+        "unactivated": (
+            "panel_discard_unactivated",
+            "confirm_discard",
+            "async_discard_unactivated_ownerless_baseline",
+        ),
+    }[candidate_kind]
+    identity = _identity()
+    entry = _fleet_entry(hass)
+    form = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, SUBENTRY_TYPE_PANEL), context={"source": "user"}
+    )
+
+    async def inspect(*_args: object, allow_aarch64: bool = False) -> PanelFacts:
+        if not allow_aarch64:
+            raise PanelCompatibilityError("unsupported_architecture", architecture="aarch64")
+        return replace(_facts(identity), model="i350", architecture="aarch64")
+
+    async def recover(*_args: object) -> None:
+        monkeypatch.setattr(ProvisioningJournal, "async_load", AsyncMock(return_value=None))
+        monkeypatch.setattr(
+            ProvisioningJournal, "async_retained_records", AsyncMock(return_value=(retained,))
+        )
+
+    recover_journal = AsyncMock(side_effect=recover)
+    finalize = AsyncMock()
+    discard = AsyncMock()
+    provisioner = SimpleNamespace(
+        async_recover_ownerless_journal=recover_journal,
+        async_finalize_ownerless_restored=finalize,
+        async_discard_unactivated_ownerless_baseline=discard,
+    )
+    probe = AsyncMock(side_effect=inspect)
+    with (
+        patch.object(flow_gateway, "async_fetch_host_identity", return_value=identity),
+        patch.object(flow_gateway, "_async_inspect_candidate", probe),
+        patch.object(flow_gateway, "_get_panel_provisioner", return_value=provisioner) as factory,
+    ):
+        opt_in = await hass.config_entries.subentries.async_configure(form["flow_id"], _PANEL_INPUT)
+        assert opt_in["step_id"] == "experimental_aarch64"
+        assert _schema_defaults(opt_in)[CONF_ALLOW_AARCH64] is False
+        unchecked = await hass.config_entries.subentries.async_configure(
+            form["flow_id"], {CONF_ALLOW_AARCH64: False}
+        )
+        assert unchecked["step_id"] == "experimental_aarch64"
+        assert unchecked["errors"] == {CONF_ALLOW_AARCH64: "aarch64_opt_in_required"}
+        assert probe.await_count == 1
+        factory.assert_not_called()
+
+        recovery = await hass.config_entries.subentries.async_configure(
+            form["flow_id"], {CONF_ALLOW_AARCH64: True}
+        )
+        assert recovery["step_id"] == step
+        assert str(record.transaction_id) in repr(recovery["description_placeholders"])
+        assert _ROOT_PASSWORD not in repr(recovery)
+        factory.assert_not_called()
+        probe.assert_awaited_with(
+            hass, _PANEL_INPUT[CONF_HOST], _ROOT_PASSWORD, identity, allow_aarch64=True
+        )
+        unchecked = await hass.config_entries.subentries.async_configure(
+            form["flow_id"], {confirmation: False}
+        )
+        assert unchecked["step_id"] == step
+        assert unchecked["errors"] == {"base": "confirmation_required"}
+        factory.assert_not_called()
+        confirmed = await hass.config_entries.subentries.async_configure(
+            form["flow_id"], {confirmation: True}
+        )
+        getattr(provisioner, operation).assert_awaited_once_with(
+            record if candidate_kind == "journal" else retained,
+            _PANEL_INPUT[CONF_HOST],
+            _ROOT_PASSWORD,
+            identity,
+        )
+        factory.assert_called_with(hass, expected_identity=identity)
+        if candidate_kind == "journal":
+            assert confirmed["step_id"] == "panel_finalize_retained"
+            unchecked = await hass.config_entries.subentries.async_configure(
+                form["flow_id"], {"confirm_finalize": False}
+            )
+            assert unchecked["step_id"] == "panel_finalize_retained"
+            finalize.assert_not_awaited()
+            confirmed = await hass.config_entries.subentries.async_configure(
+                form["flow_id"], {"confirm_finalize": True}
+            )
+            finalize.assert_awaited_once_with(
+                retained, _PANEL_INPUT[CONF_HOST], _ROOT_PASSWORD, identity
+            )
+        assert confirmed["step_id"] == "panel_confirm"
+        assert _ROOT_PASSWORD not in repr(confirmed)
+        if candidate_kind != "journal":
+            recover_journal.assert_not_awaited()
+        if candidate_kind != "unactivated":
+            discard.assert_not_awaited()
+        else:
+            finalize.assert_not_awaited()
 
 
 async def test_ownerless_restore_requires_explicit_finalize_confirmation(

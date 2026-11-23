@@ -6304,3 +6304,20 @@ async def test_hue_ca_install_uploads_the_canonical_pem(
         _PANEL_HUE_CA.strip().encode("ascii"),
         0o644,
     ) in shell.uploads
+
+
+@pytest.mark.parametrize(
+    ("code", "guidance"),
+    [
+        ("service_crash_looping", "uninstall"),
+        ("baseline_capture_interrupted", "docs/canary-rollback.md"),
+    ],
+)
+def test_crash_loop_summaries_expose_only_safe_guidance(code: str, guidance: str) -> None:
+    from custom_components.brilliant_mqtt.manager import _safe_failure_summary
+    from custom_components.brilliant_mqtt.panel_ops import PanelOpError
+
+    summary = _safe_failure_summary("update failed", PanelOpError(f"{code}: SECRET stderr"))
+    assert code in summary
+    assert guidance in summary
+    assert "SECRET" not in summary

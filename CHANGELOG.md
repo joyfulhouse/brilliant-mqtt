@@ -9,14 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Experimental, per-panel opt-in for aarch64 / i350 panels during Add panel.
+  Official support remains armv7l only; the architecture gate is unchanged
+  unless that panel's opt-in is checked (default off). Voice is refused on
+  aarch64. The i.MX6 Wi-Fi last-resort reset requires a positively bound
+  `mmc1` controller (same guard as #230).
+
 - A read-only panel diagnostic,
   `scripts/brilliant-panel/panel_diagnostics.sh`, reports the architecture,
   firmware, Python, message-bus library (import and ELF machine), storage,
   Wi-Fi hardware and Hue CA path facts that are needed before another panel
   architecture can be qualified. It writes nothing, never connects to the bus
-  and reads no secrets. Brilliant i350 (aarch64) panels are still **not
-  supported**: the integration keeps refusing them with
-  `unsupported_architecture`. See `docs/brilliant-panel/i350-support.md` for the
+  and reads no secrets. Brilliant i350 (aarch64) panels remain experimental and require
+  explicit per-panel opt-in. See `docs/brilliant-panel/i350-support.md` for the
   qualification gates (#155).
 
 ### Fixed
@@ -55,6 +60,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   this wedge. See
   [the #113 contract](docs/issue-113-outbox-quarantine-contract.md).
   ([#113](https://github.com/joyfulhouse/brilliant-mqtt/issues/113))
+- Installed panels now receive `service_crash_looping` when the bounded service
+  snapshot detects an auto-restarting bridge or watchdog, before candidate
+  mutation. Issue #226's screenshot establishes `snapshot_probe_failed`; a crash
+  loop remains an inferred cause pending reporter/pilot validation. Refs #226.
+- A failed post-capture re-snapshot retires only its own unused rollback baseline
+  before propagating the typed error. Failed cleanup reports
+  `baseline_capture_interrupted`; recovery artifacts must be preserved.
+- Core-service stop handles activating and deactivating units before checking
+  for a settled state. Baseline finalization preserves foreign or symlinked pins.
+- Service sampling adds about 27 seconds to an installed-panel add/update and
+  about 14 seconds to rollback verification. Recovery and supported HA uninstall
+  guidance is in `docs/TROUBLESHOOTING.md` and `docs/canary-rollback.md`.
+
 - Removing an unactivated onboarding baseline now checks candidate release
   paths with `os.path.lexists`, which older panel Pythons provide. A failed
   proof logs the stage (snapshot section, verify, check_restored kind,
