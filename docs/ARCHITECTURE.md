@@ -98,6 +98,10 @@ bidirectional control.
   until the ticket reports the late outcome (issue #225): a late failure
   publishes `failed`, a late acceptance re-arms a full 80 s confirm window, and
   a late timeout or cancellation resumes normal contradiction handling.
+  Acceptance is installed synchronously at native return and fenced against
+  older captures in the adapter's existing sequence domain. Its fixed
+  monotonic timer runs independently of MQTT publication, so broker delay
+  cannot renew the confirmation window.
   Only a write still unresolved at the fixed 15 s hard cap latches the
   write-timeout flag, and the coordinator rebuilds the session on its next
   tick; a single 5 s timeout no longer triggers a rebuild. No retry,

@@ -1492,8 +1492,11 @@ class Bridge:
         if pending is None:
             return
         if rpc_unresolved and carrier.ticket is not None:
-            carrier.ticket.set_settle_callback(
-                lambda outcome: self._mesh.on_rpc_settled(peripheral_id, pending, outcome)
+            ticket = carrier.ticket
+            ticket.set_settle_callback(
+                lambda outcome: self._mesh.on_rpc_settled(
+                    peripheral_id, pending, outcome, accepted_at=ticket.accepted_at
+                )
             )
         await self._republish_snapshot(peripheral_id, force=False)
 

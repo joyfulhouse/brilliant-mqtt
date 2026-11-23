@@ -172,7 +172,7 @@ async def test_nonfinite_wall_clock_cannot_supply_a_confirmation_deadline(epoch:
     bus = FakeBus([_mesh_dimmer_at("1")])
     mqtt = FakeMqtt()
     sleeper = FakeSleeper()
-    bridge = Bridge(bus, mqtt, "mesh", wall_clock=lambda: epoch, sleep=sleeper)
+    bridge = Bridge(bus, mqtt, "mesh", clock=FakeClock(), wall_clock=lambda: epoch, sleep=sleeper)
     await bridge.reconcile()
     await mqtt.inject(MESH_SET_TOPIC, '{"state":"OFF"}')
     fields = json.loads(_mesh_states(mqtt)[-1][1])

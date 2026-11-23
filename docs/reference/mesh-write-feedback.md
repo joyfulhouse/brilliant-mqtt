@@ -75,9 +75,12 @@ ticket that carried the write later reports the RPC's outcome (issue #225):
 - **Late failure:** publishes `failed` with the observed state immediately,
   as an immediate rejection does.
 - **Late acceptance:** re-arms a full 80 second window with a new
-  `mesh_write_deadline`. Observations made before the acceptance do not
-  count toward confirmation. After this, a contradicting observation
-  publishes `contradicted` as usual.
+  `mesh_write_deadline`. The accepted record is installed synchronously at
+  native return. Adapter capture provenance fences observations made before
+  acceptance, including snapshots delivered later: they cannot contradict
+  the request or refresh confirmation. A fresh contradicting observation
+  publishes `contradicted` as usual. The monotonic timer runs independently
+  of MQTT publication; a slow or stalled re-arm publish cannot extend it.
 - **Late timeout or cancellation:** reveals nothing about actuation. The
   original deadline stays, and contradiction handling resumes.
 - **Native timeout before the deadline:** the panel library's own "No

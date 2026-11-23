@@ -1986,8 +1986,9 @@ class TestMeshConfirmedWrites:
 
         await asyncio.sleep(0)
         assert sleeper.requested == [80.0]  # only the ON command armed a timer
-        clock.advance(80.0)
+        clock.advance(75.0)
         await bus.emit(_mesh_dimmer_at("1"))
+        clock.advance(5.0)
         await sleeper.release_all()
         payloads = [json.loads(p[1]) for p in _mesh_states(mqtt)]
         assert payloads == [
@@ -2396,9 +2397,8 @@ class TestMeshWriteTimeout:
 
     @pytest.mark.parametrize("revocation", ["withdraw", "supersede"])
     async def test_rearm_publish_stays_cancellable(self, revocation: str) -> None:
-        """The settle task stays the registered handle through its re-arm
-        publish, so supersession or withdrawal cancels it mid-publish and no
-        orphaned resolver is started afterwards."""
+        """Both the fixed resolver and blocked re-arm publication are revoked
+        by supersession or withdrawal."""
         bus = FakeBus([_mesh_dimmer_at("1")])
         mqtt = _BlockingStatePublishMqtt()
         bridge, _clock, sleeper = _mesh_bridge_parts(bus, mqtt)
@@ -2425,7 +2425,9 @@ class TestMeshWriteTimeout:
         await _turns()
 
         assert settle.cancelled()
-        assert sleeper.requested == [80.0] if revocation == "withdraw" else [80.0, 80.0]
+        assert sleeper.requested == (
+            [80.0, 80.0] if revocation == "withdraw" else [80.0, 80.0, 80.0]
+        )
         # The re-armed OFF window never reached the wire.
         assert not any(
             json.loads(p[1]).get("mesh_requested") == {"on": "0"} for p in _mesh_states(mqtt)

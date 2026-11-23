@@ -16,7 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no 80 second confirm hold, which reopened the false-state window from #46.
   While the native write is still running, differing observations are now
   ignored. A late failure publishes `failed` with the observed state. A late
-  acceptance starts a full 80 second confirm window. A late timeout or
+  acceptance synchronously starts a full 80 second confirm window, fenced
+  against older captured snapshots and independent of MQTT publication
+  delays. A late timeout or
   cancellation resumes normal contradiction handling. A fast native "No
   response received!" timeout is still contradicted on the next poll. The
   peer churn that makes these writes slow is native firmware behaviour and

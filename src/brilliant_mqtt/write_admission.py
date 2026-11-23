@@ -59,6 +59,7 @@ class AdmissionTicket:
     )
     # One-element tuple once settled, so a falsy receipt still reads as settled.
     _settlement: tuple[SettleOutcome] | None = field(default=None, init=False, repr=False)
+    _accepted_at: CaptureProvenance | None = field(default=None, init=False, repr=False)
     _on_settled: Callable[[SettleOutcome], None] | None = field(
         default=None, init=False, repr=False
     )
@@ -87,6 +88,11 @@ class AdmissionTicket:
         """True once the BusClient reported this ticket's native outcome."""
         return self._settlement is not None
 
+    @property
+    def accepted_at(self) -> CaptureProvenance | None:
+        """Adapter capture boundary stamped immediately after native acceptance."""
+        return self._accepted_at
+
     def set_settle_callback(self, callback: Callable[[SettleOutcome], None]) -> None:
         """Observe the native write's outcome, even one landing after the caller deadline.
 
@@ -104,13 +110,16 @@ class AdmissionTicket:
         """Stop delivering this ticket's outcome (an abandoned, reused ticket)."""
         self._on_settled = None
 
-    def mark_settled(self, outcome: SettleOutcome) -> None:
+    def mark_settled(
+        self, outcome: SettleOutcome, *, accepted_at: CaptureProvenance | None = None
+    ) -> None:
         """Record the native outcome once; called only by a BusClient.
 
         Callback failures propagate to the BusClient, which contains them.
         """
         if self._settlement is not None:
             return
+        self._accepted_at = accepted_at
         self._settlement = (outcome,)
         if self._on_settled is not None:
             self._on_settled(outcome)

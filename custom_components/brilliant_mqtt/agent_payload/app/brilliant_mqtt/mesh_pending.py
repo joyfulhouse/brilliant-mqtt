@@ -29,7 +29,7 @@ from dataclasses import dataclass, replace
 from types import MappingProxyType
 
 from brilliant_mqtt.commands import VarSet
-from brilliant_mqtt.model import BrilliantDevice
+from brilliant_mqtt.model import BrilliantDevice, CaptureProvenance
 from brilliant_mqtt.write_admission import SettleOutcome
 
 # Deliberately the bridge's logger name: this module was extracted from
@@ -82,6 +82,8 @@ class PendingMeshWrite:
     # (#225): the mirror then still carries the PRE-write value, so a differing
     # observation is ignored rather than treated as a contradiction.
     rpc_unresolved: bool = False
+    accepted_at: CaptureProvenance | None = None
+    expires_at: float | None = None
 
 
 def _is_inconclusive(outcome: SettleOutcome) -> bool:
@@ -114,11 +116,13 @@ class MeshPending:
         self._before_feedback_change = before_feedback_change
         # peripheral_id → in-flight write awaiting observation-based confirmation.
         self._pending: dict[str, PendingMeshWrite] = {}
-        # Confirm (and settle) tasks, keyed OUTSIDE the pending record: a
+        # Confirm tasks, keyed OUTSIDE the pending record: a
         # resolver deletes its pending entry before publishing the
         # confirmation, and must stay cancellable (supersession, withdraw)
-        # through that final publish.
+        # through that final publish. Settlement publishes have their own
+        # bounded per-peripheral registry so MQTT cannot delay expiry.
         self._confirm_tasks: dict[str, asyncio.Task[None]] = {}
+        self._publication_tasks: dict[str, asyncio.Task[None]] = {}
         # Monotonic per-peripheral command counter — NEVER cleared or reused
         # within a Bridge lifetime, so a stalled bus write from before a
         # withdraw can never match a generation minted after re-acquisition.
@@ -182,6 +186,9 @@ class MeshPending:
         """
         self._feedback_enabled = False
         self._feedback.clear()
+        for task in self._publication_tasks.values():
+            task.cancel()
+        self._publication_tasks.clear()
         for peripheral_id in self._generation:
             self._generation[peripheral_id] += 1
 
@@ -249,6 +256,7 @@ class MeshPending:
             generation=generation,
             deadline=self._fresh_deadline(),
             rpc_unresolved=rpc_unresolved,
+            expires_at=self._clock() + MESH_CONFIRM_SECONDS,
         )
         self._start_window(peripheral_id, pending)
         return pending
@@ -287,6 +295,16 @@ class MeshPending:
             return
         if not self.owns(peripheral_id, pending.generation, pending):
             return
+        if pending.expires_at is not None and self._clock() >= pending.expires_at:
+            return
+        if pending.accepted_at is not None:
+            capture = device.capture_provenance
+            if (
+                capture is None
+                or capture.source_generation != pending.accepted_at.source_generation
+                or capture.sequence <= pending.accepted_at.sequence
+            ):
+                return
         fully_matched = True
         for name, want in pending.targets.items():
             var = device.variables.get(name)
@@ -316,15 +334,19 @@ class MeshPending:
             pending.last_observed_at = self._clock()
 
     def on_rpc_settled(
-        self, peripheral_id: str, pending: PendingMeshWrite, outcome: SettleOutcome
+        self,
+        peripheral_id: str,
+        pending: PendingMeshWrite,
+        outcome: SettleOutcome,
+        *,
+        accepted_at: CaptureProvenance | None = None,
     ) -> None:
         """Settle callback for a detached RPC (#225); runs inside the bus adapter.
 
         Synchronous and non-blocking. A late timeout or cancellation learns
         nothing: contradiction handling resumes against the ORIGINAL deadline.
-        A late acceptance or failure replaces the confirm timer with a settle
-        task registered in the same registry, so supersession and withdrawal
-        reach it exactly as they reach a resolver.
+        Acceptance installs its fenced record and fixed timer synchronously.
+        Only MQTT publication is deferred, independently of that timer.
         """
         if not pending.rpc_unresolved or not self._owns_pending(peripheral_id, pending):
             return
@@ -337,23 +359,7 @@ class MeshPending:
                 type(outcome).__name__,
             )
             return
-        prior = self._confirm_tasks.pop(peripheral_id, None)
-        if prior is not None:
-            prior.cancel()
-        self._confirm_tasks[peripheral_id] = asyncio.create_task(
-            self.settle_unresolved(peripheral_id, pending, outcome),
-            name=f"brilliant-mqtt-mesh-settle-{peripheral_id}",
-        )
-
-    async def settle_unresolved(
-        self, peripheral_id: str, pending: PendingMeshWrite, outcome: SettleOutcome
-    ) -> None:
-        """Apply a detached RPC's late acceptance or failure (background task)."""
-        if self._confirm_tasks.get(
-            peripheral_id
-        ) is not asyncio.current_task() or not self._owns_pending(peripheral_id, pending):
-            self.release_confirm_task(peripheral_id)
-            return
+        self.drop(peripheral_id)
         if isinstance(outcome, str):
             # Late acceptance: the native RPC only now took the write, so the
             # #46 revert tail starts now — a FULL fresh window, and no
@@ -364,6 +370,8 @@ class MeshPending:
                 deadline=self._fresh_deadline(),
                 last_observed_at=None,
                 rpc_unresolved=False,
+                accepted_at=accepted_at,
+                expires_at=self._clock() + MESH_CONFIRM_SECONDS,
             )
             logger.info(
                 "mesh write for %s accepted after the caller deadline; confirm window "
@@ -371,39 +379,42 @@ class MeshPending:
                 peripheral_id,
                 outcome,
             )
-            # Publish the re-armed window while THIS task is still the
-            # registered handle, so supersession or withdrawal cancels it
-            # mid-publish; only then hand the registry over to the resolver.
-            self._pending[peripheral_id] = rearmed
-            self.set_feedback(peripheral_id, rearmed)
-            try:
-                await self._republish(peripheral_id, False)
-            except Exception:
-                logger.warning("mesh re-arm publish failed for %s", peripheral_id, exc_info=True)
-            if self._confirm_tasks.get(peripheral_id) is not asyncio.current_task():
-                # Only drop() takes a settle task's registry entry, and it
-                # cancels the task. A cancellation landing mid-publish arrives
-                # with the publication's revocation and is swallowed there
-                # (py3.10 cannot tell them apart), so restore it here.
-                raise asyncio.CancelledError
-            if not self._owns_pending(peripheral_id, rearmed):
-                self.release_confirm_task(peripheral_id)
-                return
-            self._start_resolver(peripheral_id, rearmed)
+            self._start_window(peripheral_id, rearmed)
+            self._start_publication(peripheral_id, rearmed, force=False)
             return
-        del self._pending[peripheral_id]
         logger.warning(
             "mesh write failed after the caller deadline for %s (%s); "
             "republishing last observed state",
             peripheral_id,
             type(outcome).__name__,
         )
+        failed = replace(pending, targets={}, status="failed", deadline=None)
+        self.set_feedback(peripheral_id, failed)
+        self._start_publication(peripheral_id, failed, force=True)
+
+    def _start_publication(
+        self, peripheral_id: str, record: PendingMeshWrite, *, force: bool
+    ) -> None:
+        self._publication_tasks[peripheral_id] = asyncio.create_task(
+            self._publish_settlement(peripheral_id, record, force),
+            name=f"brilliant-mqtt-mesh-settle-{peripheral_id}",
+        )
+
+    async def _publish_settlement(
+        self, peripheral_id: str, record: PendingMeshWrite, force: bool
+    ) -> None:
         try:
-            await self.publish_failure(peripheral_id, pending.generation)
+            if self.owns(peripheral_id, record.generation, record):
+                await self._republish(peripheral_id, force)
+            if self._publication_tasks.get(peripheral_id) is not asyncio.current_task():
+                # The bridge may contain cancellation of a revoked nested
+                # publish. Restore cancellation of this withdrawn owner.
+                raise asyncio.CancelledError
         except Exception:
-            logger.warning("mesh failure publish failed for %s", peripheral_id, exc_info=True)
+            logger.warning("mesh settlement publish failed for %s", peripheral_id, exc_info=True)
         finally:
-            self.release_confirm_task(peripheral_id)
+            if self._publication_tasks.get(peripheral_id) is asyncio.current_task():
+                del self._publication_tasks[peripheral_id]
 
     async def resolve(self, peripheral_id: str, pending: PendingMeshWrite) -> None:
         """Deadline arm of the pending-write state machine (background task).
@@ -420,7 +431,13 @@ class MeshPending:
         this task through the confirm-task registry as cancellation —
         including while the final publish is still in flight.
         """
-        await self._sleep(MESH_CONFIRM_SECONDS)
+        if not self._owns_pending(peripheral_id, pending):
+            self.release_confirm_task(peripheral_id)
+            return
+        expires_at = pending.expires_at
+        await self._sleep(
+            MESH_CONFIRM_SECONDS if expires_at is None else max(0.0, expires_at - self._clock())
+        )
         if not self._owns_pending(peripheral_id, pending):
             self.release_confirm_task(peripheral_id)
             return
@@ -489,6 +506,9 @@ class MeshPending:
         confirmation is still reached — even mid-publish.
         """
         self._pending.pop(peripheral_id, None)
+        publication = self._publication_tasks.pop(peripheral_id, None)
+        if publication is not None:
+            publication.cancel()
         task = self._confirm_tasks.pop(peripheral_id, None)
         if task is not None:
             task.cancel()
@@ -499,7 +519,8 @@ class MeshPending:
         The registry union also reaches a resolver already past its pending
         entry, mid-publish.
         """
-        for peripheral_id in set(self._pending) | set(self._confirm_tasks):
+        peripherals = set(self._pending) | set(self._confirm_tasks) | set(self._publication_tasks)
+        for peripheral_id in peripherals:
             self.drop(peripheral_id)
 
     # -- internals ----------------------------------------------------------

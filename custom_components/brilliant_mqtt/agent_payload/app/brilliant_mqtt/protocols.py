@@ -149,6 +149,8 @@ class BusClient(Protocol):
         never-issued work. A write still running at the caller deadline raises
         asyncio.TimeoutError with the ticket unsettled; the bridge relies on
         that to learn the detached RPC's late outcome (#225).
+        For success, stamp accepted_at in the capture provenance domain at
+        native return and invoke mark_settled synchronously before yielding.
         """
         ...
 

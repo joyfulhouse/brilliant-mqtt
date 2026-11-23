@@ -1368,10 +1368,8 @@ class RpcBusAdapter:
         if self._write_serving.get(admission.device_id) is admission:
             del self._write_serving[admission.device_id]
         self._serve_next(admission.device_id)
-        # Report the native outcome for EVERY admitted write (#225): detached,
-        # cancelled, tombstoned and never-issued work included. Deliberately
-        # after the lane moved on and the result future settled, so a callback
-        # can neither stall the lane nor observe an unsettled result.
+        # Success was reported synchronously at native return. This idempotent
+        # fallback also settles failures and never-issued/cancelled work.
         outcome: SettleOutcome
         if task.cancelled():
             outcome = WriteCancelled()
@@ -1434,6 +1432,14 @@ class RpcBusAdapter:
                     admission.values,
                     device_id=admission.device_id,
                 )
+                accepted_at = self._next_capture_provenance()
+                receipt = _normalize_receipt(response)
+                # Publish acceptance synchronously before a queued notification
+                # can drain; its capture fence belongs to the native return.
+                try:
+                    admission.ticket.mark_settled(receipt, accepted_at=accepted_at)
+                except Exception as error:
+                    logger.warning("WRITE_SETTLE_CALLBACK_FAILED %s", type(error).__name__)
             except asyncio.CancelledError:
                 logger.info("set_variables(%s) cancelled at session teardown", record.label)
                 raise
@@ -1449,7 +1455,6 @@ class RpcBusAdapter:
                 raise
             finally:
                 cap.cancel()
-        receipt = _normalize_receipt(response)
         if record.detached:
             logger.warning(
                 "detached set_variables(%s) completed after %.1fs (queue wait %.3fs); receipt: %s",
