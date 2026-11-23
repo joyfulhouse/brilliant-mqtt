@@ -290,6 +290,10 @@ class _PanelOnboardingMixin:
             )
             if duplicate is not None:
                 return {}, None, duplicate
+            # Preserve pinned recovery authority across the architecture opt-in step.
+            self._retained_finalize = retained
+            self._unactivated_discard = unactivated
+            self._journal_recover = journal_record
             facts = await gateway._async_inspect_candidate(
                 cast(_FlowSurface, self).hass,
                 host,
@@ -330,9 +334,6 @@ class _PanelOnboardingMixin:
             return {}, _panel_failure("inspection_failed", stage="panel_inspection"), None
 
         self._panel_identity = identity
-        self._retained_finalize = retained
-        self._unactivated_discard = unactivated
-        self._journal_recover = journal_record
         self._panel_facts = facts
         self._panel_failure = None
         return {}, None, None
