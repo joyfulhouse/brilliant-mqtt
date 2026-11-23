@@ -68,15 +68,22 @@ cannot substitute another mount's flags. Read-only storage, or an `fstatvfs`
 failure (writability unknown), rejects dead-writer evidence. Unknown is
 deliberately treated as read-only, which fails safe toward no reboot.
 
-When an otherwise qualifying dead attempt is rejected for storage, the
-observer remembers its writer generation in the existing single revocation
-slot. A later writable remount does not rearm it. Missing or malformed samples,
-copies on replacement inodes, and changed records first seen after that
-generation's death do not erase this disqualification. A changed record leased
-by the same generation confirmed live can rearm it, and a fresh writer
-generation's genuine writable-storage crash evidence still qualifies under
-the existing gates. State remains bounded to one revoked generation and one
-leased sample per observer, and lasts only for that watchdog lifetime.
+On every valid bus sample with read-only or unknown storage, the observer
+remembers its writer generation and record in a separate storage-disqualification
+slot, including while that writer is live and leased. This blocks later
+dead-writer attribution if recovery cannot rewrite, unlink, or truncate the
+marker and the writer dies between polls. Live leased evidence remains eligible
+both during the unsafe sample and on later live samples.
+
+A writable remount alone does not rearm dead-writer attribution. Missing or
+malformed samples, copies on replacement inodes, and changed records first
+seen after that generation's death do not erase this disqualification. Only a
+changed record leased by the same generation confirmed live on writable
+storage rearms it. An unchanged live writable sample or a fresh live record on
+unsafe storage does not. A fresh writer generation's genuine writable-storage
+crash evidence still qualifies under the existing gates. State remains bounded
+to one storage-disqualified record, one revoked generation, and one leased
+sample per observer, and lasts only for that watchdog lifetime.
 
 The storage gate only adds rejections to dead-writer evidence. A live writer
 that still holds its lease is still accepted on read-only or unknown storage:
@@ -174,7 +181,13 @@ and unknown storage gate, pathname and symlink swaps before PID checks,
 read-only/unknown-to-writable remounts with intervening gaps and record copies,
 live leased writers on read-only or unknown storage, replacement-inode and
 first-unleased samples, fresh leased rearming, fresh writable-storage crashes,
-and the unsampled native-crash ambiguity.
+and the unsampled native-crash ambiguity. A synchronized child also recovers
+after a live RO/unknown sample while rewrite, unlink, and truncate all fail,
+then exits before the next poll. The same observer rejects its stale dead
+record on writable storage. Controls distinguish unchanged live writable
+samples, fresh unsafe live records, changed records first seen dead, and fresh
+changed live-leased writable evidence that rearms dead attribution. A killed
+writer sampled only on writable storage retains genuine crash evidence.
 
 `tests/test_heartbeat.py` covers unrecordable recovery and `pre_bus`
 transitions (not dead-writer evidence), retained failed-attempt evidence, a

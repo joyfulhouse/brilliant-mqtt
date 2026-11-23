@@ -22,6 +22,7 @@ class BusFailureObserver:
 
     _revoked: PhaseRecord | None = None
     _leased: tuple[PhaseRecord, tuple[int, int]] | None = None
+    _storage_disqualified: PhaseRecord | None = None
 
 
 def _read_phase_record_and_lease(
@@ -83,12 +84,32 @@ def bus_failure_age(
         return None
     live_generation = process_generation(record.pid)
     if observer is not None:
+        writer = (record.boot_id, record.pid, record.process_generation)
+        if not writable:
+            observer._storage_disqualified = record
+        disqualified = observer._storage_disqualified
+        if disqualified is not None and writer == (
+            disqualified.boot_id,
+            disqualified.pid,
+            disqualified.process_generation,
+        ):
+            if (
+                writable
+                and live_generation == record.process_generation
+                and leased
+                and record != disqualified
+            ):
+                observer._storage_disqualified = None
+            elif live_generation is None:
+                # Live leases remain evidence; a remount alone cannot certify
+                # a dead writer's recovery was recorded during unsafe storage.
+                return None
         revoked = observer._revoked
-        same_writer = revoked is not None and (
-            record.boot_id,
-            record.pid,
-            record.process_generation,
-        ) == (revoked.boot_id, revoked.pid, revoked.process_generation)
+        same_writer = revoked is not None and writer == (
+            revoked.boot_id,
+            revoked.pid,
+            revoked.process_generation,
+        )
         if live_generation == record.process_generation:
             if not leased and observer._leased == (record, inode):
                 observer._revoked = record
@@ -112,10 +133,6 @@ def bus_failure_age(
     ):
         return None
     elif not writable:
-        if observer is not None:
-            # A remount cannot make this writer's stale attempt fresh evidence.
-            # Reuse the bounded generation revocation and live-lease rearming.
-            observer._revoked = record
         return None
     return sampled_at - record.failure_started_at
 

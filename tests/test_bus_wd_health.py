@@ -953,3 +953,111 @@ def test_fresh_live_lease_rearms_storage_disqualified_generation(
     monkeypatch.setattr(health_mod, "process_generation", lambda pid: None)
     monkeypatch.setattr(health_mod, "process_is_absent", lambda pid: True)
     assert bus_failure_age(str(phase), now=250.0, observer=observer) == 150.0
+
+
+@_requires_linux_proc
+@pytest.mark.parametrize("storage", ["writable", "read-only", "unknown"])
+@pytest.mark.parametrize(
+    "fresh_evidence",
+    ["none", "unchanged-live-rw", "changed-live-unsafe", "changed-live-rw", "changed-dead-rw"],
+)
+def test_live_storage_sample_controls_later_dead_attribution(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, storage: str, fresh_evidence: str
+) -> None:
+    phase = tmp_path / "bus-phase"
+    observer = health_mod.BusFailureObserver()
+    writer = """
+import sys
+from brilliant_mqtt import heartbeat
+
+path = sys.argv[1]
+for now in (100., 400., 700., 1000., 1300., 1600., 1898.):
+    assert heartbeat.write_phase(path, "bus", monotonic_clock=lambda: now)
+print("ready", flush=True)
+if input() == "refresh":
+    assert heartbeat.write_phase(path, "bus", monotonic_clock=lambda: 1899.25)
+    print("refreshed", flush=True)
+    input()
+def readonly(*args, **kwargs):
+    raise OSError(30, "read-only filesystem")
+heartbeat._atomic_write = readonly
+heartbeat._rewrite_phase_lease = lambda path, text: False
+heartbeat.os.unlink = readonly
+heartbeat.os.ftruncate = readonly
+assert not heartbeat.write_phase(
+    path, "bus", bus_read_succeeded=True, monotonic_clock=lambda: 1899.5
+)
+"""
+    with subprocess.Popen(
+        [sys.executable, "-c", writer, str(phase)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    ) as process:
+        assert process.stdin is not None
+        assert process.stdout is not None
+        try:
+            assert process.stdout.readline().strip() == "ready"
+            with monkeypatch.context() as storage_patch:
+                if storage == "read-only":
+                    _report_marker_storage_read_only(storage_patch)
+                elif storage == "unknown":
+                    _report_marker_storage_unknown(storage_patch)
+                for now in (1899.0, 1899.1):
+                    assert bus_failure_age(
+                        str(phase), now=now, service_started_at=90.0, observer=observer
+                    ) == pytest.approx(now - 100.0)
+                if fresh_evidence == "changed-live-unsafe":
+                    process.stdin.write("refresh\n")
+                    process.stdin.flush()
+                    assert process.stdout.readline().strip() == "refreshed"
+                    assert bus_failure_age(str(phase), now=1899.25, observer=observer) == 1799.25
+            if fresh_evidence == "changed-live-rw":
+                process.stdin.write("refresh\n")
+                process.stdin.flush()
+                assert process.stdout.readline().strip() == "refreshed"
+            if fresh_evidence in ("changed-live-rw", "unchanged-live-rw"):
+                assert bus_failure_age(str(phase), now=1899.25, observer=observer) == 1799.25
+            original = phase.read_bytes()
+            process.communicate("recover\n", timeout=10)
+            assert process.returncode == 0
+            assert phase.read_bytes() == original
+            if fresh_evidence == "changed-dead-rw":
+                phase.write_bytes(original.replace(b"1898.0", b"1899.25"))
+            age = bus_failure_age(
+                str(phase), now=1901.0, service_started_at=90.0, observer=observer
+            )
+            qualifies = storage == "writable" or fresh_evidence == "changed-live-rw"
+            assert age == (1801.0 if qualifies else None)
+            assert (
+                should_reboot(
+                    age=1801.0,
+                    bridge_active=True,
+                    gateway_up=True,
+                    bus_failure_age=age,
+                    stale_after=1800.0,
+                )
+                is qualifies
+            )
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=10)
+
+
+@_requires_linux_proc
+def test_observed_live_writable_writer_still_qualifies_after_genuine_crash(tmp_path: Path) -> None:
+    phase = tmp_path / "bus-phase"
+    observer = health_mod.BusFailureObserver()
+    process = _start_phase_writer(phase, 100.0)
+    try:
+        assert bus_failure_age(str(phase), now=150.0, observer=observer) == 50.0
+        process.kill()
+        assert process.wait(timeout=10) == -signal.SIGKILL
+        assert bus_failure_age(str(phase), now=200.0, observer=observer) == 100.0
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=10)
+        assert process.stdout is not None
+        process.stdout.close()
