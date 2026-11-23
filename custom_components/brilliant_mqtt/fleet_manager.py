@@ -25,6 +25,7 @@ from . import panel_ops
 from .broker import BrokerKind, BrokerProfile
 from .broker_validation import BrokerValidator
 from .const import (
+    CONF_ALLOW_AARCH64,
     CONF_BROKER_KIND,
     CONF_COMPONENTS,
     CONF_ENTRY_KIND,
@@ -2187,6 +2188,8 @@ class FleetManager:
                 CONF_IDENTITY_FINGERPRINT: candidate.fingerprint,
                 CONF_SSH_HOST_KEY: candidate.public_key,
             }
+            # Experimental hardware consent belongs to the previous physical panel.
+            rebound_data.pop(CONF_ALLOW_AARCH64, None)
             rebound_subentry = ConfigSubentry(
                 data=MappingProxyType(rebound_data),
                 subentry_id=subentry.subentry_id,

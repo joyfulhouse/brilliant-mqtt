@@ -32,7 +32,80 @@ Reset to `LOG_LEVEL=INFO` when done.
    VLAN can reach the broker on port 1883.
 3. Check the agent is running: `systemctl status brilliant-mqtt` on the panel.
 
+### "This panel architecture is not supported"
+
+Setup stopped with `unsupported_architecture`. brilliant-mqtt is qualified only
+on armv7l (i.MX6) Brilliant Controls. Newer i350 panels report `aarch64` and are
+**not supported yet**. This is deliberate. A contributor's experimental pilot
+in [#155](https://github.com/joyfulhouse/brilliant-mqtt/issues/155#issuecomment-7065744176)
+reports native bus-library import, core entities, healthy Wi-Fi and bus
+watchdogs, and working Hue CA recovery. OTA survival of `/var` and HA Control
+remain unverified; voice was not installed. Full qualification is still pending,
+so keep the architecture check in place.
+
+If you have an i350 and want to help qualify it, run the read-only diagnostic
+from a checkout of this repo and attach the output to
+[issue #155](https://github.com/joyfulhouse/brilliant-mqtt/issues/155) after
+reviewing it:
+
+```bash
+ssh -o NumberOfPasswordPrompts=1 root@<panel-ip> 'sh -s' \
+  < scripts/brilliant-panel/panel_diagnostics.sh > i350-diagnostics.txt
+```
+
+See [brilliant-panel/i350-support.md](brilliant-panel/i350-support.md) for what
+the diagnostic collects, what is architecture-bound, and the qualification gates.
+
+The Wi-Fi watchdog requires the `mmc1` alias target to be bound to
+`sdhci-esdhc-imx` before its GPIO reset. A registered driver directory (including
+`imx_sdhci_driver_present=1` in the diagnostic) is insufficient. Missing binding
+evidence produces a warning and reboot-only recovery. Production binding
+evidence on the armv7 pilot remains a release prerequisite.
+
+Voice upload, configuration, enable and restart require armv7l, including repair
+of an existing payload and wake-word updates. Inspection and removal remain
+available on other architectures.
+
 ---
+
+### Add or update fails with `service_crash_looping`
+
+The pre-change snapshot samples the bridge and both watchdogs with batched
+`systemctl show` calls for about 13.5 seconds, at 0.5-second intervals. An
+`auto-restart` sample or a restart counter increase of at least two refuses the
+snapshot with `service_crash_looping` before file reads or candidate mutation,
+even when agent files are absent: a loaded service can outlive its files.
+A final `reloading` state counts as running; unsettled final states,
+malformed readings, timeouts, or spans from the previous round's start through
+the current round's end over four seconds fail closed with
+`snapshot_probe_failed`. The sampler has a 40-second deadline and 32-round cap.
+Two consecutive all-stopped rounds may end sampling early. Two snapshots add
+about 27 seconds to a typical installed-panel add/update, and rollback
+verification uses the same sampler.
+
+The screenshot in issue #226 proves `snapshot_probe_failed`. A crash loop is an
+inferred explanation for that report, not a confirmed hardware RCA. This change
+has off-device regression coverage; reporter/pilot validation remains needed.
+Refs #226.
+
+Preserve the incumbent installation. Inspect service status and recent bridge
+or watchdog logs using read-only diagnostics, redacting credentials before
+sharing them. Restore the old bridge's health (for example broker reachability)
+and retry. An explicit release override is consumed before this check, so a
+retry may need a fresh approval; an automatic admission can also be recorded.
+
+If a crash loop starts during baseline capture, the re-snapshot refuses it and
+removes that capture's unused baseline. If removal fails, the error becomes
+`baseline_capture_interrupted`. Cancellation still propagates, with a sanitized
+warning carrying that code if cleanup also fails; follow
+[Interrupted baseline capture](canary-rollback.md#interrupted-baseline-capture).
+
+For an existing HA panel owner, uninstall/re-add is an alternative only after
+recovery is settled and retained baselines are explicitly finalized after
+sign-off. Turn off both watchdog switches, then use the supported
+`brilliant_mqtt.uninstall` action. That path restores virtual slider state before
+removing agent files. If there is no HA panel owner, collect redacted diagnostics
+and seek maintainer assistance; preserve files, pins and recovery artifacts.
 
 ## Connectivity
 
@@ -379,6 +452,59 @@ a `— rebooting` line names the trigger. Reboots are rate-limited
 **If it reboots repeatedly:** the bus keeps wedging — capture
 `bus-watchdog.log` plus `journalctl -u brilliant-mqtt` and open an issue. Full
 settings in [CONFIGURATION.md → Bus-health watchdog](CONFIGURATION.md#bus-health-watchdog).
+
+### Scene outbox quarantined (`outbox_quarantine` / `outbox_blocked`)
+
+**Symptom:** Scene and mode entities go unavailable, and the retained
+`brilliant/ha-control/v1/status/scene/<panel>` (and `.../mode/<panel>`) status
+shows `"available": false` with reason `outbox_quarantine` or
+`outbox_blocked`. Home Assistant refuses scene and mode commands while the
+transport is reported offline. The panel itself stays online, and device
+state, discovery and device commands keep working.
+
+**Why:** The broker closed the MQTT connection every time one scene/mode
+outbox frame was sent. That usually means an operator `max_packet_size` that
+the frame exceeds. After 3 such disconnects in 3 different sessions spanning at
+least a minute, the agent quarantines that record and halts the scene outbox,
+so nothing is sent past it. `outbox_blocked` means the connection dropped right
+after sending the record, before the session had any acknowledged QoS-1
+publish, so nothing could be attributed. It is transient and practically
+unreachable, because every session normally publishes a QoS-1 message first,
+and it clears as soon as the record is delivered. Check the broker first. The bridge
+meta `diag.outbox` object names the record (key, kind, size and sha256, never
+the payload). The full contract is in
+[issue-113-outbox-quarantine-contract.md](issue-113-outbox-quarantine-contract.md).
+
+**Fix the broker first** (remove or raise `max_packet_size`). Then release or
+discard the record on the panel. The tool refuses to run while the agent is
+running:
+
+```bash
+ssh -o NumberOfPasswordPrompts=1 root@<panel>
+systemctl stop brilliant-mqtt
+set -a; . /etc/brilliant-mqtt.env; set +a
+# Fleet release layout; legacy installs use /var/brilliant-mqtt/app:/var/brilliant-mqtt/vendor
+export PYTHONPATH=/var/brilliant-mqtt/current/app:/var/brilliant-mqtt/current/vendor
+/data/switch-embedded/env/bin/python3 -m brilliant_mqtt.outbox_admin list
+# Either retry the record once the broker accepts it ...
+/data/switch-embedded/env/bin/python3 -m brilliant_mqtt.outbox_admin release <key> <sha256>
+# ... or drop it for good (an event also drops its dependent command results).
+/data/switch-embedded/env/bin/python3 -m brilliant_mqtt.outbox_admin discard <key> <sha256>
+systemctl start brilliant-mqtt
+```
+
+`<key>` and `<sha256>` come from the `list` output, and the hash must match.
+The key is a bounded record digest; the full original identity appears only in
+the local JSON-escaped `source_key` column. Listing works on readable read-only
+storage. If a write reports unknown durability after rename, inspect `list`
+again before deciding whether to retry: the action may already be visible.
+Every release and discard is appended to `scene-watermarks.json.outbox-audit.log`
+next to the state file, and either is refused if that audit entry cannot be
+written. The
+tool treats the agent as stopped only when `systemctl is-active brilliant-mqtt`
+prints `inactive` or `failed` and no process runs `-m brilliant_mqtt`. If it
+still refuses, check `systemctl status brilliant-mqtt` and
+`pgrep -af 'brilliant_mqtt'`, and stop whatever is still running.
 
 ### Bridge broken after a panel firmware update
 

@@ -26,6 +26,7 @@ from custom_components.brilliant_mqtt.const import (
     COMPONENT_BRIDGE,
     COMPONENT_BUS_WATCHDOG,
     COMPONENT_WIFI_WATCHDOG,
+    CONF_ALLOW_AARCH64,
     CONF_BROKER_KIND,
     CONF_COMPONENTS,
     CONF_ENTRY_KIND,
@@ -2717,8 +2718,10 @@ async def test_management_id_may_differ_from_rebound_identity_fingerprint(
         await fleet.async_shutdown()
 
 
+@pytest.mark.parametrize("consent", [None, False, True], ids=["missing", "off", "on"])
 async def test_rebind_durably_adopts_exact_identity_and_audits_after_proof(
     hass: HomeAssistant,
+    consent: bool | None,
 ) -> None:
     """A deliberate rebind preserves logical identity and advances the live baseline."""
     office = _panel(
@@ -2729,6 +2732,11 @@ async def test_rebind_durably_adopts_exact_identity_and_audits_after_proof(
     )
     entry = _fleet_entry(office)
     entry.add_to_hass(hass)
+    if consent is not None:
+        stored = entry.subentries[office.subentry_id]
+        hass.config_entries.async_update_subentry(
+            entry, stored, data={**stored.data, CONF_ALLOW_AARCH64: consent}
+        )
     fleet = FleetManager(hass, entry)
     order: list[str] = []
     immutable_checks: list[tuple[PanelConfig, PanelConfig]] = []
@@ -2766,6 +2774,7 @@ async def test_rebind_durably_adopts_exact_identity_and_audits_after_proof(
             stored = entry.subentries["panel-office"]
             assert stored.unique_id == candidate.fingerprint
             assert stored.data[CONF_SSH_HOST_KEY] == candidate.public_key
+            assert CONF_ALLOW_AARCH64 not in stored.data
             assert manager.store is original_store
             assert fleet._panel_configs["panel-office"] == expected
             order.append("persisted")
@@ -2815,9 +2824,11 @@ async def test_rebind_durably_adopts_exact_identity_and_audits_after_proof(
         assert stored.subentry_id == "panel-office"
         assert stored.title == original_title
         assert stored.unique_id == candidate.fingerprint
-        assert set(stored.data) == set(original_panel_data)
+        assert set(stored.data) == set(original_panel_data) - {CONF_ALLOW_AARCH64}
         assert {
-            key for key, old_value in original_panel_data.items() if stored.data[key] != old_value
+            key
+            for key, old_value in original_panel_data.items()
+            if key != CONF_ALLOW_AARCH64 and stored.data[key] != old_value
         } == {
             CONF_HOST,
             CONF_ROOT_PASSWORD,
@@ -2828,6 +2839,7 @@ async def test_rebind_durably_adopts_exact_identity_and_audits_after_proof(
         assert rebound.root_password == new_password
         assert rebound.identity_fingerprint == candidate.fingerprint
         assert rebound.ssh_host_key == candidate.public_key
+        assert rebound.allow_aarch64 is False
         assert rebound.name == expected.name
         assert rebound.panel == expected.panel
         assert rebound.management_id == expected.management_id

@@ -8,6 +8,7 @@ with no await to interleave a read/modify/write; no locks or atomics are needed.
 
 from __future__ import annotations
 
+import json
 import time
 from collections import deque
 from collections.abc import Callable
@@ -30,6 +31,9 @@ SessionRebuildReason = Literal[
     "mqtt_transport_overload",
     "other",
 ]
+# #113 outbox quarantine details: key, record kind, payload size and hash,
+# failure count and quarantine time. Never the payload contents.
+OutboxDetails = dict[str, int | str | None]
 Snapshot = dict[str, int | float | None | dict[str, int]]
 
 
@@ -66,6 +70,7 @@ class ResponseDiagnostics:
         self._rpc_s_count = 0
         self._queue_wait_recent: deque[float] = deque(maxlen=64)
         self._rpc_recent: deque[float] = deque(maxlen=64)
+        self._outbox: OutboxDetails | None = None
 
     def note_superseded(self) -> None:
         self._superseded += 1
@@ -96,6 +101,10 @@ class ResponseDiagnostics:
     def note_hard_cap(self) -> None:
         self._hard_cap_total += 1
 
+    def note_outbox(self, details: OutboxDetails | None) -> None:
+        """Replace the current outbox quarantine details (None clears them)."""
+        self._outbox = None if details is None else dict(details)
+
     def snapshot(self) -> Snapshot:
         """Copy every mutable container before a publisher can yield the loop."""
         rebuilds: dict[str, int] = {
@@ -118,3 +127,19 @@ class ResponseDiagnostics:
             "queue_wait_s_recent_max": max(self._queue_wait_recent, default=None),
             "rpc_s_recent_max": max(self._rpc_recent, default=None),
         }
+
+    def meta(self) -> dict[str, object]:
+        """Return diagnostics without enlarging startup meta for outbox evidence.
+
+        Counters keep accumulating while outbox details replace their optional
+        wire snapshot. Clearing the evidence restores the complete snapshot.
+        """
+        diag: dict[str, object] = dict(self.snapshot())
+        if self._outbox is not None:
+            evidence: dict[str, object] = {"v": diag["v"], "outbox": dict(self._outbox)}
+            # Meta is published before the outbox starts. Evidence must fit the
+            # ordinary frame's budget so it cannot poison the next bootstrap.
+            if len(json.dumps(evidence, sort_keys=True)) > len(json.dumps(diag, sort_keys=True)):
+                evidence["outbox"] = {key: self._outbox[key] for key in ("state", "key", "kind")}
+            return evidence
+        return diag

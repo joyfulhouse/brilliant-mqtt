@@ -110,10 +110,10 @@
           "hue_ca_cert": "diyHue CA certificate (PEM)"
         },
         "data_description": {
-          "voice": "Install a Home Assistant voice satellite on this panel (on-panel wake word + microphone + speaker). Speech-to-text, the conversation agent, and text-to-speech all run in your HA Assist pipeline — nothing voice-specific is configured on the panel.",
+          "voice": "Install a Home Assistant voice satellite on this panel (on-panel wake word + microphone + speaker). Speech-to-text, the conversation agent, and text-to-speech all run in your HA Assist pipeline \u2014 nothing voice-specific is configured on the panel.",
           "voice_wake_word": "The on-panel wake word that activates the satellite.",
           "voice_ha_host": "Only needed if the panel cannot resolve your Home Assistant URL's hostname (e.g. a segmented IoT VLAN). Format: hostname=ip, e.g. homeassistant.example=10.0.0.5. Leave blank to use the panel's own DNS.",
-          "wifi_watchdog": "Auto-recovers lost Wi-Fi (reconnect → restart networking → reboot the panel as a last resort).",
+          "wifi_watchdog": "Auto-recovers lost Wi-Fi (reconnect \u2192 restart networking \u2192 reboot the panel as a last resort).",
           "bus_watchdog": "Installs the on-panel daemon that reboots the panel if the Brilliant bus stays wedged for 30+ minutes.",
           "hue_ca": "Installs a periodic timer that re-injects your diyHue CA certificate into the panel's pinned Hue trust bundle, recovering it after an OTA update wipes /data.",
           "hue_ca_cert": "The diyHue bridge's CA certificate, PEM-encoded. Required to enable Hue CA recovery."
@@ -136,7 +136,7 @@
           "ha_control_label": "Home Assistant label selecting entities for the constrained control manifest.",
           "room_overrides": "A JSON object mapping Home Assistant area names to Brilliant room names, for example: \"Office\" mapped to \"Office Bath\".",
           "ha_control_domains": "Only selected supported domains enter the control manifest.",
-          "max_mirrored_entities": "Safety limit for entities in the control manifest (1–200).",
+          "max_mirrored_entities": "Safety limit for entities in the control manifest (1\u2013200).",
           "scene_panel": "Brilliant panel used when a scene or mode service call omits a panel.",
           "scene_actions": "A JSON object of explicitly allowlisted scene actions keyed by panel and scene ID."
         }
@@ -184,12 +184,12 @@
       "retained_message_timeout": "Retained-message validation timed out. Verify broker retention behavior and routing.",
       "cleanup_failed": "MQTT validation cleanup did not finish. Review broker connectivity before retrying.",
       "operation_failed": "MQTT validation failed. Review the integration documentation and retry.",
-      "cannot_connect": "SSH connection failed — check the host and the root password.",
+      "cannot_connect": "SSH connection failed \u2014 check the host and the root password.",
       "cannot_read_config": "The agent is installed but its configuration could not be read. Try Reconfigure, or remove and re-add the panel.",
       "cannot_apply": "Connected, but writing the new settings to the panel failed. Check the agent and try Repair.",
       "cannot_install": "Connected, but installing the agent on the panel failed. Check the panel and try again.",
       "cannot_install_voice": "The bridge agent installed, but installing the voice satellite failed (its payload may not be downloadable yet, or the panel rejected it). Untick \"Enable voice satellite\" to finish without it, or try again.",
-      "wrong_panel": "That host already runs a different Brilliant panel's agent. Check the IP — applying here would overwrite and restart the wrong panel.",
+      "wrong_panel": "That host already runs a different Brilliant panel's agent. Check the IP \u2014 applying here would overwrite and restart the wrong panel.",
       "host_key_changed": "The panel's SSH host key changed. For a fleet panel, verify the physical replacement and use Replace physical panel for an explicit identity rebind. For a legacy entry, remove and re-add the verified panel to re-pin it. If the change is unexpected, do not continue; check the address and network for impersonation.",
       "invalid_cadence": "Enter a whole number of seconds within the documented range."
     },
@@ -346,6 +346,16 @@
           "data": {
             "confirm_discard": "I confirm removal of this unactivated rollback baseline"
           }
+        },
+        "experimental_aarch64": {
+          "title": "Experimental i350 / aarch64 panel",
+          "description": "This panel reports aarch64 (Brilliant i350 / MediaTek). Official support is still armv7l only. Checking the box admits this one panel as an experimental pilot: the agent and watchdogs may be installed, voice is refused, and the i.MX6 Wi-Fi GPIO reset will not run. Leave the box unchecked to abort. Other panels are unchanged. [Open troubleshooting]({documentation_url})",
+          "data": {
+            "allow_aarch64": "Allow experimental aarch64 / i350 support on this panel"
+          },
+          "data_description": {
+            "allow_aarch64": "Default is off. This does not enable aarch64 for the rest of the fleet."
+          }
         }
       },
       "progress": {
@@ -435,8 +445,10 @@
         "release_selection_conflict": "Some installed components already match. Update differing components individually to preserve their code selection.",
         "baseline_retained_finalize_first": "This panel retains a canary rollback baseline. After sign-off, explicitly finalize that baseline using its transaction name before updating again. See docs/canary-rollback.md.",
         "snapshot_probe_failed": "The panel service snapshot could not be read safely. Wait for restarting services to settle, check panel connectivity, and retry. No candidate was staged.",
+        "service_crash_looping": "The earlier bridge (or a watchdog) kept restarting during the check (crash-looping), so no safe rollback baseline can be taken. No agent code, unit or configuration was changed. Likely causes: missing or changed broker credentials, or an unreachable broker. Restore the old bridge so it stays up. After recovery is settled and retained baselines are finalized after sign-off, an existing HA panel owner can turn off both watchdog switches and use brilliant_mqtt.uninstall, then re-add. Without an HA panel owner, preserve the installation and collect redacted diagnostics; see docs/TROUBLESHOOTING.md. If it was a one-off restart and the service now stays up, simply retry. If the release needed an explicit override, that override was consumed and a retry needs a fresh approval.",
         "ownerless_recovery_unavailable": "This retained baseline is owned, still in use, or not verified restored. Preserve the journal and baseline. Finish recovery or use the owning panel's canary actions; do not delete private storage to retry.",
-        "ownerless_finalize_reauthentication_required": "Retained baseline cleanup requires fresh authentication. Start Add Brilliant panel again with the panel address and root password, verify its pinned identity, and explicitly confirm cleanup. Interrupted cleanup remains retained."
+        "ownerless_finalize_reauthentication_required": "Retained baseline cleanup requires fresh authentication. Start Add Brilliant panel again with the panel address and root password, verify its pinned identity, and explicitly confirm cleanup. Interrupted cleanup remains retained.",
+        "aarch64_opt_in_required": "Check the box to continue with this experimental i350 / aarch64 panel, or go back to cancel."
       },
       "abort": {
         "already_configured": "Panel `{panel_name}` is already configured.",

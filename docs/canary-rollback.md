@@ -96,6 +96,7 @@ while obtaining redacted diagnostics and the HA repair/log code.
 | Code/state | Operator action |
 | --- | --- |
 | `baseline_capture_failed`, `baseline_verify_failed` | Candidate mutation is refused. Preserve the incumbent; investigate missing/drifting code, permissions, free space, or capture bounds before retrying. |
+| `baseline_capture_interrupted` | A capture re-check failed after publication, and removing its unused baseline also failed. Preserve artifacts and follow Interrupted baseline capture. |
 | `transaction_in_progress` | Another operation holds the shared panel lock. Allow it to finish and retry. |
 | `provisioning_recovery_required` | Another panel's interrupted provisioning journal must be recovered first. Diagnostics name it (`provisioning.name`, `panel`, `phase`, `last_error`). Resolve that journal's own code below; for an onboarding that never created an HA panel, see [Interrupted onboarding without an HA panel owner](#interrupted-onboarding-without-an-ha-panel-owner). Operations stay serialized; nothing is skipped. |
 | `recovery_connection_failed` | Recovery could not reach the panel at the journal's recorded address. Bring the panel online. If its address or root password changed and it has no HA panel entry, settle it with Add Brilliant panel (below); otherwise repair the owning panel's address/credentials. |
@@ -250,6 +251,24 @@ recovery does not reuse stored credentials to finish this operation. Start Add
 Brilliant panel again, authenticate freshly and confirm again. Unmarked older
 `finalizing` records are not accepted through this path because their original
 state cannot be proven; preserve those records for investigation.
+
+## Interrupted baseline capture
+
+`baseline_capture_interrupted` means the post-capture snapshot failed or changed
+and the bounded attempt to remove that capture's unused baseline also failed.
+No candidate mutation was authorized. The baseline may exist without an HA
+retained record, so the named `canary_finalize` action cannot necessarily settle
+it. Uninstall can refuse with `baseline_retained_finalize_first`.
+If the operation is cancelled and cleanup also fails, cancellation propagates
+and a sanitized `baseline_capture_interrupted` warning reports the possible
+stranded baseline. Preserve any existing journal and baseline in this case too.
+
+Restore connectivity, preserve the installation, and collect redacted HA
+diagnostics and read-only service status for maintainer assistance. Settle any
+existing recovery journal through its supported HA recovery flow. Do not delete
+baseline directories, release pins, or HA storage, and do not uninstall while
+recovery remains unresolved. A retry is not guaranteed to remove an orphaned
+capture; automated orphan cleanup is outside this change.
 
 ## Interrupted onboarding without an HA panel owner
 

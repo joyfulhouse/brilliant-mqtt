@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
 import stat
@@ -143,6 +144,36 @@ def test_load_rejects_oversized_file_without_reading_it_all(tmp_path: Path) -> N
     loaded = load_state(path)
 
     assert loaded.trusted is False
+    assert loaded.reason == "state_untrusted"
+
+
+def test_validation_only_load_preserves_permissions_and_reads_readonly_storage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "private" / "state.json"
+    atomic_write_state(path, _state())
+    path.chmod(0o640)
+    path.parent.chmod(0o750)
+
+    def readonly_chmod(path: str | Path, mode: int) -> None:
+        raise OSError(errno.EROFS, "read-only filesystem")
+
+    monkeypatch.setattr(os, "chmod", readonly_chmod)
+    loaded = load_state(path, normalize_permissions=False)
+
+    assert loaded.trusted
+    assert loaded.state == _state()
+    assert stat.S_IMODE(path.stat().st_mode) == 0o640
+    assert stat.S_IMODE(path.parent.stat().st_mode) == 0o750
+    # Existing agent callers still require permission normalization by default.
+    assert not load_state(path).trusted
+
+
+def test_validation_only_load_still_rejects_invalid_state(tmp_path: Path) -> None:
+    path = tmp_path / "state.json"
+    path.write_text('{"version":1}')
+    loaded = load_state(path, normalize_permissions=False)
+    assert not loaded.trusted
     assert loaded.reason == "state_untrusted"
 
 

@@ -76,8 +76,8 @@ class InterruptedUpdateRepairFlow(RepairsFlow):
         try:
             await manager.interrupted_updates.async_dismiss()
         except Exception:
-            # HA's Store swallows write I/O errors itself, so this guard only sees
-            # non-I/O failures (for example serialization). The issue is kept.
+            # Strict persistence propagates write failures. Keep the issue when
+            # the intent could not be durably cleared.
             return self.async_abort(reason="interrupted_update_clear_failed")
         return self.async_create_entry(data={})
 
