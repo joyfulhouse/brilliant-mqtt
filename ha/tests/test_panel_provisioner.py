@@ -7,8 +7,9 @@ from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
 
 import pytest
@@ -60,6 +61,7 @@ from custom_components.brilliant_mqtt.panel_provisioner import (
     stored_snapshot_from_panel,
 )
 from custom_components.brilliant_mqtt.provisioning_journal import (
+    ProvisioningJournal,
     ProvisioningOperation,
     ProvisioningPhase,
     ProvisioningRecord,
@@ -524,6 +526,11 @@ class _FakeJournal:
     async def async_begin_ownerless_finalize(self, expected: RetainedRollback) -> RetainedRollback:
         raise RuntimeError("ownerless_finalization_requires_real_journal")
 
+    async def async_begin_ownerless_unactivated_discard(
+        self, expected: RetainedRollback
+    ) -> RetainedRollback:
+        raise RuntimeError("ownerless_unactivated_discard_requires_real_journal")
+
     async def async_retained_records(self) -> tuple[RetainedRollback, ...]:
         return ()
 
@@ -708,6 +715,16 @@ class _FakeOperations:
 
     async def finalize_baseline(self, shell: PanelShell, snapshot: panel_ops.PanelSnapshot) -> None:
         pass
+
+    async def prove_unactivated_capture(
+        self,
+        shell: PanelShell,
+        snapshot: panel_ops.PanelSnapshot,
+        *,
+        version: str,
+        transaction_id: UUID,
+    ) -> None:
+        del shell, snapshot, version, transaction_id
 
     async def restart_restored(
         self,
@@ -1014,6 +1031,9 @@ class _Harness:
     def id_factory(self) -> UUID:
         return next(self.ids)
 
+    async def authorize_recovery(self, record: ProvisioningRecord) -> None:
+        self.events.append(("authorize_recovery", record.transaction_id))
+
     def provisioner(
         self,
         operation_lock: asyncio.Lock | None = None,
@@ -1035,6 +1055,7 @@ class _Harness:
             health_observer_factory=self.observer_factory,
             transaction_lookup=self.transaction_lookup,
             repair_reporter=self.repair_reporter,
+            recovery_authorizer=self.authorize_recovery,
             id_factory=self.id_factory,
             clock=lambda: _STARTED_AT,
             health_timeout=45.0,
@@ -2624,3 +2645,500 @@ async def test_cancelling_install_waiter_preserves_shared_lock_owner() -> None:
         assert lock.locked()
         assert harness.events == []
     assert not lock.locked()
+
+
+async def _unused_preflight(_raw_request: str) -> FakePanelProcess:
+    return FakePanelProcess()
+
+
+async def test_install_journal_disk_failure_keeps_captured_baseline_recoverable(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from custom_components.brilliant_mqtt.provisioning_journal import JOURNAL_STORAGE_KEY, Store
+    from tests.test_provisioning_journal import _install_real_store
+
+    _install_real_store(hass, monkeypatch, tmp_path)
+    original_write = Store._async_write_data
+
+    async def fail_journal(store: Store, data: dict[str, object]) -> None:
+        if store.key == JOURNAL_STORAGE_KEY:
+            raise OSError("journal disk failure")
+        await original_write(store, data)
+
+    monkeypatch.setattr(Store, "_async_write_data", fail_journal)
+    harness = _Harness()
+    journal = ProvisioningJournal(hass)
+    monkeypatch.setattr(harness, "journal", journal)
+    finalize = AsyncMock()
+    stage = AsyncMock()
+    capture = AsyncMock(wraps=harness.operations.capture_baseline)
+    harness.ids = iter((_TRANSACTION_ID, _SETUP_ID, _OTHER_TRANSACTION_ID, _SETUP_ID))
+    monkeypatch.setattr(harness.operations, "finalize_baseline", finalize)
+    monkeypatch.setattr(harness.operations, "stage_release", stage)
+    monkeypatch.setattr(harness.operations, "capture_baseline", capture)
+    provisioner = harness.provisioner()
+
+    with pytest.raises(PanelProvisioningError) as raised:
+        await provisioner.async_install(_request(), _fleet(), harness.progress)
+
+    assert raised.value.code == "journal_failed"
+    restarted = ProvisioningJournal(hass)
+    assert await restarted.async_load() is None
+    retained = await restarted.async_retained(_TRANSACTION_ID)
+    assert retained is not None and retained.ownerless_unactivated_discard_allowed
+    assert retained.record.prior_snapshot.baseline == harness.operations.snapshot.baseline
+    finalize.assert_not_awaited()
+    stage.assert_not_awaited()
+    monkeypatch.setattr(Store, "_async_write_data", original_write)
+    with pytest.raises(PanelProvisioningError, match="baseline_retained_finalize_first"):
+        await provisioner.async_install(_request(), _fleet(), harness.progress)
+    assert capture.await_count == 1
+    assert await restarted.async_retained_records() == (retained,)
+    monkeypatch.setattr(provisioner, "_retained_owner_exists", AsyncMock(return_value=False))
+    await provisioner.async_discard_unactivated_ownerless_baseline(
+        retained, _request().host, _request().root_password, HostIdentity(_PUBLIC_KEY, _FINGERPRINT)
+    )
+    assert await restarted.async_retained_records() == ()
+    assert finalize.await_count == 1
+
+
+async def test_ownerless_discard_marker_does_not_block_another_panels_recovery(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from tests.test_config_flow import _OTHER_FINGERPRINT, _OTHER_PUBLIC_KEY
+    from tests.test_provisioning_journal import _install_real_store
+
+    _install_real_store(hass, monkeypatch, tmp_path)
+    journal = ProvisioningJournal(hass)
+    first = _record(ProvisioningPhase.STAGED)
+    await journal.async_create(first)
+    await journal.async_complete_cleanup(first.transaction_id)
+    retained = await journal.async_retained(first.transaction_id)
+    assert retained is not None
+    marked = await journal.async_begin_ownerless_unactivated_discard(retained)
+    other = replace(
+        first,
+        transaction_id=_OTHER_TRANSACTION_ID,
+        operation=ProvisioningOperation.UPDATE,
+        panel_request=replace(
+            first.panel_request,
+            host="second.local",
+            slug="second",
+            public_key=_OTHER_PUBLIC_KEY,
+            fingerprint=_OTHER_FINGERPRINT,
+        ),
+    )
+    await journal.async_create(other)
+    harness = _Harness()
+    monkeypatch.setattr(harness, "journal", journal)
+    provisioner = harness.provisioner()
+    resolver = AsyncMock(side_effect=AssertionError("ownerless marker needs fresh authority"))
+    monkeypatch.setattr(provisioner, "_credential_resolver", resolver)
+    recovered: list[ProvisioningRecord] = []
+
+    async def recover(record: ProvisioningRecord, _progress: object) -> None:
+        recovered.append(record)
+        await journal.async_complete_cleanup(record.transaction_id)
+
+    monkeypatch.setattr(provisioner, "_async_recover_record", recover)
+    await provisioner.async_recover()
+    assert recovered == [other]
+    assert await journal.async_load() is None
+    assert await journal.async_retained(first.transaction_id) == marked
+    resolver.assert_not_awaited()
+    monkeypatch.setattr(provisioner, "_retained_owner_exists", AsyncMock(return_value=False))
+    await provisioner.async_discard_unactivated_ownerless_baseline(
+        marked, _request().host, _request().root_password, HostIdentity(_PUBLIC_KEY, _FINGERPRINT)
+    )
+    assert await journal.async_retained(first.transaction_id) is None
+    assert await journal.async_retained(other.transaction_id) is not None
+
+
+@pytest.mark.parametrize("journal_write_fails", (False, True))
+@pytest.mark.parametrize("finalize_fault", (None, "error", "cancel"))
+async def test_discard_unactivated_baseline_requires_matching_capture_and_no_candidate(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    journal_write_fails: bool,
+    finalize_fault: str | None,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from custom_components.brilliant_mqtt.provisioning_journal import (
+        JOURNAL_STORAGE_KEY,
+        ProvisioningJournalError,
+        Store,
+    )
+    from tests.test_provisioning_journal import _install_real_store
+
+    _install_real_store(hass, monkeypatch, tmp_path)
+    journal = ProvisioningJournal(hass)
+    record = _record(ProvisioningPhase.STAGED)
+    if journal_write_fails:
+        original_write = Store._async_write_data
+
+        async def fail_journal(store: Store, data: dict[str, object]) -> None:
+            if store.key == JOURNAL_STORAGE_KEY:
+                raise OSError("journal disk failure")
+            await original_write(store, data)
+
+        monkeypatch.setattr(Store, "_async_write_data", fail_journal)
+        with pytest.raises(ProvisioningJournalError):
+            await journal.async_create(record)
+        monkeypatch.setattr(Store, "_async_write_data", original_write)
+        journal = ProvisioningJournal(hass)
+    else:
+        await journal.async_create(record)
+        await journal.async_complete_cleanup(record.transaction_id)
+    retained = await journal.async_retained(record.transaction_id)
+    assert retained is not None and retained.state == "armed"
+    events: list[str] = []
+    shell = FakeShell(pinned=_PUBLIC_KEY)
+
+    class _Ops:
+        async def snapshot_panel(self, _shell: PanelShell) -> panel_ops.PanelSnapshot:
+            events.append("snapshot")
+            return panel_snapshot_from_stored(record.prior_snapshot)
+
+        async def prove_unactivated_capture(
+            self,
+            _shell: PanelShell,
+            snapshot: panel_ops.PanelSnapshot,
+            *,
+            version: str,
+            transaction_id: UUID,
+        ) -> None:
+            events.append(f"prove:{version}:{transaction_id}")
+            assert snapshot.baseline == record.prior_snapshot.baseline
+
+        async def finalize_baseline(
+            self, _shell: PanelShell, _snapshot: panel_ops.PanelSnapshot
+        ) -> None:
+            events.append("finalize")
+            if finalize_fault == "error":
+                raise panel_ops.PanelOpError("baseline_finalize_failed")
+            if finalize_fault == "cancel":
+                raise asyncio.CancelledError
+
+    class _Reporter:
+        async def async_report_rollback_failure(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+        async def async_clear_rollback_failure(self, transaction_id: UUID) -> None:
+            events.append(f"clear:{transaction_id}")
+
+    provisioner = PanelProvisioner(
+        operation_lock=asyncio.Lock(),
+        journal=journal,
+        identity_fetcher=AsyncMock(return_value=HostIdentity(_PUBLIC_KEY, _FINGERPRINT)),
+        shell_factory=lambda *_args: shell,
+        inspector=AsyncMock(),
+        duplicate_fingerprint=AsyncMock(return_value=False),
+        operations=cast(Any, _Ops()),
+        snapshot_to_stored=stored_snapshot_from_panel,
+        snapshot_from_stored=panel_snapshot_from_stored,
+        staged_release_factory=staged_release_from_journal,
+        release_provider=AsyncMock(),
+        preflight_launcher_factory=lambda *_args: _unused_preflight,
+        broker_validator=AsyncMock(),
+        health_observer_factory=lambda _slug: AsyncMock(),
+        transaction_lookup=AsyncMock(),
+        repair_reporter=_Reporter(),
+        retained_owner_exists=AsyncMock(return_value=False),
+    )
+    identity = HostIdentity(_PUBLIC_KEY, _FINGERPRINT)
+
+    async def discard(expected: RetainedRollback) -> None:
+        await provisioner.async_discard_unactivated_ownerless_baseline(
+            expected, "office.iot.example", "SECRET-root-password", identity
+        )
+
+    if finalize_fault is not None:
+        expected = asyncio.CancelledError if finalize_fault == "cancel" else panel_ops.PanelOpError
+        with pytest.raises(expected):
+            await discard(retained)
+        restarted = ProvisioningJournal(hass)
+        marked = await restarted.async_retained(record.transaction_id)
+        assert marked is not None and marked.state == "finalizing"
+        assert marked.ownerless_unactivated_discard_allowed
+        assert not shell.connected
+        finalize_fault = None
+        await discard(marked)
+    else:
+        await discard(retained)
+
+    assert await journal.async_load() is None
+    assert await journal.async_retained_records() == ()
+    assert events[0] == "snapshot"
+    assert events[1] == f"prove:{_VERSION}:{record.transaction_id}"
+    assert "finalize" in events
+    assert shell.connect_count == (2 if events.count("finalize") == 2 else 1)
+    assert not shell.connected
+
+
+async def test_discard_refuses_when_panel_no_longer_matches_the_capture(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from tests.test_provisioning_journal import _install_real_store
+
+    _install_real_store(hass, monkeypatch, tmp_path)
+    caplog.set_level("WARNING")
+    journal = ProvisioningJournal(hass)
+    record = _record(ProvisioningPhase.STAGED)
+    await journal.async_create(record)
+    await journal.async_complete_cleanup(record.transaction_id)
+    retained = await journal.async_retained(record.transaction_id)
+    assert retained is not None
+    events: list[str] = []
+
+    class _Ops:
+        async def snapshot_panel(self, _shell: PanelShell) -> panel_ops.PanelSnapshot:
+            return panel_snapshot_from_stored(_release_link_snapshot())
+
+        async def prove_unactivated_capture(self, *_args: object, **_kwargs: object) -> None:
+            events.append("prove")
+
+        async def finalize_baseline(self, *_args: object, **_kwargs: object) -> None:
+            events.append("finalize")
+
+    class _Reporter:
+        async def async_report_rollback_failure(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+        async def async_clear_rollback_failure(self, _transaction_id: UUID) -> None:
+            return None
+
+    provisioner = PanelProvisioner(
+        operation_lock=asyncio.Lock(),
+        journal=journal,
+        identity_fetcher=AsyncMock(return_value=HostIdentity(_PUBLIC_KEY, _FINGERPRINT)),
+        shell_factory=lambda *_args: FakeShell(pinned=_PUBLIC_KEY),
+        inspector=AsyncMock(),
+        duplicate_fingerprint=AsyncMock(return_value=False),
+        operations=cast(Any, _Ops()),
+        snapshot_to_stored=stored_snapshot_from_panel,
+        snapshot_from_stored=panel_snapshot_from_stored,
+        staged_release_factory=staged_release_from_journal,
+        release_provider=AsyncMock(),
+        preflight_launcher_factory=lambda *_args: _unused_preflight,
+        broker_validator=AsyncMock(),
+        health_observer_factory=lambda _slug: AsyncMock(),
+        transaction_lookup=AsyncMock(),
+        repair_reporter=_Reporter(),
+        retained_owner_exists=AsyncMock(return_value=False),
+    )
+
+    with pytest.raises(PanelProvisioningError) as raised:
+        await provisioner.async_discard_unactivated_ownerless_baseline(
+            retained,
+            "office.iot.example",
+            "SECRET-root-password",
+            HostIdentity(_PUBLIC_KEY, _FINGERPRINT),
+        )
+
+    assert raised.value.code == "unactivated_baseline_not_proven"
+    assert events == []
+    assert raised.value.storage_reason is not None
+    assert raised.value.storage_reason.startswith("snapshot mismatch:")
+    assert "layout" in raised.value.storage_reason
+    assert "SECRET" not in raised.value.storage_reason
+    assert "MQTT_PASSWORD" not in raised.value.storage_reason
+    assert "snapshot mismatch" in caplog.text
+    assert "SECRET" not in caplog.text
+    still = await journal.async_retained(record.transaction_id)
+    assert still is not None and still.state == "armed"
+
+
+def test_unactivated_probe_reasons_name_each_stage_without_secrets() -> None:
+    from custom_components.brilliant_mqtt.panel_provisioner import _probe_failure_reason
+
+    password = "SECRET-root-password"
+    secrets = (password,)
+    read_failed = panel_ops.PanelOpError(
+        "baseline_read_failed",
+        exit_status=1,
+        stderr=f"AttributeError: lexists {password}",
+    )
+    read_reason = _probe_failure_reason(read_failed, secrets)
+    assert read_reason.startswith("panel command failed: exit 1:")
+    assert "lexists" in read_reason
+    assert password not in read_reason
+
+    restored = panel_ops.PanelOpError(
+        "baseline_check_restored_failed",
+        exit_status=2,
+        stderr="ManifestError: baseline_restore_mismatch",
+    )
+    restored_reason = _probe_failure_reason(restored, secrets)
+    assert restored_reason == "check_restored failed: baseline_restore_mismatch"
+
+    verify = panel_ops.PanelOpError("baseline_verify_failed", stderr="baseline_digest_mismatch")
+    assert _probe_failure_reason(verify, ()).startswith("verify_baseline failed:")
+    assert "baseline_digest_mismatch" in _probe_failure_reason(verify, ())
+
+    present = panel_ops.PanelOpError("baseline_candidate_present")
+    assert _probe_failure_reason(present, ()) == "candidate release directory present"
+
+
+async def test_discard_logs_panel_command_failure_without_secrets(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from tests.test_provisioning_journal import _install_real_store
+
+    _install_real_store(hass, monkeypatch, tmp_path)
+    caplog.set_level("WARNING")
+    journal = ProvisioningJournal(hass)
+    record = _record(ProvisioningPhase.STAGED)
+    await journal.async_create(record)
+    await journal.async_complete_cleanup(record.transaction_id)
+    retained = await journal.async_retained(record.transaction_id)
+    assert retained is not None
+    password = record.panel_request.root_password
+
+    class _Ops:
+        async def snapshot_panel(self, _shell: PanelShell) -> panel_ops.PanelSnapshot:
+            return panel_snapshot_from_stored(record.prior_snapshot)
+
+        async def prove_unactivated_capture(self, *_args: object, **_kwargs: object) -> None:
+            raise panel_ops.PanelOpError(
+                "baseline_read_failed",
+                exit_status=1,
+                stderr=(
+                    "AttributeError: 'PosixPath' object has no attribute 'lexists' " + password
+                ),
+            )
+
+        async def finalize_baseline(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+    class _Reporter:
+        async def async_report_rollback_failure(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+        async def async_clear_rollback_failure(self, _transaction_id: UUID) -> None:
+            return None
+
+    provisioner = PanelProvisioner(
+        operation_lock=asyncio.Lock(),
+        journal=journal,
+        identity_fetcher=AsyncMock(return_value=HostIdentity(_PUBLIC_KEY, _FINGERPRINT)),
+        shell_factory=lambda *_args: FakeShell(pinned=_PUBLIC_KEY),
+        inspector=AsyncMock(),
+        duplicate_fingerprint=AsyncMock(return_value=False),
+        operations=cast(Any, _Ops()),
+        snapshot_to_stored=stored_snapshot_from_panel,
+        snapshot_from_stored=panel_snapshot_from_stored,
+        staged_release_factory=staged_release_from_journal,
+        release_provider=AsyncMock(),
+        preflight_launcher_factory=lambda *_args: _unused_preflight,
+        broker_validator=AsyncMock(),
+        health_observer_factory=lambda _slug: AsyncMock(),
+        transaction_lookup=AsyncMock(),
+        repair_reporter=_Reporter(),
+        retained_owner_exists=AsyncMock(return_value=False),
+    )
+
+    with pytest.raises(PanelProvisioningError) as raised:
+        await provisioner.async_discard_unactivated_ownerless_baseline(
+            retained,
+            record.panel_request.host,
+            password,
+            HostIdentity(_PUBLIC_KEY, _FINGERPRINT),
+        )
+
+    assert raised.value.code == "unactivated_baseline_not_proven"
+    assert raised.value.storage_reason is not None
+    assert raised.value.storage_reason.startswith("panel command failed: exit 1:")
+    assert "lexists" in raised.value.storage_reason
+    assert password not in raised.value.storage_reason
+    assert password not in caplog.text
+    assert "panel command failed: exit 1" in caplog.text
+    still = await journal.async_retained(record.transaction_id)
+    assert still is not None and still.state == "armed"
+
+
+async def test_discard_resumes_after_the_marker_without_reproof(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from tests.test_provisioning_journal import _install_real_store
+
+    _install_real_store(hass, monkeypatch, tmp_path)
+    journal = ProvisioningJournal(hass)
+    record = _record(ProvisioningPhase.STAGED)
+    await journal.async_create(record)
+    await journal.async_complete_cleanup(record.transaction_id)
+    retained = await journal.async_retained(record.transaction_id)
+    assert retained is not None
+    marked = await journal.async_begin_ownerless_unactivated_discard(retained)
+    events: list[str] = []
+
+    class _Ops:
+        async def snapshot_panel(self, _shell: PanelShell) -> panel_ops.PanelSnapshot:
+            events.append("snapshot")
+            return panel_snapshot_from_stored(record.prior_snapshot)
+
+        async def prove_unactivated_capture(self, *_args: object, **_kwargs: object) -> None:
+            events.append("prove")
+
+        async def finalize_baseline(self, *_args: object, **_kwargs: object) -> None:
+            events.append("finalize")
+
+    class _Reporter:
+        async def async_report_rollback_failure(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+        async def async_clear_rollback_failure(self, _transaction_id: UUID) -> None:
+            return None
+
+    provisioner = PanelProvisioner(
+        operation_lock=asyncio.Lock(),
+        journal=journal,
+        identity_fetcher=AsyncMock(return_value=HostIdentity(_PUBLIC_KEY, _FINGERPRINT)),
+        shell_factory=lambda *_args: FakeShell(pinned=_PUBLIC_KEY),
+        inspector=AsyncMock(),
+        duplicate_fingerprint=AsyncMock(return_value=False),
+        operations=cast(Any, _Ops()),
+        snapshot_to_stored=stored_snapshot_from_panel,
+        snapshot_from_stored=panel_snapshot_from_stored,
+        staged_release_factory=staged_release_from_journal,
+        release_provider=AsyncMock(),
+        preflight_launcher_factory=lambda *_args: _unused_preflight,
+        broker_validator=AsyncMock(),
+        health_observer_factory=lambda _slug: AsyncMock(),
+        transaction_lookup=AsyncMock(),
+        repair_reporter=_Reporter(),
+        retained_owner_exists=AsyncMock(return_value=False),
+    )
+
+    await provisioner.async_discard_unactivated_ownerless_baseline(
+        marked,
+        "office.iot.example",
+        "SECRET-root-password",
+        HostIdentity(_PUBLIC_KEY, _FINGERPRINT),
+    )
+
+    assert events == ["finalize"]
+    assert await journal.async_retained_records() == ()

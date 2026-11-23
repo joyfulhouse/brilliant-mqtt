@@ -27,6 +27,10 @@ from tests.fakes import FakeBus, FakeClock, FakeMqtt
 
 
 class _Bus:
+    capture_generation = 0
+    capture_sequence = 0
+    privacy_revocation = None
+
     def __init__(
         self,
         start_error: Exception | None = None,

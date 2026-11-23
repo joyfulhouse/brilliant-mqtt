@@ -20,7 +20,7 @@ import math
 import secrets
 import time
 from collections import deque
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Any, NamedTuple
@@ -30,8 +30,13 @@ from brilliant_mqtt.diagnostics import ResponseDiagnostics, WriteOutcome
 from brilliant_mqtt.model import (
     BrilliantDevice,
     CaptureProvenance,
+    DeviceKind,
     Variable,
     kind_for_peripheral_type,
+)
+from brilliant_mqtt.protocols import (
+    VirtualPeripheralHostProtocol,
+    VirtualPeripheralSpec,
 )
 from brilliant_mqtt.write_admission import (
     AdmissionTicket,
@@ -284,17 +289,19 @@ class _PendingPeripheral:
     peripheral id.
     """
 
-    __slots__ = ("capture_provenance", "peripheral_id", "snapshot", "normalized")
+    __slots__ = ("capture_provenance", "peripheral_id", "snapshot", "normalized", "hardware_count")
 
     def __init__(
         self,
         peripheral_id: str,
         snapshot: _PeripheralSnapshot,
         capture_provenance: CaptureProvenance,
+        hardware_count: int,
     ) -> None:
         self.peripheral_id = peripheral_id
         self.snapshot = snapshot
         self.capture_provenance = capture_provenance
+        self.hardware_count = hardware_count
         self.normalized: BrilliantDevice | None = None
 
 
@@ -511,6 +518,7 @@ class RpcBusAdapter:
         # starts a new incomparable source generation.
         self._capture_generation = 0
         self._capture_sequence = 0
+        self._privacy_revocation: CaptureProvenance | None = None
         self._field_eras: dict[tuple[str, str, str], int] = {}
         # Multiple consumers (panel bridge + mesh publisher) may each register
         # a change callback; every change fans out to all of them. Each entry is
@@ -620,11 +628,49 @@ class RpcBusAdapter:
     def _advance_capture_generation(self) -> None:
         self._capture_generation += 1
         self._capture_sequence = 0
+        self._privacy_revocation = None
         self._field_eras.clear()
 
     @property
     def capture_generation(self) -> int:
         return self._capture_generation
+
+    @property
+    def own_device_id(self) -> str | None:
+        """Return the local panel's bus device_id once start() has committed."""
+        return self._own_device_id
+
+    @property
+    def capture_sequence(self) -> int:
+        """Latest allocated boundary, including undelivered pushes and empty reads."""
+        return self._capture_sequence
+
+    @property
+    def privacy_revocation(self) -> CaptureProvenance | None:
+        if self._shutting_down:
+            return CaptureProvenance(self._capture_generation, self._capture_sequence)
+        return self._privacy_revocation
+
+    def _capture_privacy_revocation(
+        self, device_id: str, boundary: CaptureProvenance, peripherals: Iterable[Any]
+    ) -> None:
+        """Retain denial ordering even when its callbacks are delayed or coalesced away."""
+        if (
+            device_id != self._own_device_id
+            or boundary.source_generation != self._capture_generation
+        ):
+            return
+        hardware = [
+            p
+            for p in peripherals
+            if kind_for_peripheral_type(int(p.peripheral_type)) is DeviceKind.HARDWARE
+        ]
+        var = hardware[0].variables.get("privacy_toggle") if len(hardware) == 1 else None
+        if var is not None and str(_coerce_scalar(var.value)).strip() == "0":
+            return
+        previous = self._privacy_revocation
+        if previous is None or boundary.sequence > previous.sequence:
+            self._privacy_revocation = boundary
 
     def _next_capture_provenance(self) -> CaptureProvenance:
         self._capture_sequence += 1
@@ -768,8 +814,8 @@ class RpcBusAdapter:
         """Normalize a wanted changed device and dispatch by callback policy.
 
         A live per-callback scope predicate (``want_device``) is evaluated on
-        the raw device id FIRST: if no registered callback wants this device the
-        push is dropped before any peripheral is even snapshotted (issue #98).
+        the raw device id FIRST. Unwanted extra devices are dropped before
+        snapshotting (issue #98); own-panel privacy denial is always captured.
         For a wanted device, every peripheral is captured into an IMMUTABLE
         primitive snapshot here and now (synchronously — the raw structs come
         from a mutable mirror, poc-findings §8b), but the expensive normalization
@@ -797,8 +843,6 @@ class RpcBusAdapter:
         if self._shutting_down or session != self._session:
             return
         cbs = list(self._change_cbs)
-        if not cbs:
-            return
         raw_id = getattr(raw_device, "id", None)
         device_id = str(raw_id) if raw_id else self._own_device_id
         if device_id is None:
@@ -808,14 +852,14 @@ class RpcBusAdapter:
         # consumer currently wants — a mesh push while this panel is a mesh
         # standby, or the mesh device seen by the panel bridge — is dropped here
         # having done zero normalization and zero Variable allocation. Each
-        # want_device predicate is opaque (str -> bool): the adapter never
-        # learns about panels, "ble_mesh", or leadership.
+        # want_device predicate is opaque (str -> bool). The own-panel exception
+        # preserves synchronous camera revocation independently of delivery.
         admitted = [
             (cb, coalesce_pushes)
             for cb, coalesce_pushes, want_device in cbs
             if want_device is None or want_device(device_id)
         ]
-        if not admitted:
+        if not admitted and device_id != self._own_device_id:
             return
         # Same defensive access as get_all(): a peripheral-less housekeeping
         # notification is routine, not worth a logger.exception from the
@@ -836,6 +880,11 @@ class RpcBusAdapter:
         # bridge AND the lossless scene bridge on the own device) is normalized
         # at most once total — like main, which shared one BrilliantDevice.
         capture_provenance = self._next_capture_provenance()
+        raw_peripherals = dict(peripherals)
+        hardware_count = sum(
+            kind_for_peripheral_type(int(raw.peripheral_type)) is DeviceKind.HARDWARE
+            for raw in raw_peripherals.values()
+        )
         snapshot = tuple(
             _PendingPeripheral(
                 peripheral_id,
@@ -846,8 +895,12 @@ class RpcBusAdapter:
                     peripheral_id,
                     dict(raw_peripheral.variables),
                 ),
+                hardware_count,
             )
-            for peripheral_id, raw_peripheral in dict(peripherals).items()
+            for peripheral_id, raw_peripheral in raw_peripherals.items()
+        )
+        self._capture_privacy_revocation(
+            device_id, capture_provenance, (p.snapshot for p in snapshot)
         )
         for cb, coalesce_pushes in admitted:
             key = (device_id if coalesce_pushes else None, cb)
@@ -919,6 +972,7 @@ class RpcBusAdapter:
                                 ),
                                 capture_provenance=pending_peripheral.capture_provenance,
                                 capture_complete=False,
+                                capture_hardware_count=pending_peripheral.hardware_count,
                             )
                             pending_peripheral.normalized = device
                         await cb(device)
@@ -1058,9 +1112,12 @@ class RpcBusAdapter:
                 timeout=_READ_DEADLINE_S,
             )
             if raw_device is None or getattr(raw_device, "peripherals", None) is None:
+                self._capture_privacy_revocation(device_id, boundary, ())
                 label = "own device" if device_id == own_id else "extra device"
                 logger.warning("%s id=%s not returned by get_device()", label, device_id)
                 continue
+            raw_peripherals = dict(raw_device.peripherals)
+            self._capture_privacy_revocation(device_id, boundary, raw_peripherals.values())
             devices.extend(
                 replace(
                     normalize_peripheral(device_id, peripheral_id, raw_peripheral),
@@ -1072,7 +1129,7 @@ class RpcBusAdapter:
                         complete=True,
                     ),
                 )
-                for peripheral_id, raw_peripheral in dict(raw_device.peripherals).items()
+                for peripheral_id, raw_peripheral in raw_peripherals.items()
             )
         return devices
 
@@ -1593,3 +1650,162 @@ class RpcBusAdapter:
         self._pending_pushes.clear()
         self._push_tasks.clear()
         await self._close_bus_resources()
+
+
+async def _await_if_coroutine(result: Any) -> None:
+    """Await a borrowed firmware method's result when it is a coroutine."""
+    if hasattr(result, "__await__"):
+        await result
+
+
+class HostedVirtualPeripheralAdapter(VirtualPeripheralHostProtocol):
+    """Concrete :class:`VirtualPeripheralHostProtocol` backed by ``PeripheralHost``.
+
+    All firmware imports (``lib.*`` / ``peripherals.*``) are deferred to runtime
+    methods so this module imports cleanly on any machine without panel libraries,
+    matching :mod:`brilliant_ha_mirror.hosting`.
+    """
+
+    def __init__(
+        self,
+        spec: VirtualPeripheralSpec,
+        on_external_set: Callable[[str, Any], Awaitable[None]],
+        loop: asyncio.AbstractEventLoop | None = None,
+    ) -> None:
+        self._spec = spec
+        self._on_external_set = on_external_set
+        self._loop = loop
+        self._host: Any = None
+        self._instance: Any = None
+
+    def _build_peripheral_class(self) -> Any:
+        from peripherals.lib.peripheral_service.peripheral import (
+            Peripheral,
+            VariableSpec,
+        )
+
+        spec = self._spec
+        on_ext = self._on_external_set
+        adapter = self
+
+        def _make_push(var_name: str) -> Callable[[Any], Awaitable[bool]]:
+            async def _push(val: Any) -> bool:
+                await on_ext(var_name, val)
+                return True
+
+            return _push
+
+        def _build_variables() -> dict[str, Any]:
+            specs: dict[str, Any] = {}
+            for k, default_val in spec.initial_variables.items():
+                is_settable = k in spec.settable_variables
+                vtype = int if isinstance(default_val, int) else str
+                specs[k] = VariableSpec(
+                    vtype,
+                    is_settable,
+                    default_value=default_val,
+                    push_func=_make_push(k) if is_settable else None,
+                )
+            return specs
+
+        class _DynamicVirtualPeripheral(Peripheral):
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                super().__init__(*args, **kwargs)
+                adapter._instance = self
+
+            @property
+            def name(self) -> str:
+                return spec.peripheral_id
+
+            @property
+            def peripheral_type(self) -> int:
+                return spec.peripheral_type
+
+            def _my_variables(self) -> dict[str, Any]:
+                return _build_variables()
+
+        return _DynamicVirtualPeripheral
+
+    async def start(self) -> None:
+        if self._host is not None:
+            return
+        from lib.startables.startable import HostedStartableSpec
+        from peripherals.lib.peripheral_service.peripheral_host import (
+            PeripheralConfig,
+            PeripheralHost,
+        )
+
+        try:
+            import gflags
+
+            flags = gflags.FLAGS
+            try:
+                _ = flags.message_bus_server_socket_path
+            except gflags.UnparsedFlagAccessError:
+                flags([""])
+            flags.message_bus_server_socket_path = _SOCKET_PATH
+        except ImportError:
+            pass
+
+        loop = self._loop or asyncio.get_running_loop()
+        p_cls = self._build_peripheral_class()
+        startable_id = self._spec.peripheral_id
+        config = PeripheralConfig(startable_id, p_cls)
+        host = PeripheralHost(
+            loop=loop,
+            startable_id=startable_id,
+            startables_to_host=[HostedStartableSpec(startable_id, config, {})],
+            parallel_registration_limit=1,
+            raise_errors_for_lost_user_configured_data=False,
+            message_bus_address_override=None,
+        )
+        try:
+            await host.start()
+        except BaseException:
+            self._instance = None
+            raise
+        self._host = host
+
+    async def set_variable(self, name: str, value: Any) -> None:
+        instance = self._instance
+        if instance is None:
+            return
+        try:
+            from peripherals.lib.peripheral_service.peripheral import Peripheral
+
+            update = Peripheral.__dict__.get("_set_value_internal")
+            if update is not None:
+                await _await_if_coroutine(update(instance, name, value, notify=True))
+                return
+        except ImportError:
+            pass
+        if hasattr(instance, "set_value"):
+            await _await_if_coroutine(instance.set_value(name, value))
+
+    async def shutdown(self) -> None:
+        host = self._host
+        self._host = None
+        if host is None:
+            self._instance = None
+            return
+        try:
+            from peripherals.lib.peripheral_service.conditional_peripheral_host import (
+                ConditionalPeripheralHost,
+            )
+
+            delete_impl = ConditionalPeripheralHost.__dict__.get("delete_peripheral")
+            if delete_impl is not None:
+                await _await_if_coroutine(
+                    delete_impl(host, self._spec.peripheral_id, int(time.time() * 1000))
+                )
+        except ImportError:
+            pass
+        except Exception:
+            logger.exception(
+                "failed to delete hosted virtual peripheral %s during shutdown",
+                self._spec.peripheral_id,
+            )
+        finally:
+            self._instance = None
+            if hasattr(host, "shutdown"):
+                await _await_if_coroutine(host.shutdown())
