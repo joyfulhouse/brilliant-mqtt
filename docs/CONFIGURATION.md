@@ -181,15 +181,25 @@ OTA, which wipes `/data` (and the bundle with it) but not `/var`. This is what
 keeps the panel's native Hue client trusting your diyHue bridge so a wall
 slider can keep controlling an HA-backed bulb with no SmartThings/cloud
 round-trip. **Off by default.** In the HA integration, paste the public
-certificate through **Panel overrides** while the component is disabled, then
-enable the **Hue CA recovery** switch on the panel device (see
+certificate once as the fleet's **diyHue CA certificate** (Configure on the
+fleet entry). Every panel without its own override inherits it, including
+panels added later. A panel can instead use its own certificate through
+**Panel overrides**, which wins. Then enable the **Hue CA recovery** switch on
+the panel device (see
 [ha-integration.md → Entities](ha-integration.md#entities)). To replace an
-active certificate, disable the component, edit the override, and enable it
-again so stored and on-panel state cannot diverge.
+active certificate, disable the component, edit the fleet certificate or the
+override, and enable it again so stored and on-panel state cannot diverge.
 
-Enabling it requires pasting the **diyHue CA certificate (PEM)** field: your
-diyHue bridge's CA *public* certificate, PEM-encoded. The integration refuses
-to install the component if this field is empty.
+Enabling it requires a diyHue CA certificate: your diyHue bridge's CA *public*
+certificate, PEM-encoded. It must be **exactly one** X.509 certificate, not a
+chain, because the on-panel recovery tool fingerprints the file as a single
+certificate. Input must be plain ASCII: `\n` or `\r\n` line endings, no
+indentation or trailing spaces, and no non-breaking or zero-width spaces (watch
+for these when pasting from a web page or document). Accepted input is stored
+and installed in canonical form (LF, 64-column base64), so a re-paste that
+differs only in formatting doesn't count as a change. If neither the panel
+nor the fleet has a valid certificate, the integration refuses to install the
+component and says where to set it (`hue_ca_cert_missing`).
 
 A `brilliant-hue-ca.timer` drives the oneshot: it fires once ~2 minutes after
 boot, then every ~15 minutes thereafter — frequent enough to reliably catch a

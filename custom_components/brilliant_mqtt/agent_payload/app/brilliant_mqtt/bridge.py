@@ -28,7 +28,12 @@ from brilliant_mqtt.discovery import (
     meta_topic,
     state_topic,
 )
-from brilliant_mqtt.mapping import EntityDescriptor, entities_for, payload_fields
+from brilliant_mqtt.mapping import (
+    EntityDescriptor,
+    entities_for,
+    has_calibrated_motion_thresholds,
+    payload_fields,
+)
 from brilliant_mqtt.model import BrilliantDevice, CaptureProvenance, DeviceKind, Variable
 from brilliant_mqtt.motion_derive import MotionDeriver
 from brilliant_mqtt.protocols import BusClient, MqttClient
@@ -217,12 +222,18 @@ class Bridge:
         owned_topics: RetainedTopicLedger | None = None,
         deployment_id: str | None = None,
         diagnostics: ResponseDiagnostics | None = None,
+        motion_native_passthrough: bool = False,
+        motion_default_high_threshold: int | None = None,
+        motion_default_low_threshold: int | None = None,
     ) -> None:
         self._bus = bus
         self._mqtt = mqtt
         self._panel = panel
         self._deployment_id = deployment_id
         self._diagnostics = diagnostics
+        self._motion_native_passthrough = motion_native_passthrough
+        self._motion_default_high_threshold = motion_default_high_threshold
+        self._motion_default_low_threshold = motion_default_low_threshold
         # Scope filter keyed by bus DEVICE ID; None means everything (the
         # single-bridge default). The mesh milestone runs TWO Bridge instances
         # on the SAME bus in one process — the panel bridge excludes "ble_mesh",
@@ -267,6 +278,11 @@ class Bridge:
 
         # peripheral_id → most recent BrilliantDevice snapshot.
         self._devices: dict[str, BrilliantDevice] = {}
+        # Camera permission must not inherit discovery's intentionally unpruned cache.
+        self._privacy_off = False
+        self._privacy_source_generation = getattr(bus, "capture_generation", 0)
+        self._privacy_sequence = -1
+        self._privacy_invalid_through = -1
         # command topic → (peripheral_id, descriptor). descriptor is None for the
         # PRIMARY JSON light/switch topic; an EntityDescriptor for each aux topic.
         self._by_cmd_topic: dict[str, tuple[str, EntityDescriptor | None]] = {}
@@ -320,6 +336,12 @@ class Bridge:
         """Apply score-derived motion to *device* (identity when disabled)."""
         return device if self._deriver is None else self._deriver.apply(device)
 
+    def _payload_fields(self, device: BrilliantDevice) -> dict[str, object]:
+        """Render payload fields with this bridge's motion passthrough configuration."""
+        if self._motion_native_passthrough:
+            return payload_fields(device, native_motion_passthrough=True)
+        return payload_fields(device)
+
     @staticmethod
     def _same_binding(previous: BrilliantDevice, device: BrilliantDevice) -> bool:
         return (
@@ -339,6 +361,87 @@ class Bridge:
                 self._command_generation.get(device.peripheral_id, 0) + 1
             )
         self._devices[device.peripheral_id] = device
+
+    def is_privacy_off(self) -> bool:
+        """Require explicit privacy-off evidence from the current bus generation."""
+        self._sync_privacy_generation()
+        return self._wired_feedback_enabled and self._privacy_off
+
+    def camera_privacy_epoch(self) -> tuple[int, int, int]:
+        """Identity for work that must not span a denial or source replacement."""
+        self._sync_privacy_generation()
+        return (
+            self._privacy_source_generation,
+            self._privacy_invalid_through,
+            self._wired_lifecycle,
+        )
+
+    def _sync_privacy_generation(self) -> None:
+        generation = getattr(self._bus, "capture_generation", 0)
+        if generation != self._privacy_source_generation:
+            self._privacy_off = False
+            self._privacy_sequence = -1
+            self._privacy_invalid_through = -1
+            self._privacy_source_generation = generation
+        revoked = self._bus.privacy_revocation
+        if revoked is not None and revoked.source_generation == generation:
+            self._privacy_invalid_through = max(self._privacy_invalid_through, revoked.sequence)
+            if self._privacy_sequence <= revoked.sequence:
+                self._privacy_off = False
+
+    def _invalidate_privacy(self, devices: list[BrilliantDevice] | None = None) -> None:
+        self._sync_privacy_generation()
+        self._privacy_off = False
+        # Delivery can lag capture. Fence the live source's high-water mark,
+        # including empty reads that have no peripheral to carry provenance.
+        sequences = [self._privacy_invalid_through, self._bus.capture_sequence]
+        sequences.extend(
+            d.capture_provenance.sequence
+            for d in devices or ()
+            if d.capture_provenance is not None
+            and d.capture_provenance.source_generation == self._privacy_source_generation
+        )
+        self._privacy_invalid_through = max(sequences)
+
+    def _observe_privacy(self, device: BrilliantDevice) -> None:
+        if device.kind is not DeviceKind.HARDWARE:
+            return
+        self._sync_privacy_generation()
+        provenance = device.capture_provenance
+        if provenance is None and self._privacy_invalid_through >= 0:
+            return
+        if provenance is not None:
+            if provenance.source_generation != self._privacy_source_generation:
+                return
+            if provenance.sequence < self._privacy_sequence:
+                return
+            if provenance.sequence <= self._privacy_invalid_through:
+                return
+            self._privacy_sequence = provenance.sequence
+        if device.capture_hardware_count is not None and device.capture_hardware_count != 1:
+            self._invalidate_privacy([device])
+            return
+        var = device.variables.get("privacy_toggle")
+        self._privacy_off = (
+            var is not None
+            and var.value.strip() == "0"
+            and "privacy_toggle" not in device.capture_unknown
+            and (device.capture_present is None or "privacy_toggle" in device.capture_present)
+        )
+
+    def _observe_privacy_snapshot(self, devices: list[BrilliantDevice]) -> None:
+        self._sync_privacy_generation()
+        hardware = [d for d in devices if self._included(d) and d.kind is DeviceKind.HARDWARE]
+        if len(hardware) != 1:
+            self._invalidate_privacy(devices)
+            return
+        provenance = hardware[0].capture_provenance
+        if provenance is not None and (
+            provenance.source_generation != self._privacy_source_generation
+        ):
+            self._invalidate_privacy(devices)
+            return
+        self._observe_privacy(hardware[0])
 
     @staticmethod
     def _is_wired_primary(device: BrilliantDevice) -> bool:
@@ -422,6 +525,7 @@ class Bridge:
             return
         self._beat()
         self._mesh_feedback_enabled = True
+        self._observe_privacy_snapshot(devices)
 
         # A broker await may admit a command or native push. Apply this captured
         # wired batch before those awaits so it cannot later overwrite their state.
@@ -508,7 +612,7 @@ class Bridge:
             # the device contributes any payload fields. Forced: reconcile is
             # the level-triggered repair pass, so it republishes even when the
             # payload is unchanged (and re-primes the diff cache).
-            fields = payload_fields(device)
+            fields = self._payload_fields(device)
             if fields:
                 await self._publish_state(device, fields, force=True)
                 if not self._feedback_alive(lifecycle):
@@ -537,6 +641,7 @@ class Bridge:
 
     async def reconcile_after_reconnect(self) -> None:
         """Retire session-local wired evidence before reading a new bus generation."""
+        self._invalidate_privacy()
         if not self._wired_feedback_enabled:
             return
         lifecycle = self._wired_lifecycle
@@ -650,6 +755,7 @@ class Bridge:
             self._beat()
         if not self._feedback_alive(lifecycle):
             return
+        self._observe_privacy_snapshot(devices)
         for device in devices:
             # Same scope filter as reconcile: the shared get_all returns every
             # bus device, including the other bridge's.
@@ -660,13 +766,35 @@ class Bridge:
             observed = self._derived(device)
             device = self._remember_native_observation(observed)
             self._observe_mesh_pending(device)
-            fields = payload_fields(device)
+            fields = self._payload_fields(device)
             if fields:
                 await self._publish_state(device, fields, force=False)
                 if not self._feedback_alive(lifecycle):
                     return
         if self._feedback_alive(lifecycle):
             await self._enforce_desired(devices)
+
+    def _motion_default_wants(self, device: BrilliantDevice) -> dict[str, str]:
+        """Config-driven motion defaults for *device*, overlaid under recorded intent.
+
+        Never persisted: they are configuration, not user intent, so unsetting
+        the env vars stops asserting them. Scoring is only turned off on a switch
+        whose observed thresholds are already calibrated — an uncalibrated switch
+        with scoring off would have its motion gated off for good.
+        """
+        defaults: dict[str, str] = {}
+        variables = device.variables
+        if self._motion_default_high_threshold is not None and "motion_high_threshold" in variables:
+            defaults["motion_high_threshold"] = str(self._motion_default_high_threshold)
+        if self._motion_default_low_threshold is not None and "motion_low_threshold" in variables:
+            defaults["motion_low_threshold"] = str(self._motion_default_low_threshold)
+        if (
+            self._motion_native_passthrough
+            and "enable_motion_score" in variables
+            and has_calibrated_motion_thresholds(device)
+        ):
+            defaults["enable_motion_score"] = "0"
+        return defaults
 
     async def _enforce_desired(self, devices: list[BrilliantDevice]) -> None:
         """Re-assert drifted reconciled vars (firmware reverts the enable flags).
@@ -686,7 +814,10 @@ class Bridge:
                 return
             if not self._included(device):
                 continue
-            wanted = self._desired.wanted(device.peripheral_id)
+            wanted = {
+                **self._motion_default_wants(device),
+                **self._desired.wanted(device.peripheral_id),
+            }
             if not wanted:
                 continue
             drifted: list[VarSet] = []
@@ -978,6 +1109,7 @@ class Bridge:
 
     async def shutdown_wired_feedback(self) -> None:
         """Terminally retire wired work and join its one timer/publisher per load."""
+        self._privacy_off = False
         self._wired_feedback_enabled = False
         self._wired_lifecycle += 1
         slots = list(self._wired.values())
@@ -1056,6 +1188,8 @@ class Bridge:
         # bridge — an out-of-scope device must not even be snapshotted.
         if not self._included(device):
             return
+        if self._wired_feedback_enabled:
+            self._observe_privacy(device)
         if self._is_wired_primary(device) and not self._wired_feedback_enabled:
             return
 
@@ -1070,7 +1204,7 @@ class Bridge:
         device = self._remember_native_observation(observed)
         self._observe_mesh_pending(device)
 
-        fields = payload_fields(device)
+        fields = self._payload_fields(device)
         if fields:
             await self._publish_state(device, fields, force=False)
 
@@ -1549,7 +1683,7 @@ class Bridge:
         device = self._devices.get(peripheral_id)
         if device is None:
             return
-        fields = payload_fields(device)
+        fields = self._payload_fields(device)
         if fields:
             await self._publish_state(device, fields, force=force)
 
@@ -1624,6 +1758,6 @@ class Bridge:
         updated = replace(device, variables=new_vars)
         self._remember_device(updated)
 
-        fields = payload_fields(updated)
+        fields = self._payload_fields(updated)
         if fields:
             await self._publish_state(updated, fields, force=False)

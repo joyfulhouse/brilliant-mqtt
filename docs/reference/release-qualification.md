@@ -11,11 +11,12 @@ observed light response are different measurements. Record each separately. A
 bus acknowledgement or a retained MQTT `online` message does not establish
 physical actuation or native panel-slider responsiveness.
 
-## Current release: 0.11.3 agent, 0.11.4 integration
+## Historical qualification: 0.11.3 agent, 0.11.4 integration
 
 [`v0.11.3`](https://github.com/joyfulhouse/brilliant-mqtt/releases/tag/v0.11.3)
-(release ordinal 5, voice payload 0.1.1) is the agent release installed on
-every panel. Its contents are in the [changelog](../../CHANGELOG.md).
+(release ordinal 5, voice payload 0.1.1) was the agent release installed on
+every panel during the 2026-10-26 qualification window. Its contents are in
+the [changelog](../../CHANGELOG.md).
 [`v0.11.4`](https://github.com/joyfulhouse/brilliant-mqtt/releases/tag/v0.11.4)
 is a Home Assistant integration release only: it bundles the same 0.11.3 agent
 payload with release ordinal 5, so it neither changes nor updates panels.
@@ -38,6 +39,12 @@ The fleet was updated before the rollback and responsiveness rows were complete.
 The remaining work therefore qualifies an installed release. If it fails, the
 response is a targeted rollback of the affected panels and a fix in a new
 release, not a decision about whether to deploy.
+
+Later releases do not inherit this live qualification automatically. The
+repository now includes 0.12.x integration releases and agent 0.11.4 (ordinal
+6). Confirm the actual installed integration and panel identities for every
+new qualification window. The responsiveness re-run and baseline finalization
+in #164 still require live evidence.
 
 ## Verify installed identity
 
@@ -99,14 +106,15 @@ and it changes which code the services run.
 
 ### Which checkout to use
 
-Run the integration and payload parity legs from a checkout of the
-[`v0.11.4`](https://github.com/joyfulhouse/brilliant-mqtt/releases/tag/v0.11.4)
-tag, because they must match the loaded integration byte for byte. The
+Run the integration and payload parity legs from a checkout of the exact
+release loaded by Home Assistant, because they must match it byte for byte.
+Select the release for the new qualification window; the historical v0.11.4
+example does not prescribe a downgrade. If that release predates the
 `payload-identities` and `component-identities` modes of
-`scripts/brilliant-panel/bundle_manifest.py` are newer than that tag. Run them
-from a checkout that contains them, and point `payload-identities` at the
-v0.11.4 payload. This is valid because an identity covers only the core code
-trees, `VERSION` and `RELEASE_ORDINAL`, none of which a newer helper changes.
+`scripts/brilliant-panel/bundle_manifest.py`, run the helper from a checkout
+that contains them and point `payload-identities` at the selected release's
+payload. An identity covers only the core code trees, `VERSION` and
+`RELEASE_ORDINAL`, none of which a newer helper changes.
 
 ### Comparing component identities
 
@@ -119,8 +127,8 @@ already have a verified host-key pin, as in the deployment reference.
 set -euo pipefail
 legacy_evidence=artifacts/canary/legacy-parity
 manifest_helper=scripts/brilliant-panel/bundle_manifest.py
-# The v0.11.4 payload, for example from `git worktree add ../brilliant-mqtt-v0.11.4 v0.11.4`.
-release_payload=../brilliant-mqtt-v0.11.4/custom_components/brilliant_mqtt/agent_payload
+# Checkout of the exact release loaded by HA and selected for this window.
+release_payload=../brilliant-mqtt-qualified/custom_components/brilliant_mqtt/agent_payload
 components="--component bridge --component wifi_watchdog --component bus_watchdog"
 mkdir -p "$legacy_evidence"
 

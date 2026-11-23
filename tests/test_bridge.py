@@ -2425,3 +2425,140 @@ class TestReconcileSubscribeDedupe:
             await bridge.reconcile()
 
         assert raised.value is failure
+
+
+class TestNativeMotionPassthroughBridge:
+    @staticmethod
+    def _written(bus: FakeBus) -> dict[str, str]:
+        return {s.name: s.value for _, _, sets in bus.commands for s in sets}
+
+    @staticmethod
+    def _set(device: BrilliantDevice, **values: str) -> BrilliantDevice:
+        for name, value in values.items():
+            device.variables[name] = Variable(name, value)
+        return device
+
+    async def test_native_passthrough_turns_scoring_off_only_on_calibrated_switches(
+        self, tmp_path: Path, mesh_load_with_motion: BrilliantDevice
+    ) -> None:
+        from brilliant_mqtt.desired_state import DesiredState
+
+        device = self._set(
+            mesh_load_with_motion,
+            enable_motion_score="1",
+            motion_high_threshold="65",
+            motion_low_threshold="65",
+        )
+        bus = FakeBus([device])
+        bridge = Bridge(
+            bus,
+            FakeMqtt(),
+            MESH_PANEL,
+            include=_is_mesh,
+            desired=DesiredState(tmp_path / "desired.json"),
+            motion_native_passthrough=True,
+        )
+        await bridge.reconcile()
+
+        assert self._written(bus) == {"enable_motion_score": "0"}
+
+    async def test_native_passthrough_leaves_scoring_on_for_uncalibrated_switch(
+        self, tmp_path: Path, mesh_load_with_motion: BrilliantDevice
+    ) -> None:
+        """Turning scoring off on an uncalibrated switch would gate its motion off for good."""
+        from brilliant_mqtt.desired_state import DesiredState
+
+        device = self._set(mesh_load_with_motion, enable_motion_score="1")  # low=20
+        bus = FakeBus([device])
+        bridge = Bridge(
+            bus,
+            FakeMqtt(),
+            MESH_PANEL,
+            include=_is_mesh,
+            desired=DesiredState(tmp_path / "desired.json"),
+            motion_native_passthrough=True,
+        )
+        await bridge.reconcile()
+
+        assert "enable_motion_score" not in self._written(bus)
+
+    async def test_default_thresholds_are_asserted_but_never_persisted(
+        self, tmp_path: Path, mesh_load_with_motion: BrilliantDevice
+    ) -> None:
+        """Defaults are config, not user intent: unsetting the env vars must stop them."""
+        from brilliant_mqtt.desired_state import DesiredState
+
+        ds = DesiredState(tmp_path / "desired.json")
+        bus = FakeBus([mesh_load_with_motion])
+        bridge = Bridge(
+            bus,
+            FakeMqtt(),
+            MESH_PANEL,
+            include=_is_mesh,
+            desired=ds,
+            motion_native_passthrough=True,
+            motion_default_high_threshold=65,
+            motion_default_low_threshold=65,
+        )
+        await bridge.reconcile()
+
+        assert self._written(bus) == {
+            "motion_high_threshold": "65",
+            "motion_low_threshold": "65",
+        }
+        assert ds.wanted(MESH_PID) == {}
+        assert not (tmp_path / "desired.json").exists()
+
+    async def test_recorded_user_intent_overrides_motion_defaults(
+        self, tmp_path: Path, mesh_load_with_motion: BrilliantDevice
+    ) -> None:
+        from brilliant_mqtt.desired_state import DesiredState
+
+        ds = DesiredState(tmp_path / "desired.json")
+        ds.record(MESH_PID, "enable_motion_score", "1")
+        ds.record(MESH_PID, "motion_low_threshold", "80")
+        device = self._set(
+            mesh_load_with_motion,
+            enable_motion_score="1",
+            motion_high_threshold="90",
+            motion_low_threshold="80",
+        )
+        bus = FakeBus([device])
+        bridge = Bridge(
+            bus,
+            FakeMqtt(),
+            MESH_PANEL,
+            include=_is_mesh,
+            desired=ds,
+            motion_native_passthrough=True,
+            motion_default_low_threshold=65,
+        )
+        await bridge.reconcile()
+
+        assert self._written(bus) == {}
+
+    async def test_native_passthrough_state_payload_exposes_motion_when_calibrated(
+        self, mesh_load_with_motion: BrilliantDevice
+    ) -> None:
+        mesh_load_with_motion.variables["motion_high_threshold"] = Variable(
+            "motion_high_threshold", "65"
+        )
+        mesh_load_with_motion.variables["motion_low_threshold"] = Variable(
+            "motion_low_threshold", "65"
+        )
+        bus = FakeBus([mesh_load_with_motion])
+        mqtt = FakeMqtt()
+        bridge = Bridge(
+            bus,
+            mqtt,
+            MESH_PANEL,
+            include=_is_mesh,
+            motion_native_passthrough=True,
+        )
+        await bridge.reconcile()
+
+        states = [p for p in mqtt.published if p[0] == f"brilliant/{MESH_PANEL}/{MESH_PID}/state"]
+        assert len(states) == 1
+        payload = json.loads(states[0][1])
+        assert payload["motion"] is True
+        assert payload["enable_motion_score"] is False

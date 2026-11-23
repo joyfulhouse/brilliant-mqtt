@@ -32,6 +32,7 @@ from uuid import RFC_4122, UUID, uuid4
 import asyncssh
 
 from .agent_payload import bundle_manifest
+from .certificates import MAX_CERTIFICATE_CHAIN_BYTES
 from .const import (
     BUS_WATCHDOG_SERVICE_NAME,
     COMPONENT_BRIDGE,
@@ -100,6 +101,20 @@ _HA_MIRROR_STAGED_ENV = f"{PANEL_HA_MIRROR_STAGED_DIR}/{HA_MIRROR_SERVICE_NAME}.
 
 class PanelOpError(RuntimeError):
     """A panel shell command exited non-zero."""
+
+    exit_status: int | None
+    stderr: str
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        exit_status: int | None = None,
+        stderr: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.exit_status = exit_status
+        self.stderr = stderr
 
 
 class ReleaseIdentityBlocked(PanelOpError):
@@ -554,7 +569,7 @@ _MANAGED_MQTT_CA_PATH = re.compile(
 )
 MAX_SNAPSHOT_FILE_BYTES = 16 * 1024
 MAX_SNAPSHOT_WIRE_BYTES = 24 * 1024
-MAX_MQTT_CA_BYTES = 256 * 1024
+MAX_MQTT_CA_BYTES = MAX_CERTIFICATE_CHAIN_BYTES
 _MAX_LAYOUT_WIRE_BYTES = 4096
 _MAX_VERSION_BYTES = 128
 _PANEL_PYTHON = "/data/switch-embedded/env/bin/python3"
@@ -789,9 +804,11 @@ async def _provisioning_run(
     except Exception:
         failed = True
     if failed or result is None or result.exit_status != 0:
+        exit_status = None if result is None else result.exit_status
+        stderr = "" if result is None else result.stderr
         command = "<redacted>"
         result = None
-        raise PanelOpError(error_code)
+        raise PanelOpError(error_code, exit_status=exit_status, stderr=stderr)
     return result
 
 
@@ -1213,6 +1230,57 @@ async def verify_baseline(shell: PanelShell, snapshot: PanelSnapshot) -> None:
 
 async def finalize_baseline(shell: PanelShell, snapshot: PanelSnapshot) -> None:
     await _baseline_action(shell, snapshot, "finalize")
+
+
+def candidate_release_absent_command(target: str, temporary: str) -> str:
+    """Panel probe: 1 if either candidate path exists, including a dangling symlink.
+
+    The heredoc body runs on the panel interpreter. Older controls are not
+    guaranteed a recent pathlib, so this matches the layout probe: ``os.path.lexists``,
+    with no f-strings or walrus operators in the panel script. The f-string here
+    is evaluated on Home Assistant before the script is sent.
+    """
+    if "\n" in target or "\n" in temporary or "\x00" in target or "\x00" in temporary:
+        raise PanelOpError("baseline_invalid")
+    return (
+        f"{_PANEL_PYTHON} - <<'BRILLIANT_CANDIDATE_ABSENT'\n"
+        "import os\n"
+        f"paths = ({target!r}, {temporary!r})\n"
+        "print(int(any(os.path.lexists(path) for path in paths)))\n"
+        "BRILLIANT_CANDIDATE_ABSENT"
+    )
+
+
+async def prove_unactivated_capture(
+    shell: PanelShell,
+    snapshot: PanelSnapshot,
+    *,
+    version: str,
+    transaction_id: UUID,
+) -> None:
+    """Prove a pre-activation capture still matches the panel and no candidate exists.
+
+    ``check_restored`` compares the live owned tree with the capture. The
+    transaction release directory must also be absent: staging has not run, so
+    discarding the archive cannot hide a candidate.
+    """
+    if (
+        snapshot.baseline is None
+        or _VERSION.fullmatch(version) is None
+        or not _valid_uuid4(transaction_id)
+    ):
+        raise PanelOpError("baseline_invalid")
+    await verify_baseline(shell, snapshot)
+    await _baseline_action(shell, snapshot, "check_restored")
+    target = f"{PANEL_RELEASES_DIR}/{version}--{transaction_id.hex}"
+    temporary = f"{PANEL_RELEASES_DIR}/.{version}--{transaction_id.hex}.tmp"
+    result = await _provisioning_run(
+        shell,
+        candidate_release_absent_command(target, temporary),
+        "baseline_read_failed",
+    )
+    if result.stdout.strip() != "0":
+        raise PanelOpError("baseline_candidate_present")
 
 
 async def baseline_retained(shell: PanelShell) -> bool:
@@ -2962,16 +3030,183 @@ def _swap_command() -> str:
     )
 
 
+def _slider_state_directory(environment: str) -> str | None:
+    """Read the supported systemd value forms; refuse ambiguous escape/continuation syntax."""
+    directory = None
+    for line in environment.splitlines():
+        if not line.strip() or line.lstrip().startswith(("#", ";")):
+            continue
+        key, separator, raw = line.strip().partition("=")
+        if not separator:
+            continue
+        raw = raw.strip()
+        if raw.startswith("'") and re.fullmatch(r"'[^']*'", raw):
+            value = raw[1:-1]
+        elif raw.startswith('"') and re.fullmatch(r'"(?:[^"\\]|\\["\\])*"', raw):
+            value = _env_unquote(raw)
+        elif not any(character in raw for character in "'\"\\"):
+            value = raw
+        else:
+            raise PanelOpError("slider_recovery_environment_unsupported")
+        if key.strip() == "MOTION_DESIRED_STATE_DIR":
+            directory = value
+    return directory
+
+
+async def _restore_virtual_sliders_on_uninstall(shell: PanelShell) -> None:
+    """Require verified restoration before removing backups and retry code."""
+    environment = await _checked(
+        shell, f"if [ -e {PANEL_ENV_FILE} ]; then cat {PANEL_ENV_FILE}; fi"
+    )
+    configured_dir = _slider_state_directory(environment.stdout)
+    if configured_dir and not configured_dir.startswith("/"):
+        working = await _checked(
+            shell, f"systemctl show --property=WorkingDirectory --value {SERVICE_NAME}"
+        )
+        working_dir = working.stdout.strip() or "/"
+        if not working_dir.startswith("/") or "\n" in working_dir:
+            raise PanelOpError("slider_recovery_working_directory_unknown")
+        configured_dir = f"{working_dir.rstrip('/')}/{configured_dir}"
+    state_paths = [f"{PANEL_VAR_DIR}/state/virtual-sliders.json"]
+    configured_paths: list[str] = []
+    if configured_dir:
+        configured_paths.append(f"{configured_dir.rstrip('/')}/virtual-sliders.json")
+        state_paths.extend(configured_paths)
+    codec_source = await asyncio.to_thread(
+        (Path(__file__).parent / "agent_payload/app/brilliant_mqtt/slider_config.py").read_text
+    )
+    await _checked(
+        shell,
+        f"{_PANEL_PYTHON} - <<'BRILLIANT_RESTORE_VIRTUAL_SLIDERS'\n"
+        "import asyncio, json, os, sys\n"
+        "from pathlib import Path\n"
+        f"var_dir = Path({PANEL_VAR_DIR!r})\n"
+        f"state_paths = list(dict.fromkeys({state_paths!r}))\n"
+        f"explicit_paths = set({configured_paths!r})\n"
+        "owned_roots = []\n"
+        "def scan_failed(error):\n"
+        "    raise error\n"
+        f"for scan_root in (var_dir, Path({_STAGING_DIR!r})):\n"
+        "    if scan_root.is_symlink():\n"
+        "        raise ValueError('Unverified recovery scan root symlink')\n"
+        "    if not scan_root.exists():\n"
+        "        continue\n"
+        "    owned_roots.append(scan_root.resolve(strict=True))\n"
+        "    for root, directories, files in os.walk(scan_root, onerror=scan_failed):\n"
+        "        if 'virtual-sliders.json' in files:\n"
+        "            state_paths.append(str(Path(root) / 'virtual-sliders.json'))\n"
+        "codec = {}\n"
+        f"exec({codec_source!r}, codec)\n"
+        "owners = {}\n"
+        "def backups(path):\n"
+        "    data = json.loads(path.read_text())\n"
+        "    if not isinstance(data, dict):\n"
+        "        raise ValueError('Invalid slider recovery state')\n"
+        "    for row in data.values():\n"
+        "        if not isinstance(row, dict) or 'original_slider_config' not in row:\n"
+        "            raise ValueError('Invalid slider recovery row')\n"
+        "        original = row['original_slider_config']\n"
+        "        if original is None and (row.get('orphaned') is True or\n"
+        "                row.get('mode') not in ('virtual', 'passthrough')):\n"
+        "            raise ValueError('Recovery row has no original slider configuration')\n"
+        "        if original is not None and (not isinstance(original, str) or not original):\n"
+        "            raise ValueError('Invalid original slider backup')\n"
+        "        if (original is not None and\n"
+        "                codec['decode_slider_config_target'](original) is None):\n"
+        "            raise ValueError('Malformed original slider configuration')\n"
+        "        if not all(isinstance(row.get(k), str) and row[k] for k in\n"
+        "                   ('config_device_id', 'config_peripheral_id', 'config_var_name')):\n"
+        "            raise ValueError('Incomplete slider recovery coordinates')\n"
+        "        if original is not None:\n"
+        "            target = tuple(row[k] for k in\n"
+        "                ('config_device_id', 'config_peripheral_id', 'config_var_name'))\n"
+        "            if target in owners and owners[target] != original:\n"
+        "                raise ValueError('Conflicting slider originals across recovery files')\n"
+        "            owners[target] = original\n"
+        "    targets = {(r['config_device_id'], r['config_peripheral_id'],\n"
+        "                r['config_var_name']) for r in data.values()\n"
+        "                if r['original_slider_config'] is not None}\n"
+        "    if len(targets) != sum(r['original_slider_config'] is not None\n"
+        "                           for r in data.values()):\n"
+        "        raise ValueError('Conflicting slider recovery coordinates')\n"
+        "    return any(row['original_slider_config'] is not None for row in data.values())\n"
+        "paths = []\n"
+        "explicit_targets = {Path(name).resolve(strict=True) for name in explicit_paths\n"
+        "                    if Path(name).exists() or Path(name).is_symlink()}\n"
+        "for name in state_paths:\n"
+        "    path = Path(name)\n"
+        "    if not path.exists() and not path.is_symlink():\n"
+        "        continue\n"
+        "    resolved = path.resolve(strict=True)\n"
+        "    if resolved not in explicit_targets and not any(\n"
+        "            resolved.is_relative_to(root) for root in owned_roots):\n"
+        "        raise ValueError('Discovered recovery file escapes owned removal roots')\n"
+        "    if resolved not in paths:\n"
+        "        paths.append(resolved)\n"
+        "pending = [p for p in paths if backups(p)]\n"
+        "if pending:\n"
+        "    root = var_dir / 'current' if (var_dir / 'current').exists() else var_dir\n"
+        "    if not (root / 'app').is_dir():\n"
+        "        raise ValueError('Slider recovery payload missing')\n"
+        "    sys.path[:0] = [str(root / sub) for sub in ('app', 'vendor')\n"
+        "                    if (root / sub).is_dir()]\n"
+        "    from brilliant_mqtt.virtual_sliders import restore_all_persisted_slider_bindings\n"
+        "    for state_path in pending:\n"
+        "        if not asyncio.run(restore_all_persisted_slider_bindings(state_path)):\n"
+        "            sys.exit('Virtual slider restoration incomplete; retry uninstall')\n"
+        "        if not state_path.exists() or backups(state_path):\n"
+        "            sys.exit('Virtual slider recovery was not retired; retry uninstall')\n"
+        "BRILLIANT_RESTORE_VIRTUAL_SLIDERS",
+    )
+
+
+_UNINSTALL_BRIDGE_STATE_COMMAND = (
+    f"systemctl show {SERVICE_NAME} --property=LoadState --property=ActiveState "
+    "--property=MainPID --property=ControlPID"
+)
+
+
+async def _quiesce_bridge_for_uninstall(shell: PanelShell) -> None:
+    stopped = await shell.run(f"systemctl disable --now {SERVICE_NAME}")
+    result = await shell.run(_UNINSTALL_BRIDGE_STATE_COMMAND)
+    pairs = [line.partition("=") for line in result.stdout.splitlines() if line.strip()]
+    state = {key: value.strip() for key, separator, value in pairs if separator}
+    properties = {"LoadState", "ActiveState", "MainPID", "ControlPID"}
+    if (
+        len(pairs) != len(state)
+        or not {"LoadState", "ActiveState"} <= state.keys()
+        or not state.keys() <= properties
+        or stopped.exit_status < 0
+        or result.exit_status < 0
+    ):
+        raise PanelOpError("slider_recovery_writer_state_unknown")
+    absent = state["LoadState"] == "not-found" and state["ActiveState"] == "inactive"
+    if absent and (stopped.exit_status not in {0, 1} or result.exit_status not in {0, 1}):
+        raise PanelOpError("slider_recovery_writer_state_unknown")
+    if not absent and (stopped.exit_status != 0 or result.exit_status != 0):
+        raise PanelOpError("slider_recovery_stop_failed")
+    if not absent and state.keys() != properties:
+        raise PanelOpError("slider_recovery_writer_state_unknown")
+    if (
+        state["LoadState"] not in {"loaded", "masked", "not-found"}
+        or state["ActiveState"] != "inactive"
+        or state.get("MainPID", "0") != "0"
+        or state.get("ControlPID", "0") != "0"
+        or (state["LoadState"] == "not-found" and not absent)
+    ):
+        raise PanelOpError("slider_recovery_writer_not_quiescent")
+
+
 async def uninstall(shell: PanelShell) -> None:
     """Stop + disable + remove everything the integration owns on the panel.
 
-    The disable step is best-effort (`|| true`) — the unit may already be gone —
-    but the removals and the reload must actually succeed or we'd leave orphaned
-    files behind a "removed" config entry.
+    Restoration requires a successfully stopped writer or positively confirmed
+    absent unit. Every removal and the reload must also succeed.
     """
     if await baseline_retained(shell):
         raise PanelOpError("baseline_retained_finalize_first")
-    await shell.run(f"systemctl disable --now {SERVICE_NAME} 2>/dev/null || true")
+    await _quiesce_bridge_for_uninstall(shell)
+    await _restore_virtual_sliders_on_uninstall(shell)
     await _checked(shell, f"rm -f {PANEL_UNIT_FILE} {PANEL_ENV_FILE}")
     await _checked(shell, f"rm -rf {PANEL_VAR_DIR} {_STAGING_DIR} {_STAGING_TARBALL}")
     await _checked(shell, "systemctl daemon-reload")
