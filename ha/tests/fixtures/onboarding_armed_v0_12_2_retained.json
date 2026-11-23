@@ -1,0 +1,82 @@
+{
+  "version": 1,
+  "minor_version": 1,
+  "key": "brilliant_mqtt.provisioning.retained",
+  "data": {
+    "records": {
+      "12345678-1234-4abc-8def-1234567890ab": {
+        "record": {
+          "transaction_id": "12345678-1234-4abc-8def-1234567890ab",
+          "operation": "install",
+          "phase": "staged",
+          "setup_id": "87654321-4321-4abc-8def-abcdef012345",
+          "panel_request": {
+            "host": "office.iot.example",
+            "ssh_username": "root",
+            "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKIykuTed7zNwJwn20eCelcKcHKJ9c/pGFfvulRWazuC",
+            "fingerprint": "SHA256:JfCon51dCgE/yWGkyroh3Ne+ONLMm6QmHMQnEoPSLx0",
+            "slug": "office",
+            "selected_components": [
+              "bridge",
+              "bus_watchdog",
+              "wifi_watchdog"
+            ]
+          },
+          "fleet_profile": {
+            "kind": "existing_broker",
+            "host": "mqtt.iot.example",
+            "port": 8883,
+            "tls_enabled": true
+          },
+          "staged_version": "0.11.4",
+          "prior_snapshot": {
+            "layout": "absent",
+            "active_release_target": null,
+            "environment_file": {
+              "content": null,
+              "mode": null
+            },
+            "version_file": {
+              "content": null,
+              "mode": null
+            },
+            "bridge_service": {
+              "unit_file": {
+                "content": null,
+                "mode": null
+              },
+              "enabled": false,
+              "active": false
+            },
+            "wifi_watchdog_service": {
+              "unit_file": {
+                "content": null,
+                "mode": null
+              },
+              "enabled": false,
+              "active": false
+            },
+            "bus_watchdog_service": {
+              "unit_file": {
+                "content": null,
+                "mode": null
+              },
+              "enabled": false,
+              "active": false
+            },
+            "selected_components": [],
+            "baseline": {
+              "identifier": "cccccccccccccccccccccccccccccccc",
+              "digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+              "identities": {}
+            }
+          },
+          "started_at": "2026-07-27T18:30:00+00:00",
+          "last_error": null
+        },
+        "state": "armed",
+        "recovery_deployment_id": null
+      }
+    }
+  }
+}
