@@ -738,7 +738,9 @@ class TestInteractiveScheduling:
             },
         )
         sleeper = FakeSleeper()
-        bridge = Bridge(adapter, FakeMqtt(), "test", clock=FakeClock(), sleep=sleeper)
+        clock = FakeClock()
+        adapter._clock = clock
+        bridge = Bridge(adapter, FakeMqtt(), "test", clock=clock, sleep=sleeper)
         topic = (
             "brilliant/test/slider/set_screen_brightness"
             if auxiliary

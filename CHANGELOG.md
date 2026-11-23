@@ -18,8 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ignored. A late failure publishes `failed` with the observed state. A late
   acceptance synchronously starts a full 80 second confirm window, fenced
   against older captured snapshots and independent of MQTT publication
-  delays. A late timeout or
-  cancellation resumes normal contradiction handling. A fast native "No
+  delays. Confirmation freshness uses native capture time, and a reconnect
+  retires evidence from the prior native session. A newer contradiction at
+  the deadline cannot be overwritten by an older match. Success at the
+  caller-timeout boundary retains its receipt and acceptance fence. A late
+  timeout or cancellation resumes normal contradiction handling. A fast native "No
   response received!" timeout is still contradicted on the next poll. The
   peer churn that makes these writes slow is native firmware behaviour and
   is not changed here.

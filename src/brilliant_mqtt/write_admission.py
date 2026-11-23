@@ -93,6 +93,11 @@ class AdmissionTicket:
         """Adapter capture boundary stamped immediately after native acceptance."""
         return self._accepted_at
 
+    @property
+    def settled_outcome(self) -> SettleOutcome | None:
+        """The actual native outcome, including success at the caller deadline."""
+        return None if self._settlement is None else self._settlement[0]
+
     def set_settle_callback(self, callback: Callable[[SettleOutcome], None]) -> None:
         """Observe the native write's outcome, even one landing after the caller deadline.
 

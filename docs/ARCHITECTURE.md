@@ -101,7 +101,10 @@ bidirectional control.
   Acceptance is installed synchronously at native return and fenced against
   older captures in the adapter's existing sequence domain. Its fixed
   monotonic timer runs independently of MQTT publication, so broker delay
-  cannot renew the confirmation window.
+  cannot renew the confirmation window. Matching freshness uses native capture
+  time, rather than delivery time. Newer contradictions take precedence over
+  old matching evidence at expiry, and reconnect retires the old session's
+  pending evidence.
   Only a write still unresolved at the fixed 15 s hard cap latches the
   write-timeout flag, and the coordinator rebuilds the session on its next
   tick; a single 5 s timeout no longer triggers a rebuild. No retry,

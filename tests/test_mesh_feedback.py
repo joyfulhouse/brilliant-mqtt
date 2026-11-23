@@ -394,6 +394,7 @@ async def test_detached_rpc_late_outcome_settles_only_its_own_pending(
         fail_with=RuntimeError("synthetic late rejection") if late_error else None
     )
     bus, mqtt, bridge, _clock, sleeper = _mesh_bridge([_mesh_dimmer_at("1")])
+    adapter._clock = _clock
     monkeypatch.setattr(bus, "set_variables", adapter.set_variables)
     try:
         await bridge.reconcile()

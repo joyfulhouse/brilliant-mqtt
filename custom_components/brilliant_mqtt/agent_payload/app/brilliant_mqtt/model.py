@@ -91,6 +91,7 @@ class CaptureProvenance:
     sequence: int
     field_eras: tuple[tuple[str, int], ...] = ()
     issued_values: tuple[tuple[str, str], ...] = ()
+    captured_at: float | None = field(default=None, compare=False)
 
 
 @dataclass

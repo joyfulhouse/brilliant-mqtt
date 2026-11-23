@@ -446,6 +446,19 @@ class Bridge:
         self._sync_wired_timer(peripheral_id, slot)
         return slot
 
+    def _stale_mesh_capture(self, device: BrilliantDevice) -> bool:
+        if self._panel != _MESH_PANEL:
+            return False
+        current = self._devices.get(device.peripheral_id)
+        previous = None if current is None else current.capture_provenance
+        incoming = device.capture_provenance
+        if previous is None or incoming is None:
+            return False
+        return (incoming.source_generation, incoming.sequence) <= (
+            previous.source_generation,
+            previous.sequence,
+        )
+
     def _remember_native_observation(self, observed: BrilliantDevice) -> BrilliantDevice:
         """Reduce wired captures before any broker await or publication."""
         if not self._is_wired_primary(observed):
@@ -562,6 +575,8 @@ class Bridge:
                     continue
                 device = current
             else:
+                if self._stale_mesh_capture(device):
+                    continue
                 observed = self._derived(device)
                 device = self._remember_native_observation(observed)
                 self._mesh.observe(device)
@@ -729,6 +744,8 @@ class Bridge:
             if not self._included(device):
                 continue
             if not entities_for(device, self._panel):
+                continue
+            if self._stale_mesh_capture(device):
                 continue
             observed = self._derived(device)
             device = self._remember_native_observation(observed)
@@ -1149,6 +1166,8 @@ class Bridge:
         if not descriptors:
             return
 
+        if self._stale_mesh_capture(device):
+            return
         observed = self._derived(device)
         device = self._remember_native_observation(observed)
         self._mesh.observe(device)
@@ -1465,7 +1484,13 @@ class Bridge:
                 peripheral_id,
                 "the detached RPC" if rpc_unresolved else "an observation",
             )
-            receipt = PENDING_RPC_RECEIPT
+            settled_outcome = None if ticket is None else ticket.settled_outcome
+            if isinstance(settled_outcome, BaseException) and not isinstance(
+                settled_outcome, (asyncio.TimeoutError, TimeoutError, asyncio.CancelledError)
+            ):
+                await self._mesh.publish_failure(peripheral_id, generation)
+                return
+            receipt = settled_outcome if isinstance(settled_outcome, str) else PENDING_RPC_RECEIPT
         except Exception:
             if not self._mesh.is_current(peripheral_id, generation):
                 # Superseded mid-flight — the newer command owns the pending
@@ -1488,6 +1513,7 @@ class Bridge:
             {s.name: s.value for s in sets},
             receipt,
             rpc_unresolved=rpc_unresolved,
+            accepted_at=None if carrier.ticket is None else carrier.ticket.accepted_at,
         )
         if pending is None:
             return

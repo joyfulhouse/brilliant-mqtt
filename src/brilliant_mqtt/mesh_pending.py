@@ -76,7 +76,7 @@ class PendingMeshWrite:
     generation: int
     status: str = "pending"
     deadline: float | None = None
-    # Bridge-clock time of the newest observation matching the targets.
+    # Native capture time of the newest observation matching the targets.
     last_observed_at: float | None = None
     # True only while the native RPC is still running past the caller deadline
     # (#225): the mirror then still carries the PRE-write value, so a differing
@@ -84,6 +84,7 @@ class PendingMeshWrite:
     rpc_unresolved: bool = False
     accepted_at: CaptureProvenance | None = None
     expires_at: float | None = None
+    last_capture: CaptureProvenance | None = None
 
 
 def _is_inconclusive(outcome: SettleOutcome) -> bool:
@@ -244,19 +245,22 @@ class MeshPending:
         receipt: str,
         *,
         rpc_unresolved: bool = False,
+        accepted_at: CaptureProvenance | None = None,
     ) -> PendingMeshWrite | None:
         """Arm the pending record and its confirm timer; None when superseded."""
         if not self.is_current(peripheral_id, generation):
             # Superseded while this write awaited; the newer command's pending
             # (and confirm timer) owns the peripheral now.
             return None
+        expires_at = self._expiry(accepted_at)
         pending = PendingMeshWrite(
             targets=dict(targets),
             receipt=receipt,
             generation=generation,
-            deadline=self._fresh_deadline(),
+            deadline=self._fresh_deadline(expires_at),
             rpc_unresolved=rpc_unresolved,
-            expires_at=self._clock() + MESH_CONFIRM_SECONDS,
+            expires_at=expires_at,
+            accepted_at=accepted_at,
         )
         self._start_window(peripheral_id, pending)
         return pending
@@ -295,16 +299,29 @@ class MeshPending:
             return
         if not self.owns(peripheral_id, pending.generation, pending):
             return
-        if pending.expires_at is not None and self._clock() >= pending.expires_at:
-            return
+        capture = device.capture_provenance
         if pending.accepted_at is not None:
-            capture = device.capture_provenance
+            if capture is not None and (
+                capture.source_generation > pending.accepted_at.source_generation
+            ):
+                # A new native session cannot inherit an old session's match.
+                self.drop(peripheral_id)
+                self.set_feedback(peripheral_id, None)
+                return
             if (
                 capture is None
-                or capture.source_generation != pending.accepted_at.source_generation
+                or capture.source_generation < pending.accepted_at.source_generation
                 or capture.sequence <= pending.accepted_at.sequence
             ):
                 return
+        previous = pending.last_capture
+        if capture is not None and previous is not None:
+            if capture.source_generation < previous.source_generation or (
+                capture.source_generation == previous.source_generation
+                and capture.sequence <= previous.sequence
+            ):
+                return
+        pending.last_capture = capture
         fully_matched = True
         for name, want in pending.targets.items():
             var = device.variables.get(name)
@@ -330,8 +347,17 @@ class MeshPending:
                 return
         # A match seen while the RPC is unresolved predates any acceptance:
         # it must not let the resolver confirm at expiry (#225).
+        if not fully_matched and device.capture_complete:
+            pending.last_observed_at = None
+        now = self._clock()
+        if pending.expires_at is not None and now >= pending.expires_at:
+            return
         if fully_matched and not pending.rpc_unresolved:
-            pending.last_observed_at = self._clock()
+            observed_at = None if capture is None else capture.captured_at
+            if observed_at is None and pending.accepted_at is None:
+                observed_at = now
+            if observed_at is not None and math.isfinite(observed_at) and observed_at <= now:
+                pending.last_observed_at = observed_at
 
     def on_rpc_settled(
         self,
@@ -364,14 +390,16 @@ class MeshPending:
             # Late acceptance: the native RPC only now took the write, so the
             # #46 revert tail starts now — a FULL fresh window, and no
             # pre-acceptance observation may back the confirmation.
+            expires_at = self._expiry(accepted_at)
             rearmed = replace(
                 pending,
                 receipt=outcome,
-                deadline=self._fresh_deadline(),
+                deadline=self._fresh_deadline(expires_at),
                 last_observed_at=None,
                 rpc_unresolved=False,
                 accepted_at=accepted_at,
-                expires_at=self._clock() + MESH_CONFIRM_SECONDS,
+                expires_at=expires_at,
+                last_capture=None,
             )
             logger.info(
                 "mesh write for %s accepted after the caller deadline; confirm window "
@@ -530,8 +558,15 @@ class MeshPending:
             peripheral_id, pending.generation, pending
         )
 
-    def _fresh_deadline(self) -> float | None:
-        deadline = self._wall_clock() + MESH_CONFIRM_SECONDS
+    def _expiry(self, accepted_at: CaptureProvenance | None) -> float:
+        native_at = None if accepted_at is None else accepted_at.captured_at
+        started_at = (
+            native_at if native_at is not None and math.isfinite(native_at) else self._clock()
+        )
+        return started_at + MESH_CONFIRM_SECONDS
+
+    def _fresh_deadline(self, expires_at: float) -> float | None:
+        deadline = self._wall_clock() + max(0.0, expires_at - self._clock())
         return deadline if math.isfinite(deadline) else None
 
     def _start_window(self, peripheral_id: str, pending: PendingMeshWrite) -> None:

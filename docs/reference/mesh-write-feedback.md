@@ -90,6 +90,14 @@ ticket that carried the write later reports the RPC's outcome (issue #225):
 A late outcome for a write that was superseded by a newer command, or that
 belongs to a withdrawn session, is ignored.
 
+The same acceptance fence applies when native success races the caller
+deadline: a settled success retains its actual receipt. Matching observations
+must have been captured within 10 seconds of confirmation; delayed delivery
+cannot make an old capture fresh. Older captures cannot replace newer evidence,
+and a newer contrary observation at expiry prevents confirmation from an older
+match. Reconnect observations retire the prior native session's pending record
+and resume observed state, so a pre-reconnect match cannot confirm afterward.
+
 ## Home Assistant diagnostic
 
 Each mesh primary has one additional MQTT sensor named `<load name> Write
