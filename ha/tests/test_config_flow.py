@@ -8,6 +8,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mappin
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from pathlib import Path
+from shutil import copyfile
 from types import MappingProxyType, SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, Mock, patch
@@ -26,7 +27,7 @@ from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.selector import TextSelector, TextSelectorType
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.brilliant_mqtt import _fleet_lock, config_flow, panel_ops
+from custom_components.brilliant_mqtt import _fleet_lock, config_flow, fleet_manager, panel_ops
 from custom_components.brilliant_mqtt.broker import BrokerKind, BrokerProfile
 from custom_components.brilliant_mqtt.components import REGISTRY
 from custom_components.brilliant_mqtt.const import (
@@ -113,6 +114,7 @@ from custom_components.brilliant_mqtt.panel_provisioner import (
     PanelProvisioningError,
     ProvisionedPanel,
     ProvisioningProgress,
+    panel_snapshot_from_stored,
 )
 from custom_components.brilliant_mqtt.provisioning_journal import (
     ProvisioningJournal,
@@ -5484,6 +5486,115 @@ async def test_unactivated_armed_baseline_requires_explicit_discard(
         )
     assert confirmed["step_id"] == "panel_confirm"
     provisioner.async_discard_unactivated_ownerless_baseline.assert_awaited_once()
+
+
+async def test_v0122_persisted_armed_baseline_can_be_discarded_then_panel_readded(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from custom_components.brilliant_mqtt.provisioning_journal import JOURNAL_STORAGE_KEY
+    from tests.test_provisioning_journal import _install_real_store
+
+    _install_real_store(hass, monkeypatch, tmp_path)
+    fixture = Path(__file__).parent / "fixtures/onboarding_armed_v0_12_2_retained.json"
+    retained_path = tmp_path / ".storage" / (JOURNAL_STORAGE_KEY + ".retained")
+
+    def seed_legacy_storage() -> None:
+        retained_path.parent.mkdir(parents=True, exist_ok=True)
+        copyfile(fixture, retained_path)
+
+    # Frozen output of v0.12.2's serializer: no current arm/create call can hide
+    # an incompatible legacy payload or create the missing execution journal.
+    await hass.async_add_executor_job(seed_legacy_storage)
+    journal = ProvisioningJournal(hass)
+    (retained,) = await journal.async_retained_records()
+    assert retained.state == "armed"
+    assert retained.recovery_deployment_id is None
+    assert retained.record.prior_snapshot.layout.value == "absent"
+    assert await journal.async_load() is None
+    entry = _fleet_entry(
+        hass,
+        _subentry(
+            slug="kitchen",
+            fingerprint=_OTHER_FINGERPRINT,
+            public_key=_OTHER_PUBLIC_KEY,
+            subentry_id="panel-kitchen",
+        ),
+        _subentry(
+            slug="living",
+            fingerprint=_THIRD_FINGERPRINT,
+            public_key=_THIRD_PUBLIC_KEY,
+            priority=2,
+            subentry_id="panel-living",
+        ),
+    )
+    previous_panels = {key: panel.as_dict() for key, panel in entry.subentries.items()}
+    fresh_password = "SECRET-fresh-recovery-password"
+    identity = _identity()
+    shell = FakeShell(pinned=identity.public_key)
+    shell_factory = Mock(return_value=shell)
+    baseline_action = AsyncMock()
+    candidate_probe = AsyncMock(return_value=RunResult(0, "0", ""))
+    form = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, SUBENTRY_TYPE_PANEL), context={"source": "user"}
+    )
+    with (
+        patch.object(flow_gateway, "async_fetch_host_identity", AsyncMock(return_value=identity)),
+        patch.object(flow_gateway, "_async_inspect_candidate", AsyncMock(return_value=_facts())),
+        patch.object(fleet_manager, "async_verify_host_identity", AsyncMock(return_value=identity)),
+        patch.object(fleet_manager, "AsyncsshShell", shell_factory),
+        patch.object(
+            panel_ops,
+            "snapshot_panel",
+            AsyncMock(return_value=panel_snapshot_from_stored(retained.record.prior_snapshot)),
+        ),
+        patch.object(panel_ops, "_baseline_action", baseline_action),
+        patch.object(panel_ops, "_provisioning_run", candidate_probe),
+    ):
+        discard = await hass.config_entries.subentries.async_configure(
+            form["flow_id"],
+            {CONF_HOST: retained.record.panel_request.host, CONF_ROOT_PASSWORD: fresh_password},
+        )
+        assert discard["step_id"] == "panel_discard_unactivated"
+        assert discard["errors"] == {}
+        baseline_action.assert_not_awaited()
+        confirm = await hass.config_entries.subentries.async_configure(
+            form["flow_id"], {"confirm_discard": True}
+        )
+    assert confirm["step_id"] == "panel_confirm"
+    assert confirm["errors"] == {}
+    shell_factory.assert_called_once_with(
+        retained.record.panel_request.host, fresh_password, identity.public_key
+    )
+    assert [call.args[2] for call in baseline_action.await_args_list] == [
+        "verify",
+        "check_restored",
+        "finalize",
+    ]
+    candidate_probe.assert_awaited_once()
+    probe_call = candidate_probe.await_args
+    assert probe_call is not None
+    assert "BRILLIANT_CANDIDATE_ABSENT" in probe_call.args[1]
+    assert await ProvisioningJournal(hass).async_retained_records() == ()
+    assert not shell.connected
+
+    install_gate = asyncio.Event()
+    provisioner = _FakeProvisioner(identity, gate=install_gate)
+    with patch.object(flow_gateway, "_get_panel_provisioner", return_value=provisioner):
+        progress = await hass.config_entries.subentries.async_configure(
+            form["flow_id"], {CONF_NAME: "Office"}
+        )
+        assert progress["type"] is FlowResultType.SHOW_PROGRESS
+        install_gate.set()
+        created = await _drain_progress(hass.config_entries.subentries, form["flow_id"])
+    assert created["type"] is FlowResultType.CREATE_ENTRY
+    assert len(provisioner.install_calls) == 1
+    assert provisioner.install_calls[0][0].root_password == fresh_password
+    assert len(entry.subentries) == 3
+    assert all(entry.subentries[key].as_dict() == value for key, value in previous_panels.items())
+    added = next(panel for panel in entry.subentries.values() if panel.unique_id == _FINGERPRINT)
+    assert added.data[CONF_HOST] == retained.record.panel_request.host
+    assert added.data[CONF_ROOT_PASSWORD] == fresh_password
+    assert await ProvisioningJournal(hass).async_retained_records() == ()
 
 
 async def test_ownerless_recovery_checks_retained_pin_before_fresh_password(
