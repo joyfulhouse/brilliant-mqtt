@@ -27,6 +27,7 @@ from custom_components.brilliant_mqtt.const import (
     CONF_HA_CONTROL_LABEL,
     CONF_HA_MIRROR_TOKEN,
     CONF_HOST,
+    CONF_HUE_CA_CERT,
     CONF_IDENTITY_FINGERPRINT,
     CONF_MANAGEMENT_ID,
     CONF_MAX_MIRRORED_ENTITIES,
@@ -60,6 +61,7 @@ from custom_components.brilliant_mqtt.provisioning_journal import (
     ProvisioningJournal,
     ProvisioningJournalError,
 )
+from tests import cert_fixtures
 from tests.fakes import FakeShell
 from tests.test_init import ENTRY_DATA
 
@@ -73,9 +75,10 @@ async def test_fleet_diagnostics_are_keyed_by_runtime_id_and_never_export_secret
     """A fleet diagnostic cannot serialize any persisted or MQTT-carried secret."""
     username = "diagnostics-fleet-username"
     mqtt_password = "diagnostics-fleet-password"
-    ca_pem = (
-        "-----BEGIN CERTIFICATE-----\ndiagnostics-ca-body-must-not-leak\n-----END CERTIFICATE-----"
-    )
+    ca_pem = cert_fixtures.ca_pem("diagnostics-broker")
+    ca_body = ca_pem.splitlines()[1]
+    hue_ca_pem = cert_fixtures.ca_pem("diagnostics-hue")
+    hue_ca_body = hue_ca_pem.splitlines()[1]
     environment = "MQTT_PASSWORD=diagnostics-env-body-must-not-leak\n"
     unknown_component = "diagnostics_unknown_component_must_not_leak"
     identities = {
@@ -130,6 +133,7 @@ async def test_fleet_diagnostics_are_keyed_by_runtime_id_and_never_export_secret
             CONF_MQTT_PASSWORD: mqtt_password,
             CONF_MQTT_TLS_ENABLED: True,
             CONF_MQTT_TLS_CA: ca_pem,
+            CONF_HUE_CA_CERT: hue_ca_pem,
             CONF_NEXT_MESH_PRIORITY: 3,
             CONF_HA_CONTROL_ENABLED: False,
             CONF_HA_CONTROL_LABEL: "brilliant",
@@ -222,6 +226,10 @@ async def test_fleet_diagnostics_are_keyed_by_runtime_id_and_never_export_secret
             "problem_reason": "runtime_setup_failed",
         },
     }
+    # The fleet Hue CA default is public trust material, but like the broker CA it
+    # is reported only as present (redacted), never by value.
+    assert diag["entry"][CONF_MQTT_TLS_CA] == "**REDACTED**"
+    assert diag["entry"][CONF_HUE_CA_CERT] == "**REDACTED**"
     diagnostic_text = repr(diag)
     assert all(
         CONF_SSH_USERNAME not in panel_diagnostics["configuration"]
@@ -231,7 +239,9 @@ async def test_fleet_diagnostics_are_keyed_by_runtime_id_and_never_export_secret
         username,
         mqtt_password,
         ca_pem,
-        "diagnostics-ca-body-must-not-leak",
+        ca_body,
+        hue_ca_pem,
+        hue_ca_body,
         environment,
         "diagnostics-env-body-must-not-leak",
         "diagnostics-office-root-password",

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -14,6 +16,7 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import area_registry as ar
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
+from homeassistant.util.yaml import load_yaml_dict
 from pytest_homeassistant_custom_component.common import MockConfigEntry, async_fire_mqtt_message
 from pytest_homeassistant_custom_component.typing import MqttMockHAClient
 
@@ -23,6 +26,8 @@ from custom_components.brilliant_mqtt.const import (
     CONF_SCENE_ACTIONS,
     CONF_SCENE_PANEL,
     DOMAIN,
+    panel_device_identifier,
+    panel_device_name,
 )
 from custom_components.brilliant_mqtt.ha_control_protocol import (
     MAPPING_VERSION,
@@ -30,10 +35,18 @@ from custom_components.brilliant_mqtt.ha_control_protocol import (
     encode_json,
     mode_result_topic,
 )
+from custom_components.brilliant_mqtt.migration_coordinator import (
+    SINGLE_OWNER_DEVICES,
+    device_links,
+)
 from tests.fakes import FakeShell
+from tests.registry_helpers import panel_device, panel_devices
 from tests.test_entry_data import _fleet_data
 from tests.test_fleet_manager import _panel
 from tests.test_init import ENTRY_DATA
+from tests.test_migration_coordinator import PANELS as MIGRATION_PANELS
+from tests.test_migration_coordinator import _restart_from_disk
+from tests.test_migration_coordinator import _run as _run_migration
 
 
 async def _setup_control_entry(hass: HomeAssistant) -> MockConfigEntry:
@@ -118,8 +131,7 @@ async def test_service_panel_device_target_operates_on_only_its_panel_subentry(
     kitchen = entry.runtime_data.panels["panel-kitchen"]
     office.async_repair = AsyncMock()
     kitchen.async_repair = AsyncMock()
-    device = dr.async_get(hass).async_get_device(identifiers={("mqtt", "brilliant_panel_office")})
-    assert device is not None
+    device = panel_device(hass, "office", entry.entry_id)
 
     await hass.services.async_call(
         DOMAIN,
@@ -148,9 +160,8 @@ async def test_overlapping_entity_and_device_targets_do_not_repeat_panel_operati
     kitchen.async_repair = AsyncMock()
     registry = er.async_get(hass)
     entity_id = registry.async_get_entity_id("binary_sensor", DOMAIN, "SHA256:office_bridge_health")
-    device = dr.async_get(hass).async_get_device(identifiers={("mqtt", "brilliant_panel_office")})
+    device = panel_device(hass, "office", entry.entry_id)
     assert entity_id is not None
-    assert device is not None
 
     await hass.services.async_call(
         DOMAIN,
@@ -162,6 +173,194 @@ async def test_overlapping_entity_and_device_targets_do_not_repeat_panel_operati
     office.async_repair.assert_awaited_once_with(trigger="service")
     kitchen.async_repair.assert_not_awaited()
     assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+def _mqtt_discovery_devices(hass: HomeAssistant) -> dict[str, dr.DeviceEntry]:
+    """Register the panels' MQTT-discovery devices, as the on-panel agents do.
+
+    Registered after the fleet set up: on HA <= 2026.9 they merge into the shared
+    panel devices, on 2026.10+ each is a separate twin owned by the MQTT entry only.
+    """
+    mqtt_entry = hass.config_entries.async_entries("mqtt")[0]
+    registry = dr.async_get(hass)
+    return {
+        slug: registry.async_get_or_create(
+            config_entry_id=mqtt_entry.entry_id,
+            identifiers={panel_device_identifier(slug)},
+            name=panel_device_name(slug),
+        )
+        for slug in ("office", "kitchen")
+    }
+
+
+@pytest.mark.parametrize(
+    ("service_name", "method_name", "data"),
+    [
+        ("repair", "async_repair", {}),
+        ("redeploy", "async_update_agent", {}),
+        ("reboot", "async_reboot", {"collect_diagnostics": False}),
+    ],
+)
+@pytest.mark.allow_lingering_timers
+async def test_service_mqtt_discovery_device_target_operates_on_only_its_panel(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    fake_shell: FakeShell,
+    payload_dir: Path,
+    caplog: pytest.LogCaptureFixture,
+    service_name: str,
+    method_name: str,
+    data: dict[str, object],
+) -> None:
+    """The device a user picks in the UI may be the MQTT-discovery record.
+
+    On HA 2026.10+ that record is owned by the MQTT entry alone (the management
+    entities live on its linked twin), so the panel must be resolved from the
+    shared panel identifier rather than from config-entry ownership.
+    """
+    entry = await _setup_fleet_entry(hass)
+    discovery = _mqtt_discovery_devices(hass)
+    operations: dict[str, AsyncMock] = {}
+    for panel_id, manager in entry.runtime_data.panels.items():
+        operations[panel_id] = AsyncMock()
+        setattr(manager, method_name, operations[panel_id])
+
+    await hass.services.async_call(
+        DOMAIN,
+        service_name,
+        {"device_id": discovery["office"].id, **data},
+        blocking=True,
+    )
+
+    operations["panel-office"].assert_awaited_once()
+    operations["panel-kitchen"].assert_not_awaited()
+    assert "deprecated" not in caplog.text
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.parametrize("service_name", ["canary_rollback", "canary_finalize"])
+@pytest.mark.allow_lingering_timers
+async def test_canary_targeting_both_panel_device_records_resolves_one_panel(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    fake_shell: FakeShell,
+    payload_dir: Path,
+    service_name: str,
+) -> None:
+    """Every record carrying a panel's identifier denotes that ONE panel.
+
+    Canary recovery demands exactly one targeted panel, so a twin pair (HA
+    2026.10+) or a repeated shared device (<= 2026.9) must not double-resolve.
+    """
+    entry = await _setup_fleet_entry(hass)
+    _mqtt_discovery_devices(hass)
+    office = entry.runtime_data.panels["panel-office"]
+    kitchen = entry.runtime_data.panels["panel-kitchen"]
+    office.async_canary_operation = AsyncMock()
+    kitchen.async_canary_operation = AsyncMock()
+    records = [device.id for device in panel_devices(hass, "office")]
+    assert len(records) == (2 if SINGLE_OWNER_DEVICES else 1)
+
+    await hass.services.async_call(
+        DOMAIN,
+        service_name,
+        {"device_id": [*records, *records], "name": "baseline-1"},
+        blocking=True,
+    )
+
+    office.async_canary_operation.assert_awaited_once_with(
+        service_name.removeprefix("canary_"), "baseline-1"
+    )
+    kitchen.async_canary_operation.assert_not_awaited()
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_service_area_of_the_mqtt_discovery_device_selects_its_panel(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    fake_shell: FakeShell,
+    payload_dir: Path,
+) -> None:
+    """An area assigned to the discovery device (the record users edit) reaches the panel."""
+    entry = await _setup_fleet_entry(hass)
+    discovery = _mqtt_discovery_devices(hass)
+    area = ar.async_get(hass).async_get_or_create("Office")
+    dr.async_get(hass).async_update_device(discovery["office"].id, area_id=area.id)
+    office = entry.runtime_data.panels["panel-office"]
+    kitchen = entry.runtime_data.panels["panel-kitchen"]
+    office.async_repair = AsyncMock()
+    kitchen.async_repair = AsyncMock()
+
+    await hass.services.async_call(DOMAIN, "repair", {"area_id": area.id}, blocking=True)
+
+    office.async_repair.assert_awaited_once_with(trigger="service")
+    kitchen.async_repair.assert_not_awaited()
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.skipif(not SINGLE_OWNER_DEVICES, reason="single-owner devices are HA 2026.10+")
+@pytest.mark.allow_lingering_timers
+async def test_production_split_twins_and_composite_id_resolve_to_one_panel(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    fake_shell: FakeShell,
+    payload_dir: Path,
+    hass_storage: dict[str, Any],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The production registry after HA's 2026.10 split and the fleet migration.
+
+    A real HA 2026.6 disk (shared devices) is split by HA into per-panel twins,
+    then consolidated into one fleet entry. Each twin, the pair, and the
+    pre-split composite device id (still stored in old automations) must all
+    reboot exactly that panel - once - with no registry deprecation report.
+    """
+    del mqtt_mock, fake_shell, payload_dir
+    mqtt_id = hass.config_entries.async_entries("mqtt")[0].entry_id
+    fixture = Path(__file__).with_name("fixtures") / "legacy_fleet_ha_2026_6_disk.json"
+    raw = await hass.async_add_executor_job(fixture.read_text)
+    disk = {**copy.deepcopy(hass_storage), **json.loads(raw.replace("MQTT_ENTRY_ID", mqtt_id))}
+    composite_ids = {
+        device["identifiers"][0][1].removeprefix("brilliant_panel_"): device["id"]
+        for device in disk["core.device_registry"]["data"]["devices"]
+        if len(device["config_entries"]) > 1
+    }
+    assert set(composite_ids) == set(MIGRATION_PANELS.values())
+    await _restart_from_disk(hass, hass_storage, disk)
+    assert (await _run_migration(hass, dry_run=False))["status"] == "migrated"
+    await hass.async_block_till_done()
+    (fleet,) = hass.config_entries.async_entries(DOMAIN)
+    managers = {manager.panel: manager for manager in fleet.runtime_data.panels.values()}
+    assert set(managers) == set(composite_ids)
+
+    for slug, composite_id in composite_ids.items():
+        twins = panel_devices(hass, slug)
+        assert {next(iter(device_links(device))) for device in twins} == {fleet.entry_id, mqtt_id}
+        mqtt_twin = panel_device(hass, slug, mqtt_id)
+        management = panel_device(hass, slug, fleet.entry_id)
+        targets: list[str | list[str]] = [
+            mqtt_twin.id,
+            management.id,
+            [mqtt_twin.id, management.id],
+            composite_id,
+        ]
+        for target in targets:
+            caplog.clear()
+            with patch(
+                "custom_components.brilliant_mqtt.PanelManager.async_reboot", autospec=True
+            ) as reboot:
+                await hass.services.async_call(
+                    DOMAIN,
+                    "reboot",
+                    {"device_id": target, "collect_diagnostics": False},
+                    blocking=True,
+                )
+            assert [call.args[0] for call in reboot.await_args_list] == [managers[slug]], target
+            assert "deprecated" not in caplog.text
+
+    for entry in hass.config_entries.async_entries(DOMAIN):
+        assert await hass.config_entries.async_unload(entry.entry_id)
 
 
 @pytest.mark.parametrize("target_kind", ["entity", "device", "area"])
@@ -354,8 +553,7 @@ async def test_repair_and_uninstall_services(
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
 
-    device = dr.async_get(hass).async_get_device(identifiers={("mqtt", "brilliant_panel_office")})
-    assert device is not None
+    device = panel_device(hass, "office", entry.entry_id)
 
     await hass.services.async_call(DOMAIN, "repair", {"device_id": device.id}, blocking=True)
     assert "systemctl enable --now brilliant-mqtt" in fake_shell.commands
@@ -438,10 +636,8 @@ async def test_uninstall_aggregates_multi_target_failures(
     assert await hass.config_entries.async_setup(kitchen.entry_id)
     await hass.async_block_till_done()
 
-    registry = dr.async_get(hass)
-    office_device = registry.async_get_device(identifiers={("mqtt", "brilliant_panel_office")})
-    kitchen_device = registry.async_get_device(identifiers={("mqtt", "brilliant_panel_kitchen")})
-    assert office_device is not None and kitchen_device is not None
+    office_device = panel_device(hass, "office", office.entry_id)
+    kitchen_device = panel_device(hass, "kitchen", kitchen.entry_id)
 
     # BOTH targets fail: a naive loop attempts only whichever the set yields first,
     # leaving the other's mock un-awaited — order-independently red against the bug.
@@ -586,8 +782,7 @@ async def test_reboot_service_reaches_manager_with_options(
     await hass.async_block_till_done()
     assert hass.services.has_service(DOMAIN, "reboot")
 
-    device = dr.async_get(hass).async_get_device(identifiers={("mqtt", "brilliant_panel_office")})
-    assert device is not None
+    device = panel_device(hass, "office", entry.entry_id)
     with patch(
         "custom_components.brilliant_mqtt.PanelManager.async_reboot", autospec=True
     ) as reboot:
@@ -616,8 +811,7 @@ async def test_reboot_service_rejects_out_of_range_journal_lines(
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
 
-    device = dr.async_get(hass).async_get_device(identifiers={("mqtt", "brilliant_panel_office")})
-    assert device is not None
+    device = panel_device(hass, "office", entry.entry_id)
     with pytest.raises(vol.Invalid):
         await hass.services.async_call(
             DOMAIN,
@@ -657,13 +851,17 @@ def test_scene_service_descriptions_and_translations_are_complete() -> None:
         (root / "custom_components/brilliant_mqtt/translations/en.json").read_text()
     )
 
+    definitions = load_yaml_dict(str(root / "custom_components/brilliant_mqtt/services.yaml"))
     for service, field in (("run_scene", "scene_id"), ("set_mode", "mode_id")):
         assert f"{service}:" in services
         assert "panel:" in services
         assert f"{field}:" in services
+        # Targetable like the panel-management services (resolved to ONE panel).
+        assert definitions[service]["target"] == {"entity": {"integration": DOMAIN}}
         for document in (strings, translations):
             assert document["services"][service]["name"]
-            assert document["services"][service]["fields"]["panel"]["description"]
+            panel_copy = document["services"][service]["fields"]["panel"]["description"]
+            assert "target" in panel_copy
             assert document["services"][service]["fields"][field]["description"]
 
     for document in (strings, translations):

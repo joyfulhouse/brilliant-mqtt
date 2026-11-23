@@ -94,6 +94,35 @@ async def async_ownerless_recovery_candidate(
     return retained
 
 
+async def async_ownerless_unactivated_candidate(
+    hass: HomeAssistant, host: str, identity: HostIdentity
+) -> RetainedRollback | None:
+    """Select an armed pre-activation baseline that never gained an execution journal."""
+    from ..fleet_manager import _async_retained_owner_exists
+
+    journal = ProvisioningJournal(hass)
+    matches = [
+        item
+        for item in await journal.async_retained_records()
+        if item.record.panel_request.host == host
+        or item.record.panel_request.fingerprint == identity.fingerprint
+        or item.record.panel_request.public_key == identity.public_key
+    ]
+    if not matches:
+        return None
+    if len(matches) != 1:
+        raise PanelProvisioningError("ownerless_recovery_unavailable")
+    retained = matches[0]
+    request = retained.record.panel_request
+    if request.public_key != identity.public_key or request.fingerprint != identity.fingerprint:
+        raise PanelProvisioningError("panel_identity_mismatch")
+    if not retained.ownerless_unactivated_discard_allowed:
+        return None
+    if await journal.async_load() is not None or await _async_retained_owner_exists(hass, retained):
+        raise PanelProvisioningError("ownerless_recovery_unavailable")
+    return retained
+
+
 async def async_ownerless_journal_candidate(
     hass: HomeAssistant, host: str, identity: HostIdentity
 ) -> ProvisioningRecord | None:

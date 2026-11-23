@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from collections.abc import Coroutine, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Coroutine, Iterable, Mapping
 from dataclasses import dataclass
 from functools import partial
 from types import MappingProxyType
@@ -71,6 +71,7 @@ from .entry_data import (
     _panel_agent_cadences,
 )
 from .manager import PanelManager, async_delete_panel_issues
+from .migration import planned_subentry_id
 from .panel_health import PanelHealthObserver
 from .panel_inspection import async_inspect_panel
 from .panel_provisioner import (
@@ -275,9 +276,17 @@ def _matches_record_identity(
     *,
     managed_update: bool = False,
 ) -> bool:
-    """Match every journaled panel owner field without exposing credential values."""
+    """Match every journaled panel owner field without exposing credential values.
+
+    A freshly onboarded panel's management ID is its fingerprint, so an install
+    handoff requires that exact value. A managed update may also target a panel
+    consolidated from a legacy entry, whose management ID stays that entry ID (so
+    entity unique IDs never change); it is accepted only when the subentry ID is
+    exactly the one the migration derived from that management ID.
+    """
     request = record.panel_request
     data = subentry.data
+    management_id = data.get(CONF_MANAGEMENT_ID)
     return (
         subentry.unique_id == request.fingerprint
         and data.get(CONF_IDENTITY_FINGERPRINT) == request.fingerprint
@@ -286,7 +295,14 @@ def _matches_record_identity(
         and data.get(CONF_SSH_USERNAME) == request.ssh_username
         and data.get(CONF_ROOT_PASSWORD) == request.root_password
         and data.get(CONF_PANEL) == request.slug
-        and data.get(CONF_MANAGEMENT_ID) == request.fingerprint
+        and (
+            management_id == request.fingerprint
+            or (
+                managed_update
+                and isinstance(management_id, str)
+                and subentry.subentry_id == planned_subentry_id(management_id)
+            )
+        )
         and (_managed_components(data) if managed_update else _enabled_components(data))
         == frozenset(request.selected_components)
     )
@@ -408,6 +424,15 @@ def _owned_subentry(
             raise EntryDataError("provisioning_ownership_mismatch")
         return identity_matches[0]
     return None
+
+
+def _committed_owner_matches(entry: ConfigEntry[Any], candidate: ConfigSubentry | None) -> bool:
+    """Committed cleanup requires the normalized, exact config subentry owner."""
+    return (
+        candidate is not None
+        and candidate.data.get(CONF_PROVISIONING_TRANSACTION_ID) is None
+        and entry.data.get(CONF_SCENE_PANEL) in entry.subentries
+    )
 
 
 class ConfigEntryPersistenceError(RuntimeError):
@@ -665,9 +690,59 @@ async def _async_retained_owner_exists(hass: HomeAssistant, retained: RetainedRo
     return False
 
 
+async def _async_authorize_recorded_recovery(
+    hass: HomeAssistant,
+    record: ProvisioningRecord,
+    *,
+    expected_entry: ConfigEntry[Any] | None = None,
+) -> None:
+    """Prove current operation authority before using recorded panel credentials."""
+    try:
+        if record.operation is ProvisioningOperation.UPDATE:
+            owner, _panel_id = _managed_update_owner(hass, record)
+            if expected_entry is not None and owner is not expected_entry:
+                raise EntryDataError("provisioning_ownership_mismatch")
+        elif record.operation in {ProvisioningOperation.INSTALL, ProvisioningOperation.UPGRADE}:
+            entries = hass.config_entries.async_entries(DOMAIN)
+            if len(entries) != 1:
+                raise EntryDataError("provisioning_ownership_mismatch")
+            owner = entries[0]
+            if (
+                expected_entry is not None and owner is not expected_entry
+            ) or not _is_exact_fleet_envelope_owner(owner, record):
+                raise EntryDataError("provisioning_ownership_mismatch")
+            candidate = _owned_subentry(owner, record)
+            if record.phase is ProvisioningPhase.COMMITTED and not _committed_owner_matches(
+                owner, candidate
+            ):
+                raise EntryDataError("provisioning_ownership_mismatch")
+            if candidate is not None and record.phase not in {
+                ProvisioningPhase.PENDING_CONFIG_COMMIT,
+                ProvisioningPhase.COMMITTED,
+            }:
+                raise EntryDataError("provisioning_ownership_mismatch")
+        elif record.operation is ProvisioningOperation.ROLLBACK:
+            password = await _async_rollback_credential(hass, record.panel_request)
+            if password is None or password != record.panel_request.root_password:
+                raise PanelProvisioningError("rollback_credentials_unavailable")
+        elif record.operation is ProvisioningOperation.ONBOARDING_ROLLBACK:
+            try:
+                retained = await ProvisioningJournal(hass).async_retained(record.transaction_id)
+            except Exception:
+                raise PanelProvisioningError("rollback_credentials_unavailable") from None
+            if retained is None or retained.compensation_password(record) is None:
+                raise PanelProvisioningError("rollback_credentials_unavailable")
+        else:
+            raise EntryDataError("provisioning_ownership_mismatch")
+    except EntryDataError:
+        raise PanelProvisioningError("provisioning_recovery_required") from None
+
+
 def _build_panel_provisioner(
     hass: HomeAssistant,
     identity_fetcher: Any,
+    *,
+    recovery_authorizer: Callable[[ProvisioningRecord], Awaitable[None]] | None = None,
 ) -> PanelProvisioner:
     """Wire one provisioner to HA-wide locks and production adapters."""
     validator = BrokerValidator(
@@ -690,6 +765,8 @@ def _build_panel_provisioner(
         broker_validator=validator,
         health_observer_factory=partial(PanelHealthObserver, hass),
         credential_resolver=partial(_async_rollback_credential, hass),
+        recovery_authorizer=recovery_authorizer
+        or partial(_async_authorize_recorded_recovery, hass),
         retained_owner_exists=partial(_async_retained_owner_exists, hass),
         transaction_lookup=partial(_async_transaction_lookup, hass),
         repair_reporter=_ProvisioningRepairReporter(hass),
@@ -710,14 +787,63 @@ def get_panel_provisioner(
     )
 
 
-def _get_recovery_provisioner(hass: HomeAssistant) -> PanelProvisioner:
+async def _async_authorize_removed_recovery(
+    hass: HomeAssistant,
+    removed_entry: ConfigEntry[Any],
+    expected: ProvisioningRecord,
+    current: ProvisioningRecord,
+) -> None:
+    """Limit a removal hook's authority to its exact journal and retired owner."""
+    if (
+        current != expected
+        or hass.config_entries.async_get_entry(removed_entry.entry_id) is not None
+        or hass.config_entries.async_entries(DOMAIN)
+    ):
+        raise PanelProvisioningError("provisioning_recovery_required")
+    if current.operation not in {ProvisioningOperation.INSTALL, ProvisioningOperation.UPGRADE}:
+        await _async_authorize_recorded_recovery(hass, current)
+        return
+    try:
+        candidate = _owned_subentry(removed_entry, current)
+        if (
+            not _is_exact_fleet_envelope_owner(removed_entry, current)
+            or current.phase is ProvisioningPhase.COMMITTED
+            and not _committed_owner_matches(removed_entry, candidate)
+            or candidate is not None
+            and current.phase
+            not in {
+                ProvisioningPhase.PENDING_CONFIG_COMMIT,
+                ProvisioningPhase.COMMITTED,
+            }
+        ):
+            raise EntryDataError("provisioning_ownership_mismatch")
+    except EntryDataError:
+        raise PanelProvisioningError("provisioning_recovery_required") from None
+
+
+def _get_recovery_provisioner(
+    hass: HomeAssistant,
+    *,
+    removed_entry: ConfigEntry[Any] | None = None,
+    expected_record: ProvisioningRecord | None = None,
+) -> PanelProvisioner:
     """Build recovery-only orchestration; fresh installation stays unavailable."""
 
     async def recovery_only_identity_fetcher(host: str) -> HostIdentity:
         del host
         raise RuntimeError("recovery_only_provisioner")
 
-    return _build_panel_provisioner(hass, recovery_only_identity_fetcher)
+    if removed_entry is None and expected_record is None:
+        return _build_panel_provisioner(hass, recovery_only_identity_fetcher)
+    if removed_entry is None or expected_record is None:
+        raise ValueError("removed_recovery_authority_incomplete")
+    return _build_panel_provisioner(
+        hass,
+        recovery_only_identity_fetcher,
+        recovery_authorizer=partial(
+            _async_authorize_removed_recovery, hass, removed_entry, expected_record
+        ),
+    )
 
 
 @callback
@@ -842,7 +968,12 @@ async def _async_recover_removed_entry(
             )
             return
         _async_abort_owned_panel_flows(hass, entry, record.transaction_id)
-        await _get_recovery_provisioner(hass).async_recover()
+        await _get_recovery_provisioner(
+            hass, removed_entry=entry, expected_record=record
+        ).async_recover(expected_record=record)
+        remaining = await journal.async_load()
+        if remaining is not None and remaining.transaction_id == record.transaction_id:
+            return
         ir.async_delete_issue(
             hass,
             DOMAIN,
@@ -1011,9 +1142,18 @@ async def _async_settle_cleanup(operation: Coroutine[Any, Any, None]) -> None:
 class FleetManager:
     """Own all panel managers below one fleet or one legacy compatibility entry."""
 
-    def __init__(self, hass: HomeAssistant, entry: ConfigEntry[Any]) -> None:
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        entry: ConfigEntry[Any],
+        *,
+        defer_setup_panel_contact: bool = False,
+    ) -> None:
         self.hass = hass
         self.entry = entry
+        # One-shot: a migration-restoration setup must not SSH any panel (the
+        # legacy HA-mirror retirement audit runs again on the next ordinary setup).
+        self._defer_setup_panel_contact = defer_setup_panel_contact
         self._ssh_lock = _shared_ssh_lock(hass)
         self._lifecycle_lock = asyncio.Lock()
         self._panels: dict[str, PanelManager] = {}
@@ -1037,6 +1177,11 @@ class FleetManager:
     def panels(self) -> Mapping[str, PanelManager]:
         """Return a live, read-only view keyed by subentry or legacy entry ID."""
         return self._panels_view
+
+    @property
+    def runtime_owned_panel_ids(self) -> frozenset[str]:
+        """Return panels whose runtime started successfully and is owned here."""
+        return frozenset(self._runtime_owned_panel_ids)
 
     @property
     def fleet(self) -> FleetConfig:
@@ -1135,7 +1280,10 @@ class FleetManager:
         """Settle one orphan journal without holding healthy panel runtime offline."""
         reporter = _ProvisioningRepairReporter(self.hass)
         try:
-            await _get_recovery_provisioner(self.hass).async_recover()
+            await _get_recovery_provisioner(self.hass).async_recover(
+                expected_record=record,
+                authorize=self._async_authorize_background_recovery,
+            )
             remaining = await ProvisioningJournal(self.hass).async_load()
         except asyncio.CancelledError:
             raise
@@ -1169,6 +1317,10 @@ class FleetManager:
             _provisioning_repair_issue_id(record.transaction_id),
         )
         self._async_schedule_reload_once()
+
+    async def _async_authorize_background_recovery(self, record: ProvisioningRecord) -> None:
+        """Repeat mutable config ownership checks while recovery holds the operation lock."""
+        await _async_authorize_recorded_recovery(self.hass, record, expected_entry=self.entry)
 
     def _async_schedule_background_recovery(
         self,
@@ -1207,7 +1359,11 @@ class FleetManager:
                         raise EntryDataError("rollback_credentials_unavailable")
                     await journal.async_begin_restore(retained.record.transaction_id, password)
                     record = await journal.async_load()
-                elif retained.state == "finalizing":
+                elif (
+                    retained.state == "finalizing"
+                    and retained.finalization_origin is None
+                    and record is None
+                ):
                     self._async_schedule_background_recovery(retained.record)
         except asyncio.CancelledError:
             raise
@@ -1272,10 +1428,7 @@ class FleetManager:
                 )
                 raise EntryDataError("provisioning_ownership_mismatch")
             if record.phase is ProvisioningPhase.COMMITTED:
-                if (
-                    candidate.data.get(CONF_PROVISIONING_TRANSACTION_ID) is not None
-                    or self.entry.data.get(CONF_SCENE_PANEL) != candidate.subentry_id
-                ):
+                if not _committed_owner_matches(self.entry, candidate):
                     await _ProvisioningRepairReporter(self.hass).async_report_rollback_failure(
                         record.transaction_id,
                         original_code="restart_recovery",
@@ -1654,6 +1807,10 @@ class FleetManager:
                 if config is not None
             }
             self._panels.update(managers)
+            if self._defer_setup_panel_contact:
+                for manager in managers.values():
+                    manager.defer_setup_panel_contact = True
+                self._defer_setup_panel_contact = False
             try:
                 successful_starts = 0
                 for panel_id, manager in managers.items():
