@@ -15,6 +15,7 @@ from homeassistant.const import CONF_NAME
 from homeassistant.core import HomeAssistant
 
 from .broker import BrokerProfile
+from .certificates import canonical_hue_ca_certificate, is_hue_ca_certificate
 from .const import (
     CONF_BROKER_KIND,
     CONF_COMPONENTS,
@@ -25,6 +26,7 @@ from .const import (
     CONF_HA_CONTROL_LABEL,
     CONF_HOST,
     CONF_HOT_POLL_SECONDS,
+    CONF_HUE_CA_CERT,
     CONF_IDENTITY_FINGERPRINT,
     CONF_MANAGEMENT_ID,
     CONF_MAX_MIRRORED_ENTITIES,
@@ -74,6 +76,7 @@ _FLEET_KEYS = frozenset(
         CONF_MQTT_PASSWORD,
         CONF_MQTT_TLS_ENABLED,
         CONF_MQTT_TLS_CA,
+        CONF_HUE_CA_CERT,
         CONF_NEXT_MESH_PRIORITY,
         CONF_HA_CONTROL_ENABLED,
         CONF_HA_CONTROL_LABEL,
@@ -85,7 +88,7 @@ _FLEET_KEYS = frozenset(
         CONF_SCHEMA_VERSION,
     }
 )
-_FLEET_REQUIRED_KEYS = _FLEET_KEYS - {CONF_MQTT_TLS_CA}
+_FLEET_REQUIRED_KEYS = _FLEET_KEYS - {CONF_MQTT_TLS_CA, CONF_HUE_CA_CERT}
 _PANEL_KEYS = frozenset(
     {
         CONF_IDENTITY_FINGERPRINT,
@@ -242,6 +245,31 @@ def _resilience_values(
     return auto_repair, offline_grace_minutes, repair_cooldown_minutes
 
 
+def _optional_fleet_hue_ca(data: Mapping[str, Any]) -> str:
+    """Parse the optional fleet Hue CA default: absent, or one public certificate."""
+    if CONF_HUE_CA_CERT not in data:
+        return ""
+    value = data[CONF_HUE_CA_CERT]
+    if not isinstance(value, str) or not is_hue_ca_certificate(value):
+        raise _invalid("invalid_fleet_entry_data")
+    return value
+
+
+def effective_hue_ca_cert(overrides: Mapping[str, Any], fleet_default: str) -> str:
+    """Resolve one panel's diyHue CA: its non-blank override, else the fleet default.
+
+    Panels added through the fleet Add-panel flow start with no overrides, so they
+    inherit the fleet default; an explicit per-panel certificate still wins. A blank
+    override (the Overrides form stores "" when the field is cleared) means "not
+    set" and inherits too. Returns "" when neither is configured. A valid result is
+    returned in canonical PEM form (what is persisted and deployed), so guards that
+    compare effective CAs ignore line-ending/wrapping differences.
+    """
+    override = overrides.get(CONF_HUE_CA_CERT)
+    chosen = override if isinstance(override, str) and override.strip() else fleet_default
+    return canonical_hue_ca_certificate(chosen) or chosen
+
+
 @dataclass(frozen=True, slots=True)
 class FleetConfig:
     """Immutable fleet-owned settings parsed from one version-4 config entry."""
@@ -260,6 +288,9 @@ class FleetConfig:
     auto_repair: bool = DEFAULT_AUTO_REPAIR
     offline_grace_minutes: int = DEFAULT_OFFLINE_GRACE_MINUTES
     repair_cooldown_minutes: int = DEFAULT_REPAIR_COOLDOWN_MINUTES
+    # Fleet-wide diyHue CA (public PEM) inherited by panels without an explicit
+    # per-panel override; "" when unset. Kept out of repr like panel overrides.
+    hue_ca_cert: str = field(default="", repr=False)
 
     @classmethod
     def from_entry(cls, entry: ConfigEntry[Any]) -> FleetConfig:
@@ -309,6 +340,7 @@ class FleetConfig:
                 auto_repair=auto_repair,
                 offline_grace_minutes=offline_grace_minutes,
                 repair_cooldown_minutes=repair_cooldown_minutes,
+                hue_ca_cert=_optional_fleet_hue_ca(data),
             )
         except EntryDataError:
             raise

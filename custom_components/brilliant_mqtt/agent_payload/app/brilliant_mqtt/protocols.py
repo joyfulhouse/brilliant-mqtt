@@ -10,10 +10,11 @@ No panel imports, no MQTT library imports: pure stdlib + project types.
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from typing import Protocol
+from dataclasses import dataclass
+from typing import Any, Protocol
 
 from brilliant_mqtt.commands import VarSet
-from brilliant_mqtt.model import BrilliantDevice
+from brilliant_mqtt.model import BrilliantDevice, CaptureProvenance
 from brilliant_mqtt.write_admission import AdmissionTicket, WriteClass, WriteResult
 
 
@@ -27,6 +28,16 @@ class BusClient(Protocol):
     @property
     def capture_generation(self) -> int:
         """Current source generation, advanced before reconnect callbacks or reads."""
+        ...
+
+    @property
+    def capture_sequence(self) -> int:
+        """Latest source boundary, including captures still awaiting delivery."""
+        ...
+
+    @property
+    def privacy_revocation(self) -> CaptureProvenance | None:
+        """Own-panel denial captured synchronously, before asynchronous delivery."""
         ...
 
     async def start(self) -> None:
@@ -190,4 +201,31 @@ class MqttSessionSignals(Protocol):
 
         Never fired for a disconnect this adapter initiated itself.
         """
+        ...
+
+
+@dataclass(frozen=True)
+class VirtualPeripheralSpec:
+    """Specification for a local virtual peripheral hosted on the panel bus."""
+
+    peripheral_id: str
+    display_name: str
+    peripheral_type: int
+    initial_variables: dict[str, Any]
+    settable_variables: frozenset[str]
+
+
+class VirtualPeripheralHostProtocol(Protocol):
+    """Protocol for hosting a local virtual peripheral on the panel's Thrift bus."""
+
+    async def start(self) -> None:
+        """Register and start hosting the virtual peripheral on the local bus."""
+        ...
+
+    async def set_variable(self, name: str, value: Any) -> None:
+        """Update a variable on the hosted peripheral without firing command callbacks."""
+        ...
+
+    async def shutdown(self) -> None:
+        """Delete and stop hosting the virtual peripheral cleanly."""
         ...

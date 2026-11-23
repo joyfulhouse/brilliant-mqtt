@@ -73,6 +73,14 @@ class FakeBus:
     def capture_generation(self) -> int:
         return self._capture_generation
 
+    @property
+    def capture_sequence(self) -> int:
+        return self._capture_sequence
+
+    @property
+    def privacy_revocation(self) -> CaptureProvenance | None:
+        return None
+
     async def start(self) -> None:
         pass
 
@@ -106,9 +114,12 @@ class FakeBus:
         return CaptureProvenance(self._capture_generation, self._capture_sequence, eras)
 
     def _captured(self, device: BrilliantDevice, *, complete: bool) -> BrilliantDevice:
+        if device.kind is DeviceKind.HARDWARE and device.capture_provenance is not None:
+            return device
         if device.device_id == "ble_mesh" or device.kind not in (
             DeviceKind.LIGHT,
             DeviceKind.SWITCH,
+            DeviceKind.HARDWARE,
         ):
             return device
         captured = replace(

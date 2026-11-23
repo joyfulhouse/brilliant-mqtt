@@ -46,6 +46,12 @@ HomeKit without breaking them. It survives panel firmware updates.
 
 ## Features
 
+Panel camera snapshots and TV Ambilight are opt-in: set `AMBILIGHT_ENABLED=1`
+in the agent environment. Capture requires the panel's privacy toggle to be
+positively off. `AMBILIGHT_INTERVAL_S` defaults to `1.0` seconds and accepts
+finite values from `0.25` to `10` seconds. Setting `AMBILIGHT_ENABLED=0`
+retires the feature's previously owned MQTT discovery and retained state.
+
 | Area | What you get |
 |---|---|
 | Lighting & switches | Panel loads and BLE-mesh loads as HA lights/switches, with brightness |
