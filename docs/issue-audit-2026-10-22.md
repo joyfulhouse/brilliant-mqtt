@@ -45,7 +45,7 @@ rollback failure in #214 remains open as described below.
 
 | Issue | Completion requirement |
 | --- | --- |
-| #113 | A poison-frame quarantine changes QoS-1 replay, durability, and capacity policy. Define an explicit retained/quarantine contract before changing delivery; current payloads have no demonstrated permanent broker rejection. |
+| #113 | Implemented to the written [outbox quarantine contract](issue-113-outbox-quarantine-contract.md). Attribution comes only from observed broker disconnects. A sidecar quarantine halts the outbox, its counters are persisted, status reports `outbox_quarantine` or `outbox_blocked`, and an audited on-panel CLI releases or discards the record. The deployed broker defaults cannot produce the wedge. Live qualification needs a broker with an operator `max_packet_size`. |
 | #142 | Conservative same-value mode confirmation is an accepted limitation pending request-relative evidence. Do not infer execution from a stale mirror. |
 | #143 | The [sampled lease-revocation follow-up](issue-143-lease-revocation.md) fences independently observed releases for the same writer generation. Unsampled death and watchdog restart remain ambiguous; marker write failure alone still cannot prove revocation. |
 | #153 | The event-reflection proposal is delivered, but upstream implementation and qualification remain. The issue expressly requires more than a documentation merge. |

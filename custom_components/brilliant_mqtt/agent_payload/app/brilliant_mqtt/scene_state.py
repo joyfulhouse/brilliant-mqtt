@@ -198,8 +198,8 @@ def state_payload(state: SceneState) -> dict[str, object]:
     }
 
 
-def load_state(path: Path) -> LoadedSceneState:
-    """Read at most ``MAX_STATE_BYTES`` and validate the snapshot as one unit."""
+def load_state(path: Path, *, normalize_permissions: bool = True) -> LoadedSceneState:
+    """Read and validate a bounded snapshot; optionally skip permission writes."""
     descriptor = -1
     try:
         descriptor = os.open(path, os.O_RDONLY)
@@ -212,7 +212,8 @@ def load_state(path: Path) -> LoadedSceneState:
                 raise StateValidationError("state file exceeds byte limit")
         raw = json.loads(content.decode("utf-8"))
         state = _parse_state(raw)
-        _normalize_permissions(path)
+        if normalize_permissions:
+            _normalize_permissions(path)
     except FileNotFoundError:
         return LoadedSceneState(SceneState(), True, None)
     except (OSError, UnicodeError, json.JSONDecodeError, StateValidationError, ValueError):
@@ -229,7 +230,15 @@ def atomic_write_state(path: Path, state: SceneState) -> None:
     encoded = encode_json(state_payload(validated)).encode("utf-8")
     if len(encoded) > MAX_STATE_BYTES:
         raise OSError("state snapshot exceeds byte limit")
+    atomic_write_private_file(path, encoded)
 
+
+def atomic_write_private_file(path: Path, encoded: bytes) -> None:
+    """Durably replace one 0600 file in a 0700 directory (tmp, fsync, rename).
+
+    Shared by the scene state file and its outbox quarantine sidecar (#113) so
+    both follow the identical crash-safe replacement protocol.
+    """
     descriptor = -1
     temporary = ""
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
