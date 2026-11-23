@@ -137,6 +137,7 @@ PROVISIONING_ERROR_CODES = frozenset(
         "activation_failed",
         "cleanup_failed",
         "connection_lost",
+        "mutation_outcome_unknown",
         "recovery_interrupted",
         "baseline_capture_interrupted",
         "commit_failed",
@@ -199,6 +200,8 @@ _DIAGNOSTIC_RECOVERY_CODES = frozenset({"recovery_interrupted", "flow_aborted"})
 _ERROR_KEYS = frozenset({"stage", "code"})
 _JOURNAL_ERROR_CODES = frozenset(
     {
+        "mutation_outcome_unknown",
+        "provisioning_recovery_required",
         "invalid_provisioning_journal",
         "invalid_journal_transition",
         "journal_load_failed",
@@ -211,6 +214,12 @@ _JOURNAL_ERROR_CODES = frozenset(
         "subentry_creation_not_proven",
     }
 )
+
+
+def _require_settled_mutation(record: ProvisioningRecord | None) -> None:
+    if record is not None and record.last_error is not None:
+        if record.last_error.code == "mutation_outcome_unknown":
+            raise ProvisioningJournalError("mutation_outcome_unknown")
 
 
 class ProvisioningJournalError(ValueError):
@@ -1512,6 +1521,7 @@ class ProvisioningJournal:
             if retained is None or retained.state != "restore_requested":
                 raise ProvisioningJournalError("invalid_journal_transition")
             await self._async_reload()
+            _require_settled_mutation(self._coordinator.record)
             if (
                 self._coordinator.record is not None
                 and self._coordinator.record.transaction_id != transaction_id
@@ -1557,6 +1567,7 @@ class ProvisioningJournal:
             raise _invalid()
         async with self._coordinator.lock:
             record = await self._async_current(transaction_id)
+            _require_settled_mutation(record)
             if phase not in _TRANSITIONS[record.phase]:
                 raise ProvisioningJournalError("invalid_journal_transition")
             updated = replace(record, phase=phase, last_error=last_error)
@@ -1573,7 +1584,57 @@ class ProvisioningJournal:
             raise _invalid()
         async with self._coordinator.lock:
             record = await self._async_current(transaction_id)
+            if record.last_error != last_error:
+                _require_settled_mutation(record)
             updated = replace(record, last_error=last_error)
+            await self._async_save(updated)
+            return updated
+
+    async def async_finish_update_mutations(
+        self, expected: ProvisioningRecord
+    ) -> ProvisioningRecord:
+        """Only the live operation can clear its exact write-ahead mutation guard."""
+        async with self._coordinator.lock:
+            record = await self._async_current(expected.transaction_id)
+            if (
+                record != expected
+                or record.operation is not ProvisioningOperation.UPDATE
+                or record.phase is not ProvisioningPhase.ACTIVATION_PENDING
+                or record.last_error != StoredJournalError("recovery", "mutation_outcome_unknown")
+            ):
+                raise ProvisioningJournalError("provisioning_recovery_required")
+            updated = replace(record, last_error=None)
+            await self._async_save(updated)
+            return updated
+
+    async def async_start_restore_mutations(
+        self, expected: ProvisioningRecord
+    ) -> ProvisioningRecord:
+        """Guard the exact restore before any remote writer can be dispatched."""
+        async with self._coordinator.lock:
+            record = await self._async_current(expected.transaction_id)
+            _require_settled_mutation(record)
+            if record != expected or record.phase is not ProvisioningPhase.ROLLBACK_PENDING:
+                raise ProvisioningJournalError("provisioning_recovery_required")
+            updated = replace(
+                record, last_error=StoredJournalError("recovery", "mutation_outcome_unknown")
+            )
+            await self._async_save(updated)
+            return updated
+
+    async def async_finish_restore_mutations(
+        self, expected: ProvisioningRecord
+    ) -> ProvisioningRecord:
+        """Only the live restore with acknowledged results may retire its guard."""
+        async with self._coordinator.lock:
+            record = await self._async_current(expected.transaction_id)
+            if (
+                record != expected
+                or record.phase is not ProvisioningPhase.ROLLBACK_PENDING
+                or record.last_error != StoredJournalError("recovery", "mutation_outcome_unknown")
+            ):
+                raise ProvisioningJournalError("provisioning_recovery_required")
+            updated = replace(record, last_error=None)
             await self._async_save(updated)
             return updated
 

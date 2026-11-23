@@ -1146,7 +1146,10 @@ async def test_managed_update_restart_restores_without_a_staged_release(
         ):
             captured = await harness.journal.async_load()
     assert captured is not None
-    harness.journal.record = replace(captured, phase=phase)
+    # Restart from acknowledged mutation, rather than the guard captured mid-body.
+    acknowledged = harness.journal.acknowledged_update_record
+    assert acknowledged is not None and acknowledged.last_error is None
+    harness.journal.record = replace(acknowledged, phase=phase)
     provisioner._shell_factory = lambda _host, _password, _key: harness.shell
     harness.shell._pinned = request.public_key
     await provisioner.async_recover()
@@ -2450,7 +2453,8 @@ async def test_lost_session_after_a_completed_remote_capture_is_never_resumed(
     assert captures == 1
     assert manager.update_retry is None
     error = (raised.value.translation_placeholders or {})["error"]
-    assert "baseline_capture_interrupted" in error
+    assert "outcome unknown" in error
+    assert "externally" in error
     assert await journal.async_load() is None
     assert await journal.async_retained_records() == ()
     # The completed capture stays on the panel for the documented manual settle.

@@ -778,6 +778,7 @@ async def _provisioning_run(
             try:
                 result = await asyncio.shield(settlement)
             except BaseException:
+                shell.mark_mutation_unknown()
                 process.terminate()
                 closing = asyncio.create_task(shell.close())
                 while not closing.done():
@@ -787,8 +788,8 @@ async def _provisioning_run(
                         pass
                 if not closing.cancelled():
                     closing.exception()
-                # The shared operation lock must not be released while a remote
-                # restore could still write. Shell close bounds and fences exit.
+                # Drain local tasks before releasing their resources. This does
+                # not establish remote termination when the result is missing.
                 while not settlement.done():
                     try:
                         await asyncio.shield(settlement)
@@ -2112,6 +2113,9 @@ async def rollback_snapshot(
     except BaseException as error:
         failure = error
 
+    if failure is not None and (shell.transport_lost() or shell.mutation_outcome_unknown()):
+        # Cleanup can race the old restore just as another rollback can.
+        raise failure from None
     cleanup_succeeded = await _settled_cleanup_run(
         shell,
         _rollback_cleanup_command(staged),

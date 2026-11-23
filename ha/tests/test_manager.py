@@ -2452,13 +2452,12 @@ async def test_agent_uninstall_failure_redacts_every_outward_surface(
 async def test_shutdown_during_inflight_agent_update_leaks_no_timer(
     hass: HomeAssistant, payload_dir: Path
 ) -> None:
-    """C1 (success site) for async_update_agent: shutdown mid-update arms no timer.
+    """Shutdown settles an in-flight update without mutation or a leaked timer.
 
     NOT marked allow_lingering_timers: runs under the strict guard. The update is
-    wedged inside the gated connect(); async_shutdown latches _shutting_down while it
-    is held in the ssh_lock, then the resumed update runs the full SUCCESS path and
-    the _shutting_down guard (no await before the schedule) must suppress the recovery
-    timer. No mqtt_mock → the only timer that could linger is the manager's.
+    wedged inside the gated connect(); shutdown must cancel and join it before
+    returning. Releasing connect afterward cannot deploy or arm a recovery timer.
+    No mqtt_mock → the only timer that could linger is the manager's.
     """
     import asyncio
 
@@ -2477,12 +2476,17 @@ async def test_shutdown_during_inflight_agent_update_leaks_no_timer(
         assert manager._shutting_down is True
 
         gate.set()
-        await update
+        with pytest.raises(HomeAssistantError) as raised:
+            await update
+        assert raised.value.translation_key == "update_failed"
 
-    # Reached the success path (payload + configs written, service restarted) ...
-    _assert_payload_archive_uploaded(shell)
-    assert "systemctl restart brilliant-mqtt" in shell.commands
-    # ... but did NOT arm a recovery timer on the torn-down entry.
+    assert manager.update_last_error is not None
+    assert manager.update_last_error["code"] == "update_stopped"
+    assert not shell.uploads
+    assert "systemctl restart brilliant-mqtt" not in shell.commands
+    assert not shell.connected
+    assert not manager._ssh_lock.locked()
+    assert manager._update_task is None
     assert manager._recovery_cancel is None
     assert manager._grace_cancel is None
 

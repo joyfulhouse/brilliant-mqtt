@@ -11,7 +11,12 @@ import tarfile
 
 import asyncssh
 
-from custom_components.brilliant_mqtt.shell import PanelProcess, RunResult
+from custom_components.brilliant_mqtt.shell import (
+    MutationMonitor,
+    PanelProcess,
+    RunResult,
+    track_remote_result,
+)
 
 _OK = RunResult(0, "", "")
 
@@ -49,7 +54,7 @@ class FakePanelProcess:
         self._settled.set()
 
 
-class FakeShell:
+class FakeShell(MutationMonitor):
     """Satisfies the PanelShell Protocol. Unscripted commands return success.
 
     Session-loss injection (#219), matched by substring:
@@ -175,12 +180,14 @@ class FakeShell:
         if not self.connected:
             raise RuntimeError("not connected — call connect() first")
 
+    @track_remote_result
     async def run(self, command: str) -> RunResult:
         self._before(command)
         result = await self._do_run(command)
         self._after(command)
         return result
 
+    @track_remote_result
     async def start(self, command: str) -> PanelProcess:
         self._before(command)
         process = await self._do_start(command)
@@ -189,16 +196,19 @@ class FakeShell:
         self._after(command)
         return process
 
+    @track_remote_result
     async def put_bytes(self, data: bytes, remote_path: str, mode: int) -> None:
         self._before(remote_path)
         await self._do_put_bytes(data, remote_path, mode)
         self._after(remote_path)
 
+    @track_remote_result
     async def put_dir(self, local_dir: str, remote_dir: str) -> None:
         self._before(remote_dir)
         await self._do_put_dir(local_dir, remote_dir)
         self._after(remote_dir)
 
+    @track_remote_result
     async def put_file(self, local_path: str, remote_path: str, mode: int) -> None:
         self._before(remote_path)
         await self._do_put_file(local_path, remote_path, mode)

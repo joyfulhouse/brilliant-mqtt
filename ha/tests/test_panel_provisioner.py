@@ -522,6 +522,7 @@ class _FakeJournal:
     pending_commit_started: asyncio.Event = field(default_factory=asyncio.Event)
     complete_commit_started: asyncio.Event = field(default_factory=asyncio.Event)
     created_record: ProvisioningRecord | None = None
+    acknowledged_update_record: ProvisioningRecord | None = None
 
     async def async_begin_ownerless_finalize(self, expected: RetainedRollback) -> RetainedRollback:
         raise RuntimeError("ownerless_finalization_requires_real_journal")
@@ -636,6 +637,31 @@ class _FakeJournal:
         assert self.record is not None
         assert self.record.transaction_id == transaction_id
         self.record = replace(self.record, last_error=last_error)
+        return self.record
+
+    async def async_finish_update_mutations(
+        self, expected: ProvisioningRecord
+    ) -> ProvisioningRecord:
+        assert self.record == expected
+        self.record = replace(expected, last_error=None)
+        self.acknowledged_update_record = self.record
+        return self.record
+
+    async def async_start_restore_mutations(
+        self, expected: ProvisioningRecord
+    ) -> ProvisioningRecord:
+        assert self.record == expected
+        assert expected.phase is ProvisioningPhase.ROLLBACK_PENDING
+        self.record = replace(
+            expected, last_error=StoredJournalError("recovery", "mutation_outcome_unknown")
+        )
+        return self.record
+
+    async def async_finish_restore_mutations(
+        self, expected: ProvisioningRecord
+    ) -> ProvisioningRecord:
+        assert self.record == expected
+        self.record = replace(expected, last_error=None)
         return self.record
 
     async def async_complete_commit(

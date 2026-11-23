@@ -591,40 +591,6 @@ def _dropping(marker: str = _IDENTITY_READ) -> FakeShell:
     return FakeShell(drop_on=marker)
 
 
-async def test_lost_admission_resumes_once_with_one_transaction(
-    hass: HomeAssistant,
-    payload_dir: Path,
-    clock: Clock,
-    spies: Spies,
-    shells: Shells,
-) -> None:
-    shells.scripted.extend([_dropping(), FakeShell()])
-    manager = update_manager(hass)
-    progress: list[int] = []
-    waiting: list[tuple[dict[str, Any], list[int]]] = []
-    clock.on_sleep = lambda _delay: waiting.append(
-        (dict(manager.update_retry or {}), list(progress))
-    )
-
-    await manager.async_update_agent(progress=progress.append)
-
-    assert shells.connects == [1, 1]
-    assert spies.admissions == 2
-    assert spies.baselines == 1  # one transaction only
-    assert clock.sleeps == [_CONNECT_RETRY_BASE_DELAY_S]
-    state, seen = waiting[0]
-    assert (state["stage"], state["attempt"], state["reason"]) == (
-        "admission",
-        1,
-        "connection_lost",
-    )
-    assert seen[-1] == 10  # a resume shows no completed work while waiting
-    assert progress[-1] == 100
-    assert manager.update_last_error is None
-    assert manager.update_progress is None
-    await manager.async_shutdown()
-
-
 async def test_live_admission_failure_is_not_retried(
     hass: HomeAssistant,
     payload_dir: Path,
@@ -680,172 +646,9 @@ async def test_loss_after_the_transaction_began_is_never_rerun(
     }
 
 
-async def test_connects_and_resumes_share_one_budget(
-    hass: HomeAssistant,
-    payload_dir: Path,
-    clock: Clock,
-    spies: Spies,
-    shells: Shells,
-) -> None:
-    shells.scripted.extend(
-        [
-            FakeShell(connect_error=_UNREACHABLE),
-            _dropping(),
-            FakeShell(connect_error=_UNREACHABLE),
-            _dropping(),
-            _dropping(),
-            FakeShell(),
-        ]
-    )
-    manager = update_manager(hass)
-
-    with pytest.raises(HomeAssistantError) as raised:
-        await manager.async_update_agent()
-
-    assert shells.connects == [1] * _CONNECT_RETRY_MAX_ATTEMPTS
-    assert clock.sleeps == [5.0, 10.0, 20.0, 30.0]
-    summary = f"{_ADMISSION_LOST} after {_CONNECT_RETRY_MAX_ATTEMPTS} attempts"
-    assert raised.value.translation_placeholders == {"error": summary}
-    assert "during deployment" not in summary
-    assert spies.baselines == 0
-    assert manager.update_last_error == {
-        "stage": "admission",
-        "code": "admission_connection_lost",
-        "attempts": _CONNECT_RETRY_MAX_ATTEMPTS,
-    }
-
-
-async def test_connect_failure_after_a_resume_uses_the_admission_summary(
-    hass: HomeAssistant,
-    payload_dir: Path,
-    clock: Clock,
-    spies: Spies,
-    shells: Shells,
-) -> None:
-    """Once connected, a later non-permanent connect failure is an admission loss."""
-
-    def jump(_delay: float) -> None:
-        clock.now += 200
-
-    clock.on_sleep = jump
-    shells.scripted.extend([_dropping(), FakeShell()])
-    manager = update_manager(hass)
-
-    with pytest.raises(HomeAssistantError) as raised:
-        await manager.async_update_agent()
-
-    # The resume backoff ran past the deadline: the next attempt never connected.
-    assert shells.connects == [1]
-    assert raised.value.translation_placeholders == {"error": f"{_ADMISSION_LOST} after 1 attempt"}
-
-
-async def test_permanent_reconnect_failure_keeps_the_connect_wording(
-    hass: HomeAssistant,
-    payload_dir: Path,
-    clock: Clock,
-    spies: Spies,
-    shells: Shells,
-) -> None:
-    shells.scripted.extend(
-        [_dropping(), FakeShell(connect_error=asyncssh.PermissionDenied("bad password"))]
-    )
-    manager = update_manager(hass)
-
-    with pytest.raises(HomeAssistantError) as raised:
-        await manager.async_update_agent()
-
-    assert shells.connects == [1, 1]
-    assert raised.value.translation_placeholders == {
-        "error": f"{_CONNECT_SUMMARY} after 2 attempts"
-    }
-
-
 def test_attempt_pluralisation() -> None:
     assert manager_module._after_attempts("x", 1) == "x after 1 attempt"
     assert manager_module._after_attempts("x", 2) == "x after 2 attempts"
-
-
-async def test_resume_never_repins_a_changed_host_key(
-    hass: HomeAssistant,
-    payload_dir: Path,
-    clock: Clock,
-    spies: Spies,
-    shells: Shells,
-) -> None:
-    shells.scripted.extend(
-        [
-            _dropping(),
-            FakeShell(connect_error=asyncssh.HostKeyNotVerifiable("changed")),
-            FakeShell(pinned=None),
-        ]
-    )
-    manager = update_manager(hass, options={OPT_TRUST_HOST_KEY_CHANGES: True})
-
-    with pytest.raises(HomeAssistantError) as raised:
-        await manager.async_update_agent()
-
-    assert raised.value.translation_key == "host_key_changed"
-    assert len(shells.created) == 2  # no unpinned re-pin shell
-    assert spies.baselines == 0
-
-
-async def test_cancellation_during_resume_backoff_releases_the_lock_and_keeps_the_window(
-    hass: HomeAssistant,
-    payload_dir: Path,
-    clock: Clock,
-    spies: Spies,
-    shells: Shells,
-) -> None:
-    lock = asyncio.Lock()
-    clock.gate = asyncio.Event()
-    shells.scripted.append(_dropping())
-    manager = update_manager(hass, lock=lock)
-
-    update = asyncio.create_task(manager.async_update_agent())
-    await clock.entered.wait()
-    assert not lock.locked()
-    assert manager.update_retry is not None and manager.update_retry["stage"] == "admission"
-    update.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await update
-
-    assert not lock.locked()
-    assert manager._repairing is False
-    assert manager.update_retry is None
-    record = await update_intent_store(hass).async_get(manager.management_id)
-    assert record is not None and record.stage == "admission"
-    assert spies.baselines == 0
-
-
-async def test_shutdown_during_resume_backoff_stops_and_keeps_the_window(
-    hass: HomeAssistant,
-    payload_dir: Path,
-    clock: Clock,
-    spies: Spies,
-    shells: Shells,
-) -> None:
-    lock = asyncio.Lock()
-    clock.gate = asyncio.Event()
-    shells.scripted.extend([_dropping(), FakeShell()])
-    manager = update_manager(hass, lock=lock)
-
-    update = asyncio.create_task(manager.async_update_agent())
-    await clock.entered.wait()
-    assert not lock.locked()
-    await manager.async_shutdown()
-    clock.gate.set()
-    with pytest.raises(HomeAssistantError) as raised:
-        await update
-
-    assert raised.value.translation_placeholders == {"error": _SHUTDOWN_SUMMARY}
-    assert shells.connects == [1]
-    assert manager.problem is False
-    assert manager.update_last_error == {
-        "stage": "connect",
-        "code": "update_stopped",
-        "attempts": 1,
-    }
-    assert await update_intent_store(hass).async_get(manager.management_id) is not None
 
 
 async def test_terminal_failure_clears_the_window(
@@ -890,8 +693,10 @@ async def test_lost_admission_with_an_override_is_not_resumed(
     assert clock.sleeps == []
     assert shell.identity_uploads and "override-" in shell.identity_uploads[0][0]
     error = (raised.value.translation_placeholders or {})["error"]
-    assert "release_override_used_or_write_failed" in error
-    assert "obtain a fresh override" in error
+    assert "outcome unknown" in error
+    assert "externally" in error
+    saved = await update_intent_store(hass).async_get(manager.management_id)
+    assert saved is not None and saved.stage == "outcome_unknown"
     assert spies.baselines == 0
 
 
@@ -914,7 +719,7 @@ async def test_lost_admission_with_a_journal_present_is_not_resumed(
         await manager.async_update_agent()
 
     assert shells.connects == [1]
-    assert raised.value.translation_placeholders == {"error": _ADMISSION_LOST}
+    assert "outcome unknown" in (raised.value.translation_placeholders or {})["error"]
 
 
 @pytest.mark.parametrize(
@@ -979,39 +784,10 @@ async def test_baseline_loss_stops_with_the_journal_aware_summary(
     assert spies.baselines == 1
     assert clock.sleeps == []
     error = (raised.value.translation_placeholders or {})["error"]
-    if recovery:
-        assert "provisioning_recovery_required" in error
-        assert "remove nothing by hand" in error
-    else:
-        assert "baseline_capture_interrupted" in error
-        assert "Interrupted baseline capture" in error
-
-
-async def test_resume_refuses_a_changed_release_candidate(
-    hass: HomeAssistant,
-    payload_dir: Path,
-    clock: Clock,
-    spies: Spies,
-    shells: Shells,
-) -> None:
-    def change_payload(_delay: float) -> None:
-        (payload_dir / "vendor/new.py").write_text("changed = True\n")
-
-    clock.on_sleep = change_payload
-    shells.scripted.extend([_dropping(), FakeShell()])
-    manager = update_manager(hass)
-
-    with pytest.raises(HomeAssistantError) as raised:
-        await manager.async_update_agent()
-
-    assert shells.connects == [1]
-    error = (raised.value.translation_placeholders or {})["error"]
-    assert "release_candidate_changed" in error
-    assert manager.update_last_error == {
-        "stage": "admission",
-        "code": "release_candidate_changed",
-        "attempts": 1,
-    }
+    assert "outcome unknown" in error
+    assert "externally" in error
+    saved = await update_intent_store(hass).async_get(manager.management_id)
+    assert saved is not None and saved.stage == "outcome_unknown"
 
 
 def test_both_baseline_capture_interrupted_triggers_share_one_text() -> None:

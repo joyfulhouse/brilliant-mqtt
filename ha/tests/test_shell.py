@@ -10,6 +10,7 @@ from typing import Any, Protocol, get_type_hints
 import asyncssh
 import pytest
 
+from custom_components.brilliant_mqtt import panel_ops
 from custom_components.brilliant_mqtt import shell as shell_module
 from custom_components.brilliant_mqtt.shell import (
     AsyncsshShell,
@@ -1463,6 +1464,26 @@ async def test_fake_shell_drop_on_fails_before_the_command_runs() -> None:
     assert shell.identity_commands == []
     with pytest.raises(asyncssh.ConnectionLost):
         await shell.run("true")
+
+
+async def test_run_without_exit_acknowledgement_marks_outcome_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class MissingExitConnection(_FakeConnection):
+        async def run(self, command: str, **kwargs: object) -> asyncssh.SSHCompletedProcess:
+            return asyncssh.SSHCompletedProcess(exit_status=None, stdout="", stderr="")
+
+    _patch_connect(monkeypatch, MissingExitConnection(None))
+    shell = AsyncsshShell("192.168.1.10", "pw", _REAL_ED25519_PUB)
+    await shell.connect()
+    result = await shell.run("SECRET remote mutation")
+    assert result.exit_status == -1
+    assert shell.mutation_outcome_unknown()
+    assert not shell.transport_lost()
+    with pytest.raises(panel_ops.PanelOpError, match="exited -1"):
+        await panel_ops._checked(shell, "true")
+    assert shell.mutation_outcome_unknown()
+    await shell.close()
 
 
 async def test_fake_shell_drop_after_completes_remotely_then_drops() -> None:

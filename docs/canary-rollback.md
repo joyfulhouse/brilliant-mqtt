@@ -66,10 +66,11 @@ publishes are needed for these operations.
    `recovery_deployment_id`. The execution journal is cleared only after this
    evidence is durably saved. Confirm normal panel behavior during the agreed soak;
    MQTT verification does not prove physical slider latency or electrical behavior.
-5. If HA restarts or the action is interrupted, allow the existing recovery runner
-   to reconcile durable intent. A restore operation is explicitly journaled as
-   rollback; it is never recovered as an unactivated candidate cleanup. Retrying a
-   failed rollback uses another fresh deployment ID.
+5. A restore is durably guarded before its first command. If a command result is
+   lost or HA stops during restore, `mutation_outcome_unknown` blocks further
+   recovery after restart. Preserve the artifacts and establish external command
+   settlement with maintainer guidance. A fully acknowledged failure can retain
+   its ordinary typed failure and permit recovery with a fresh deployment ID.
 
 Restoration is byte-exact **except for the deployment-correlation field in the
 live environment file**. That field must change to reject delayed messages from
@@ -105,29 +106,37 @@ while obtaining redacted diagnostics and the HA repair/log code.
 | `release_update_required` | Repair, post-OTA refresh and component enablement keep installed code and only install code that is missing. Change it with the canaried Update entity or `brilliant_mqtt.redeploy`. |
 | `rollback_credentials_unavailable` | Restore the exact HA panel owner/configuration and its pinned host identity; then retry. Do not enable automatic host-key trust. |
 | `rollback_health_failed` | Bytes may already be restored. Check HA's broker connection and panel connectivity. Retained MQTT history cannot satisfy this check. Retry after resolving connectivity. |
-| `rollback_deadline_exceeded` | Treat recovery as unverified. The pending journal remains; remote restore processes are terminated and settled before reuse. Resolve connectivity/storage delays before retrying. |
+| `rollback_deadline_exceeded` | Treat recovery as unverified. The pending journal remains. Retry only when diagnostics confirm no `mutation_outcome_unknown`; local SSH cleanup does not prove a remote process stopped. |
 | `rollback_failed` / `rollback_failed` state | Preserve artifacts and the actionable repair code for the maintainer. A missing or changed pinned release is not silently replaced with bundled code. |
 
 ## Update session loss
 
-A managed UPDATE whose transport is lost first revalidates its exact active
-journal and current owner authorization, then durably requests rollback. The
-journal intentionally changes operation to ROLLBACK. Every fresh SSH attempt,
-including after backoff, reloads that exact record and invokes the central
-authorizer for its current operation. Successful connects recheck authorization
-before restoration. A missing authorizer, changed owner, password, pin or active
-transaction fails closed, preserving the journal and retained baseline.
+A managed UPDATE persists `mutation_outcome_unknown` before yielding control to
+the deployment. Only that live operation can clear its exact marker, after all
+mutation results are acknowledged. A channel error, transport loss, timeout,
+cancellation or HA process death can leave a remote command running. Closing an
+SSH session does not establish that the command stopped.
 
-Reconnects use the journal's pinned key, at most five attempts within 120 seconds,
-and retry only classified network failures before SSH authentication. The
-300-second rollback deadline includes reconnect time. `connection_lost` identifies
-the triggering failure; `recovery_interrupted` means HA was stopping, and
-`recovery_connection_failed`, `panel_identity_mismatch`, or
-`panel_authentication_failed` identify reconnect failures. Activation and capture
-are never repeated. SSH keepalives detect silent transport loss in about 45
-seconds. No remote-command fencing is promised: a command already sent on the
-lost connection could finish late. Live pilot validation remains pending
-(Refs #219).
+An unknown outcome blocks immediate rollback, background recovery, Update Retry,
+and automatic or manual repair after restart. The active journal and retained
+baseline remain intact; no new recovery shell is created. Before baseline capture,
+a private update intent provides the same block for interrupted release admission,
+which can already have published an audit record. Dismiss cannot remove that block.
+
+The operator must establish externally that every prior command has settled and
+obtain maintainer guidance for recovery. There is no automatic clear or settlement
+button. Do not delete the intent, journal or baseline to force a retry. Known health
+failures after acknowledged mutation still use the existing verified compensation.
+Compensation itself uses the same durable guard through the final cleanup
+acknowledgement. An uncertain restore cannot start another restore or cleanup,
+including after HA restarts. A fully acknowledged restore failure may release its
+exact guard and retain its normal typed recovery error.
+Activation and capture are never repeated. SSH keepalives detect silent transport
+loss in about 45 seconds, but do not fence a remote writer.
+
+Automatic admission resume and fresh-session rollback are deferred to
+[#285](https://github.com/joyfulhouse/brilliant-mqtt/issues/285), which requires a
+panel-side writer fence. Live pilot validation remains pending (Refs #219).
 
 ## Interrupted baseline capture
 

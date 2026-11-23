@@ -1,7 +1,7 @@
-"""Shared harness for the agent update retry, resume and rollback tests (#219).
+"""Shared harness for the agent update retry and outcome-unknown tests (#219).
 
 Fixtures wrapping these live in conftest.py (``clock``, ``spies``, ``shells``,
-``durable_journal_store``, ``reconnect_sleeps``).
+``durable_journal_store``).
 """
 
 from __future__ import annotations

@@ -839,6 +839,7 @@
           }
         },
         "abort": {
+          "mutation_outcome_unknown": "An earlier panel command may still be running. Retry, Dismiss, repair and automatic recovery are blocked. Establish externally that prior commands have settled, then obtain maintainer guidance. Keep the private intent, journal and baseline; see docs/canary-rollback.md.",
           "interrupted_update_target_changed": "The bundled release changed since the update was interrupted. Dismiss this issue and start the update again from the Update entity.",
           "interrupted_update_recovery_owned": "A provisioning journal or retained baseline concerns this panel, so recovery owns it. The interrupted update was dropped; check diagnostics and follow docs/canary-rollback.md.",
           "already_in_progress": "A repair or update is already running for this panel. Wait for it to finish, then retry.",

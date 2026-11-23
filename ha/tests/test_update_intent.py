@@ -11,11 +11,9 @@ from typing import Any
 
 import pytest
 from homeassistant.components.repairs import repairs_flow_manager
-from homeassistant.components.repairs.issue_handler import async_process_repairs_platforms
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.helpers import issue_registry as ir
-from homeassistant.helpers.storage import Store
 from homeassistant.helpers.translation import async_get_translations
 from homeassistant.setup import async_setup_component
 from pytest_homeassistant_custom_component.common import MockConfigEntry
@@ -24,7 +22,7 @@ from pytest_homeassistant_custom_component.typing import MqttMockHAClient
 from custom_components.brilliant_mqtt import update_state
 from custom_components.brilliant_mqtt.const import DOMAIN
 from custom_components.brilliant_mqtt.diagnostics import async_get_config_entry_diagnostics
-from custom_components.brilliant_mqtt.provisioning_journal import ProvisioningJournal
+from custom_components.brilliant_mqtt.provisioning_journal import ProvisioningJournal, Store
 from custom_components.brilliant_mqtt.update_intent import (
     InterruptedUpdates,
     UpdateIntent,
@@ -39,6 +37,8 @@ from custom_components.brilliant_mqtt.update_intent import (
 from tests.test_init import ENTRY_DATA
 from tests.test_provisioning_journal import _FINGERPRINT, _PUBLIC_KEY, _record
 from tests.update_harness import Shells, Spies
+
+pytestmark = pytest.mark.usefixtures("durable_journal_store")
 
 _TARGET = UpdateTarget("0.2.0", 1, "a" * 64, "b" * 64)
 _OTHER_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBsF8pQ8C3EWxF7bGrXWvqJXV1fbNHo6p5FC0gIjJbqv"
@@ -92,7 +92,8 @@ class _Panel:
     def notify_update_state(self) -> None:
         self.notified += 1
 
-    async def async_update_agent(self) -> None:
+    async def async_update_agent(self, *, expected_target: UpdateTarget | None = None) -> None:
+        assert expected_target == self.target
         self.running = True
         self.updates += 1
         try:
@@ -214,7 +215,7 @@ async def test_store_saves_before_swapping_the_cache(
     store = UpdateIntentStore(hass)
     await store.async_set("p", _intent())
 
-    async def failing_save(_self: Store[Any], _data: object) -> None:
+    async def failing_save(_self: Store, _data: object) -> None:
         raise RuntimeError("serialization failed")
 
     monkeypatch.setattr(Store, "async_save", failing_save)
@@ -239,7 +240,7 @@ async def test_window_save_failure_keeps_the_surfaced_record_and_issue(
     panel = _Panel(hass)
     interrupted = await _surfaced(hass, panel)
 
-    async def failing_save(_self: Store[Any], _data: object) -> None:
+    async def failing_save(_self: Store, _data: object) -> None:
         raise RuntimeError("serialization failed")
 
     monkeypatch.setattr(Store, "async_save", failing_save)
@@ -256,7 +257,7 @@ async def test_window_cancelled_before_save_keeps_the_old_record_and_issue(
     interrupted = await _surfaced(hass, panel)
     entered = asyncio.Event()
 
-    async def hanging_save(_self: Store[Any], _data: object) -> None:
+    async def hanging_save(_self: Store, _data: object) -> None:
         entered.set()
         await asyncio.Event().wait()
 
@@ -391,7 +392,7 @@ async def test_dismiss_clears_and_a_failed_clear_raises(
     panel = _Panel(hass)
     interrupted = await _surfaced(hass, panel)
 
-    async def failing_save(_self: Store[Any], _data: object) -> None:
+    async def failing_save(_self: Store, _data: object) -> None:
         raise RuntimeError("serialization failed")
 
     with monkeypatch.context() as patched:
@@ -467,7 +468,6 @@ async def _surface_through_reload(hass: HomeAssistant) -> tuple[MockConfigEntry,
 
 async def _open_menu(hass: HomeAssistant, issue_id: str) -> dict[str, Any]:
     assert await async_setup_component(hass, "repairs", {})
-    await async_process_repairs_platforms(hass)
     flows = repairs_flow_manager(hass)
     assert flows is not None
     result = await flows.async_init(DOMAIN, data={"issue_id": issue_id})
@@ -582,7 +582,7 @@ async def test_repairs_flow_dismiss_failure_aborts_and_keeps_the_issue(
     flows = repairs_flow_manager(hass)
     assert flows is not None
 
-    async def failing_save(_self: Store[Any], _data: object) -> None:
+    async def failing_save(_self: Store, _data: object) -> None:
         raise RuntimeError("serialization failed")
 
     with monkeypatch.context() as patched:

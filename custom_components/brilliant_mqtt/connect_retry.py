@@ -1,8 +1,7 @@
 """Shared bounded-retry policy for panel SSH connects (#219).
 
-Used by the agent update's pre-mutation connect (manager) and by the managed
-update's fresh-session rollback reconnect (panel_provisioner). Backoff before
-retry n is ``min(cap, base * 2**(n-1))`` scaled by a jitter factor in
+Used only by the agent update's initial pre-mutation connect (manager). Backoff
+before retry n is ``min(cap, base * 2**(n-1))`` scaled by a jitter factor in
 ``[JITTER_MIN, 1.0]``.
 
 Only network faults are transient. Authentication, host-key, key-exchange and

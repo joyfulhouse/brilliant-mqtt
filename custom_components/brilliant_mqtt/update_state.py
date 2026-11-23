@@ -24,6 +24,7 @@ ERROR_STAGES = frozenset({"payload", "connect", "admission", "baseline", "deploy
 # Every code an agent update can record as its typed final error.
 UPDATE_ERROR_CODES = frozenset(
     {
+        "mutation_outcome_unknown",
         "payload_unreadable",
         "connect_failed",
         "host_key_changed",
@@ -143,7 +144,7 @@ def safe_interrupted(value: object) -> dict[str, object] | None:
     if (
         not isinstance(version, str)
         or _VERSION.fullmatch(version) is None
-        or value["stage"] not in RETRY_STAGES
+        or value["stage"] not in RETRY_STAGES | {"outcome_unknown"}
         or not _count(value["attempts"])
         or not _count(value["max_attempts"], minimum=1)
         or not _aware_iso(value["started_at"])

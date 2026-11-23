@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Agent updates expose retry state, typed errors and manager-owned progress in
-  diagnostics and the Update entity. A restart before capture surfaces a durable
+  diagnostics and the Update entity. A restart during initial connect surfaces a durable
   interrupted-update intent with Retry/Dismiss Repair actions. Retry requires the
   exact candidate version, ordinal, digest and selected component-set digest.
   Recovery journals and retained baselines take precedence. Refs #219; live pilot
@@ -18,13 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Release admission can resume after transport loss within the existing shared
-  five-attempt / 120-second budget, without re-pinning or replaying an override.
-  Capture and activation never repeat. A lost UPDATE session rolls back through
-  a fresh pinned connection, revalidating the exact journal and central current
-  operation authorization before each attempt and after connection. Revoked
-  ownership/credentials or a replaced transaction preserve recovery artifacts.
-  SSH keepalives bound detection of silent transport loss. Refs #219.
+- Automatic update retries stop before release admission. Unknown command outcomes
+  durably block retry, repair and recovery across restart, preserving intent,
+  journal and baseline. Shutdown cancels and settles pending updates; capture and
+  activation never repeat. SSH keepalives bound silent-loss detection. Exact
+  requested targets remain bound through Repair Retry and admission. Broader
+  admission resume and fresh rollback require the writer fencing tracked in #285.
+  Refs #219; live pilot validation remains pending.
 
 - Removing an unactivated onboarding baseline now checks candidate release
   paths with `os.path.lexists`, which older panel Pythons provide. A failed

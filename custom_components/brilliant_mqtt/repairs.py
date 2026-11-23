@@ -42,6 +42,8 @@ class InterruptedUpdateRepairFlow(RepairsFlow):
         intent = manager.interrupted_updates.surfaced if manager is not None else None
         if manager is None or intent is None:
             return self.async_abort(reason="interrupted_update_unavailable")
+        if intent.stage == "outcome_unknown":
+            return self.async_abort(reason="mutation_outcome_unknown")
         return self.async_show_menu(
             step_id="init",
             menu_options=["retry", "dismiss"],

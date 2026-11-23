@@ -19,7 +19,6 @@ from uuid import RFC_4122, UUID, uuid4
 from homeassistant.const import CONF_NAME
 from homeassistant.core import HomeAssistant
 
-from . import connect_retry
 from .broker import BrokerProfile
 from .broker_validation import BrokerValidationResult
 from .const import (
@@ -178,9 +177,6 @@ _MAX_JSON_DEPTH = 64
 _MAX_JSON_NODES = 4096
 _PROGRESS_TIMEOUT_SECONDS = 5.0
 RECOVERY_TIMEOUT_SECONDS = 300.0
-# A managed update whose session was lost reconnects (pinned) within this bound,
-# which is part of the RECOVERY_TIMEOUT_SECONDS budget for the whole rollback.
-RECONNECT_TIMEOUT_SECONDS = 120.0
 INSTALL_LOCK_TIMEOUT_SECONDS = 30.0
 
 
@@ -725,6 +721,18 @@ class _Journal(Protocol):
         last_error: StoredJournalError,
     ) -> ProvisioningRecord: ...
 
+    async def async_finish_update_mutations(
+        self, expected: ProvisioningRecord
+    ) -> ProvisioningRecord: ...
+
+    async def async_start_restore_mutations(
+        self, expected: ProvisioningRecord
+    ) -> ProvisioningRecord: ...
+
+    async def async_finish_restore_mutations(
+        self, expected: ProvisioningRecord
+    ) -> ProvisioningRecord: ...
+
     async def async_complete_commit(
         self,
         transaction_id: UUID,
@@ -881,31 +889,6 @@ class _InstallState:
 class _Settlement:
     error: BaseException | None
     cancellation: asyncio.CancelledError | None
-
-
-# How often a rollback reconnect backoff re-checks for an HA stop.
-_STOP_POLL_SECONDS = 0.5
-
-
-async def _sleep_unless_stopping(delay: float, stopping: Callable[[], bool]) -> bool:
-    """Back off for *delay*, returning False as soon as *stopping* reports a stop.
-
-    The predicate is polled every _STOP_POLL_SECONDS, so an HA shutdown is never
-    held for a whole backoff.
-    """
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + delay
-    while True:
-        if stopping():
-            return False
-        remaining = deadline - loop.time()
-        if remaining <= 0:
-            return True
-        await asyncio.sleep(min(_STOP_POLL_SECONDS, remaining))
-
-
-# Indirected so tests drive the rollback reconnect backoff without real waits.
-_reconnect_backoff: Callable[[float, Callable[[], bool]], Awaitable[bool]] = _sleep_unless_stopping
 
 
 def _not_stopping() -> bool:
@@ -1137,14 +1120,12 @@ class PanelProvisioner:
         subentry_id: str,
         stopping: Callable[[], bool] = _not_stopping,
     ) -> AsyncIterator[UUID]:
-        """Journal the existing manager's admitted update without reacquiring its lock.
+        """Retain a verified baseline and guard every possibly unsettled mutation.
 
-        If the update fails after the transaction exists, the journal's verified
-        rollback runs. When the update's session was LOST (#219) that rollback runs
-        over a fresh session pinned to the journaled host key instead of the dead
-        one; *stopping* reports an HA stop/unload so the reconnect gives up with
-        ``recovery_interrupted``. Activation is never repeated, and every failure
-        keeps the durable restore intent for the background recovery runner.
+        The write-ahead unknown marker survives process death. Only this live
+        operation, after all mutation acknowledgements, can clear its exact marker.
+        Any failure while the body runs requires external operator settlement;
+        neither a fresh SSH session nor a health acknowledgement fences old writers.
         """
         if not self._lock.locked():
             raise PanelProvisioningError("transaction_in_progress")
@@ -1183,13 +1164,20 @@ class PanelProvisioner:
         )
         await self._journal.async_create(record)
         record = await self._journal.async_transition(
-            transaction, ProvisioningPhase.ACTIVATION_PENDING
+            transaction,
+            ProvisioningPhase.ACTIVATION_PENDING,
+            last_error=StoredJournalError("recovery", "mutation_outcome_unknown"),
         )
         observer = self._health_observer_factory(request.slug)
         try:
             await observer.async_subscribe()
             observer.mark_activation_started(version, transaction.hex)
+            if stopping():
+                raise PanelProvisioningError("mutation_outcome_unknown")
             yield transaction
+            if shell.transport_lost() or shell.mutation_outcome_unknown():
+                raise PanelProvisioningError("mutation_outcome_unknown")
+            record = await self._journal.async_finish_update_mutations(record)
             evidence = await observer.async_wait(version, min(self._health_timeout, 90.0))
             if evidence.deployment_id != transaction.hex or evidence.agent_version != version:
                 raise PanelHealthError("panel_health_version_mismatch")
@@ -1198,31 +1186,49 @@ class PanelProvisioner:
                 ProvisioningPhase.VERIFYING,
                 ProvisioningPhase.PENDING_CONFIG_COMMIT,
             ):
-                await self._journal.async_transition(transaction, phase)
+                record = await self._journal.async_transition(transaction, phase)
             await self._journal.async_complete_commit(transaction, subentry_id=subentry_id)
-        except BaseException:
-            current = await self._journal.async_load()
+        except BaseException as error:
+            read_failed = False
+            current = None
+            try:
+                current = await self._journal.async_load()
+            except Exception:
+                read_failed = True
+            if read_failed or current != record:
+                # Never adopt a replacement, even one with the same UUID.
+                if isinstance(error, asyncio.CancelledError):
+                    raise error from None
+                raise PanelProvisioningError("provisioning_recovery_required") from None
             if current is not None and current.phase is not ProvisioningPhase.COMMITTED:
+                if (
+                    current.last_error is not None
+                    and current.last_error.code == "mutation_outcome_unknown"
+                ):
+                    await _settle(
+                        self._repair_reporter.async_report_rollback_failure(
+                            transaction,
+                            original_code="mutation_outcome_unknown",
+                            rollback_code="mutation_outcome_unknown",
+                        )
+                    )
+                    if isinstance(error, asyncio.CancelledError):
+                        raise
+                    raise PanelProvisioningError("mutation_outcome_unknown") from None
                 staged = self._staged_release_factory(
                     version, transaction, request.selected_components
                 )
-                if shell.transport_lost():
-                    outcome = await _settle(
-                        self._async_rollback_over_fresh_session(current, snapshot, staged, stopping)
+                outcome = await _settle(
+                    self._async_recovery_rollback(
+                        current, shell, snapshot, staged, original_code="health_failed"
                     )
-                    # The rollback itself recorded any failure and kept the intent; a
-                    # caller cancellation stays a cancellation.
-                    if outcome.cancellation is not None:
-                        raise outcome.cancellation from None
-                    if isinstance(outcome.error, PanelProvisioningError):
-                        raise PanelProvisioningError(outcome.error.code) from None
-                else:
-                    outcome = await _settle(
-                        self._async_recovery_rollback(
-                            current, shell, snapshot, staged, original_code="health_failed"
-                        )
-                    )
+                )
                 if outcome.error is not None:
+                    if (
+                        isinstance(outcome.error, PanelProvisioningError)
+                        and outcome.error.code == "mutation_outcome_unknown"
+                    ):
+                        raise PanelProvisioningError("mutation_outcome_unknown") from None
                     raise PanelProvisioningError("rollback_failed") from None
             raise
         finally:
@@ -1816,6 +1822,8 @@ class PanelProvisioner:
         progress: ProgressReporter,
     ) -> None:
         await _report(progress, ProvisioningProgressStage.RECOVERING)
+        current = await self._journal.async_load()
+        self._require_mutation_settled(current)
         ownerless_pending = False
         for retained in await self._journal.async_retained_records():
             if retained.state == "finalizing":
@@ -1846,6 +1854,7 @@ class PanelProvisioner:
     ) -> None:
         if not isinstance(record, ProvisioningRecord):
             raise PanelProvisioningError("recovery_failed")
+        self._require_mutation_settled(record)
         if host is None and password is None:
             if self._recovery_authorizer is None:
                 raise PanelProvisioningError("provisioning_recovery_required")
@@ -2109,6 +2118,7 @@ class PanelProvisioner:
         self, expected: ProvisioningRecord
     ) -> RetainedRollback:
         current = await self._journal.async_load()
+        self._require_mutation_settled(current)
         retained = (
             await self._journal.async_retained(expected.transaction_id)
             if isinstance(expected, ProvisioningRecord)
@@ -2236,6 +2246,7 @@ class PanelProvisioner:
         original_code: str,
         deadline_seconds: float = RECOVERY_TIMEOUT_SECONDS,
     ) -> None:
+        current = await self._journal.async_start_restore_mutations(current)
         failure_code: str | None = None
         try:
             async with asyncio.timeout(deadline_seconds):
@@ -2248,6 +2259,17 @@ class PanelProvisioner:
             failure_code = "rollback_health_failed"
         except Exception:
             failure_code = "rollback_failed"
+        if shell.transport_lost() or shell.mutation_outcome_unknown():
+            await _settle(
+                self._repair_reporter.async_report_rollback_failure(
+                    current.transaction_id,
+                    original_code=original_code,
+                    rollback_code="mutation_outcome_unknown",
+                )
+            )
+            raise PanelProvisioningError("mutation_outcome_unknown") from None
+        # Includes the final candidate-cleanup acknowledgement on success.
+        await self._journal.async_finish_restore_mutations(current)
         if failure_code is not None:
             await self._journal.async_retained_state(current.transaction_id, "rollback_failed")
             await self._journal.async_record_error(
@@ -2261,141 +2283,11 @@ class PanelProvisioner:
                 )
             )
             raise PanelProvisioningError(failure_code)
+        if snapshot.layout is PanelLayout.ABSENT:
+            await self._journal.async_complete_absent_rollback(current.transaction_id)
+        else:
+            await self._journal.async_complete_rollback(current.transaction_id, verified=True)
         await self._repair_reporter.async_clear_rollback_failure(current.transaction_id)
-
-    async def _async_rollback_over_fresh_session(
-        self,
-        record: ProvisioningRecord,
-        snapshot: PanelSnapshot,
-        staged: StagedRelease,
-        stopping: Callable[[], bool],
-    ) -> None:
-        """Run the verified rollback over a new pinned session after a lost one (#219).
-
-        The restore intent is made durable FIRST. A failure to reconnect keeps it
-        (ROLLBACK_PENDING, retained ``restore_requested``), records a typed
-        ``last_error`` and raises a Repair naming ``connection_lost``; the
-        background recovery runner settles it later. Nothing is cleared, finalized
-        or re-activated here.
-        """
-        loop = asyncio.get_running_loop()
-        started = loop.time()
-        # UPDATE authority must still hold before converting its durable intent
-        # to ROLLBACK, whose central authorization rules intentionally differ.
-        await self._async_authorize_reconnect(record)
-        current = await self._async_persist_rollback_intent(record, original_code="connection_lost")
-        try:
-            shell = await self._async_reconnect_pinned(current, stopping)
-        except asyncio.CancelledError:
-            await self._async_reconnect_failed(current, "recovery_interrupted")
-            raise
-        except PanelProvisioningError as error:
-            await self._async_reconnect_failed(current, error.code)
-            raise
-        try:
-            await self._async_restore_with_intent(
-                current,
-                shell,
-                snapshot,
-                staged,
-                original_code="connection_lost",
-                deadline_seconds=max(0.0, RECOVERY_TIMEOUT_SECONDS - (loop.time() - started)),
-            )
-        finally:
-            await _settle_close(shell.close)
-
-    async def _async_authorize_reconnect(self, expected: ProvisioningRecord) -> None:
-        """Use recorded credentials only for the exact, currently authorized record."""
-        current = await self._journal.async_load()
-        if current != expected or self._recovery_authorizer is None:
-            raise PanelProvisioningError("provisioning_recovery_required")
-        await self._recovery_authorizer(current)
-        # Authorization may await a credential/owner lookup. It cannot authorize
-        # a transaction that replaced the record while that lookup was in flight.
-        current = await self._journal.async_load()
-        if current != expected or self._recovery_authorizer is None:
-            raise PanelProvisioningError("provisioning_recovery_required")
-        # Production's current-owner checks do not suspend. Finish with them,
-        # since even the identity reread above can yield while an owner revokes.
-        await self._recovery_authorizer(current)
-
-    async def _async_reconnect_pinned(
-        self, record: ProvisioningRecord, stopping: Callable[[], bool]
-    ) -> PanelShell:
-        """Connect to the journaled host, pinned to the journaled key, with retries.
-
-        Only classified network faults that never reached SSH authentication are
-        retried (bounded attempts, shared backoff); authentication, identity and
-        post-auth failures stop at once. The whole reconnect is bounded by
-        RECONNECT_TIMEOUT_SECONDS (``recovery_connection_failed``); an exhausted
-        attempt budget is ``rollback_failed``; an HA stop is ``recovery_interrupted``.
-        """
-        request = record.panel_request
-        try:
-            async with asyncio.timeout(RECONNECT_TIMEOUT_SECONDS):
-                attempt = 0
-                while True:
-                    if stopping():
-                        raise PanelProvisioningError("recovery_interrupted")
-                    await self._async_authorize_reconnect(record)
-                    attempt += 1
-                    try:
-                        shell = self._shell_factory(
-                            request.host, request.root_password, request.public_key
-                        )
-                    except Exception as error:
-                        raise PanelProvisioningError(recovery_connect_failure_code(error)) from None
-                    if shell.pinned_host_key() != request.public_key:
-                        await _settle_close(shell.close)
-                        raise PanelProvisioningError("panel_identity_mismatch")
-                    try:
-                        await shell.connect()
-                        if stopping():
-                            raise PanelProvisioningError("recovery_interrupted")
-                        await self._async_authorize_reconnect(record)
-                    except asyncio.CancelledError:
-                        await _settle_close(shell.close)
-                        raise
-                    except PanelProvisioningError:
-                        await _settle_close(shell.close)
-                        raise
-                    except Exception as error:
-                        await _settle_close(shell.close)
-                        if (
-                            shell.connect_reached_auth()
-                            or connect_retry.classify_transient_connect_failure(error) is None
-                        ):
-                            raise PanelProvisioningError(
-                                recovery_connect_failure_code(error)
-                            ) from None
-                        if attempt >= connect_retry.MAX_ATTEMPTS:
-                            raise PanelProvisioningError("rollback_failed") from None
-                        if not await _reconnect_backoff(
-                            connect_retry.backoff_delay(attempt), stopping
-                        ):
-                            raise PanelProvisioningError("recovery_interrupted") from None
-                        continue
-                    return shell
-        except TimeoutError:
-            raise PanelProvisioningError("recovery_connection_failed") from None
-
-    async def _async_reconnect_failed(self, record: ProvisioningRecord, code: str) -> None:
-        """Keep the durable intent; record the typed failure and raise a Repair."""
-        if code not in PROVISIONING_ERROR_CODES:
-            code = "rollback_failed"
-        if await self._journal.async_load() == record:
-            await _settle(
-                self._journal.async_record_error(
-                    record.transaction_id, StoredJournalError(stage="recovery", code=code)
-                )
-            )
-        await _settle(
-            self._repair_reporter.async_report_rollback_failure(
-                record.transaction_id,
-                original_code="connection_lost",
-                rollback_code=code,
-            )
-        )
 
     async def _async_restore_verified(
         self,
@@ -2407,7 +2299,6 @@ class PanelProvisioner:
         await self._operations.rollback_snapshot(shell, snapshot, staged)
         if snapshot.layout is PanelLayout.ABSENT:
             await self._operations.cleanup_staged(shell, staged)
-            await self._journal.async_complete_absent_rollback(record.transaction_id)
             return
         if snapshot.baseline is None or "bridge" not in snapshot.baseline.identities:
             raise PanelProvisioningError("baseline_incomplete")
@@ -2437,7 +2328,6 @@ class PanelProvisioner:
                 record.transaction_id, "restored", evidence=deployment_id
             )
             await self._operations.cleanup_staged(shell, staged)
-            await self._journal.async_complete_rollback(record.transaction_id, verified=verified)
         finally:
             await _settle_close(observer.async_close)
 
@@ -2447,10 +2337,17 @@ class PanelProvisioner:
             raise PanelProvisioningError("rollback_credentials_unavailable")
         return password
 
+    @staticmethod
+    def _require_mutation_settled(record: ProvisioningRecord | None) -> None:
+        if record is not None and record.last_error is not None:
+            if record.last_error.code == "mutation_outcome_unknown":
+                raise PanelProvisioningError("mutation_outcome_unknown")
+
     async def async_rollback(self, transaction_id: UUID) -> None:
         """Persist operator intent before asking the existing runner to execute it."""
         async with self._lock:
             current = await self._journal.async_load()
+            self._require_mutation_settled(current)
             if current is not None and current.transaction_id != transaction_id:
                 raise PanelProvisioningError("provisioning_recovery_required")
             retained = await self._journal.async_retained(transaction_id)

@@ -148,19 +148,20 @@ MQTT shows the panel online but SSH from Home Assistant is unreachable, suspect 
 stale neighbor (ARP) entry on the Home Assistant host's route to the panel.
 Traffic from the panel toward Home Assistant usually clears it.
 
-An abnormal session loss during release admission may reconnect and repeat
-admission within the same 5-attempt / 120-second budget. This requires no release
-override and no active provisioning journal. The candidate version, ordinal,
-digest and digest of the selected component identities must still match exactly.
-A resumed connection never re-pins the host key. A single-use override may
-already be consumed, so an interrupted override requires fresh approval.
+Automatic retries stop before release admission. Admission can publish audit
+records, so it runs once. The requested version, ordinal, digest and selected
+component identities remain bound through Repair Retry and actual admission;
+a changed candidate is refused before capture or deployment.
 
 Baseline capture and activation are never repeated. A loss during capture leaves
-any baseline in place and reports `baseline_capture_interrupted` unless a journal
-or retained record already owns recovery. Preserve the artifacts and obtain
-maintainer guidance; do not delete private records or baseline files to retry.
-After the update transaction exists, a lost session triggers verified rollback
-over a fresh pinned connection. See [canary-rollback.md](canary-rollback.md).
+any baseline in place and keeps the unknown-outcome intent. Preserve the artifacts
+and obtain maintainer guidance; do not delete private records or baseline files
+to retry. Known capture refusals retain their specific error codes.
+An uncertain command result leaves `mutation_outcome_unknown`, the journal and
+any baseline intact. No automatic fresh-session rollback starts: the old command
+may still be running. Automatic and manual repair, Retry and background recovery
+remain blocked after restart. Establish remote settlement externally and obtain
+maintainer guidance. See [canary-rollback.md](canary-rollback.md).
 
 Diagnostics and the Update entity's `update` attribute show `retry` (stage,
 attempt, max_attempts, reason, retry_in_seconds, next_attempt_at), `last_error`
@@ -175,13 +176,16 @@ release, stage, attempt budget and deadline. After restart it becomes a fixable
 **Agent update was interrupted** Repair. Setup never connects for this intent,
 and it never automatically resumes the update. Retry starts a fresh budget and
 refuses a changed candidate, an existing recovery journal/baseline for the panel,
-or a concurrent repair/update. Dismiss forgets the intent. Recovery journals and
-retained baselines always take precedence. The intent is cleared before capture.
+or a concurrent repair/update. Dismiss forgets a pre-admission intent. An
+`outcome_unknown` intent allows neither Retry nor Dismiss and blocks other panel
+management writers. It is persisted before admission and stays until the guarded
+provisioning journal takes ownership, or the live operation acknowledges success.
 
 The `expired` flag reflects the old deadline; on the entity it refreshes when its
-state is written. Home Assistant's storage helper logs disk-write failures
-without returning them to this intent store. Live pilot validation remains
-pending (Refs #219).
+state is written. Intent persistence uses strict private atomic writes; a failed
+write prevents admission. Broader safe resume requires the remote fencing tracked
+in [#285](https://github.com/joyfulhouse/brilliant-mqtt/issues/285). Live pilot
+validation remains pending (Refs #219).
 
 ### Commands from HA don't drive the load
 

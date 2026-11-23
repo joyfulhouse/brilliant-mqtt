@@ -100,6 +100,7 @@ from .entry_data import (
     effective_hue_ca_cert,
 )
 from .mqtt_payload import decode_mqtt_payload
+from .panel_health import PanelHealthError
 from .panel_ops import PanelOpError
 from .provisioning_journal import ProvisioningJournal, ProvisioningJournalError
 from .shell import (
@@ -115,6 +116,7 @@ from .update_intent import (
     UpdateTarget,
     async_journal_concerns_panel,
     compute_update_target,
+    request_concerns_panel,
     update_intent_store,
     update_target_from_candidate,
 )
@@ -165,19 +167,10 @@ _CONNECT_RETRY_DEADLINE_S = connect_retry.DEADLINE_S
 _classify_transient_connect_failure = connect_retry.classify_transient_connect_failure
 _connect_retry_delay = connect_retry.backoff_delay
 
-# The only stage an update resumes after losing its session (#219). Admission writes
-# nothing a fresh admission cannot repeat safely, and it is resumed only without a
-# release override, without any provisioning journal, and only for a lost session.
-# Once baseline capture begins nothing is ever resumed: the journal owns recovery.
-_RESUMABLE_UPDATE_STAGES = frozenset({"admission"})
+# Only the initial, nonmutating connect can repeat. Admission is a single attempt.
 _CONNECT_SUMMARY = "agent update could not connect to the panel"
 _UNLOADING_SUMMARY = "agent update stopped before connecting because the integration is unloading"
 _ADMISSION_LOST_SUMMARY = "agent update lost the panel connection during release admission"
-_ADMISSION_OVERRIDE_LOST_SUMMARY = (
-    "agent update lost the panel connection during release admission "
-    "(release_override_used_or_write_failed: the single-use release override may already "
-    "be consumed; obtain a fresh override)"
-)
 # One operator text for baseline_capture_interrupted, whichever way it arose (a
 # session lost during capture, or a failed capture whose baseline removal failed).
 _BASELINE_CAPTURE_INTERRUPTED_DETAIL = (
@@ -194,7 +187,7 @@ _BASELINE_RECOVERY_SUMMARY = (
     "remove nothing by hand)"
 )
 _CANDIDATE_CHANGED_SUMMARY = (
-    "agent update could not resume release admission (release_candidate_changed: the "
+    "agent update refused release admission (release_candidate_changed: the "
     "bundled release changed while retrying; start the update again)"
 )
 
@@ -256,6 +249,7 @@ for _canary_code in (
     "health_failed",
     "recovery_connection_failed",
     "recovery_interrupted",
+    "mutation_outcome_unknown",
     "panel_identity_mismatch",
 ):
     _SAFE_PANEL_OP_DETAILS[_canary_code] = f"{_canary_code}: see docs/canary-rollback.md"
@@ -312,15 +306,14 @@ class _PanelConnectFailed(Exception):
 
 @dataclass
 class _UpdateRetryBudget:
-    """One update's shared retry budget: connects and resumed admissions draw on it."""
+    """One update's initial-connect attempt and deadline budget."""
 
     attempts: int = 0
     target: UpdateTarget | None = None
     # Monotonic deadline, set at the first fleet-lock acquisition.
     deadline: float | None = None
-    # Set once a connect succeeded: later connects never re-pin, and a later
-    # non-permanent connect failure is reported as an admission connection loss.
-    connected_once: bool = False
+    admission_started: bool = False
+    close_ok: bool = False
     failure: OSError | asyncssh.Error | None = None
 
 
@@ -328,8 +321,7 @@ class _UpdateRetryBudget:
 class _UpdateAttempt:
     """How one connected update attempt ended."""
 
-    outcome: Literal["deployed", "noop", "resume"]
-    stage: str | None = None
+    outcome: Literal["deployed", "noop"]
 
 
 class _UpdateFailed(Exception):
@@ -373,6 +365,10 @@ def _update_error_code(stage: str, error: BaseException) -> str:
     """The typed code an update failure records (allowlisted; never free text)."""
     if isinstance(error, panel_ops.ReleaseIdentityBlocked):
         return "release_identity_blocked"
+    if isinstance(error, PanelHealthError):
+        return "health_failed"
+    if isinstance(error, ProvisioningJournalError):
+        return error.code if error.code in UPDATE_ERROR_CODES else "provisioning_recovery_required"
     if isinstance(error, PanelOpError):
         code = str(error)[:_PANEL_OP_CODE_PREFIX_LIMIT].partition(":")[0]
         if code in UPDATE_ERROR_CODES:
@@ -607,6 +603,7 @@ class PanelManager:
         # resumes AFTER shutdown's one-shot cancel; this flag stops it re-arming a
         # timer that would then fire on a torn-down entry and SSH a removed panel.
         self._shutting_down = False
+        self._update_task: asyncio.Task[None] | None = None
         self._last_firmware: Any = (
             store.data.get(DATA_LAST_FIRMWARE) if isinstance(store, LegacyPanelStore) else None
         )
@@ -774,6 +771,7 @@ class PanelManager:
             to the entry, fire EVENT_HOST_KEY_REPINNED, return the connected shell.
         Any other connect failure propagates unchanged to the caller's handler.
         """
+        await self._async_assert_update_settled()
         shell = self._shell()
         try:
             await shell.connect()
@@ -781,7 +779,7 @@ class PanelManager:
             # Caught BEFORE any generic asyncssh.Error (this is the only except here,
             # so every other connect failure propagates to the caller's handler).
             await self._async_close_shell_or_raise(shell)
-            # A resumed update (allow_repin=False) never re-pins: the key it already
+            # A caller that forbids re-pinning keeps the key it already
             # authenticated against must still be the panel's key.
             if (
                 not allow_repin
@@ -820,6 +818,32 @@ class PanelManager:
             raise
         return shell
 
+    async def _async_assert_update_settled(self) -> None:
+        """Refuse all management writers while an earlier command may still run.
+
+        Management callers recheck this under the fleet operation lock before
+        creating a session. Ordinary pending journals retain their existing rules.
+        """
+        try:
+            intent = await update_intent_store(self.hass).async_get(self.management_id)
+            record = await ProvisioningJournal(self.hass).async_load()
+        except Exception:
+            raise PanelOpError("provisioning_recovery_required") from None
+        if intent is not None and intent.stage == "outcome_unknown":
+            raise PanelOpError("mutation_outcome_unknown")
+        if (
+            record is not None
+            and record.last_error is not None
+            and record.last_error.code == "mutation_outcome_unknown"
+            and request_concerns_panel(
+                record.panel_request,
+                slug=self.panel,
+                host=str(self.store.data[CONF_HOST]),
+                pinned_key=self.store.data.get(DATA_SSH_HOST_KEY),
+            )
+        ):
+            raise PanelOpError("mutation_outcome_unknown")
+
     def _set_update_retry(self, state: dict[str, Any] | None) -> None:
         self.update_retry = state
         self._notify()
@@ -845,14 +869,13 @@ class PanelManager:
         so other panels are not stalled by an unreachable one; it is held,
         uninterrupted, from the successful connect through the whole attempt body.
 
-        Attempts and the deadline come from the update's ONE shared *budget*, which a
-        resumed admission also draws on. Raises ``_PanelConnectFailed`` (with the
+        Attempts and the deadline come from this update's initial-connect budget.
+        Raises ``_PanelConnectFailed`` (with the
         attempt count) for an exhausted, expired or permanent connect failure;
         ``_HostKeyChanged`` and identity errors propagate unchanged on their first
         occurrence. A failure is retried only when it is a classified network fault,
         the shell never reached SSH user authentication (the password was not
-        offered), and it was not the opt-in re-pin connect. Once the update has
-        connected, a later connect never re-pins. Cancellation (HA shutdown, entity
+        offered), and it was not the opt-in re-pin connect. Cancellation (HA shutdown, entity
         removal) interrupts the backoff or a lock wait immediately; a latched shutdown
         is re-checked after every lock acquisition and after every backoff and stops
         without connecting. The deadline runs from the first lock acquisition.
@@ -872,22 +895,28 @@ class PanelManager:
                 except TimeoutError:
                     raise _PanelConnectFailed(budget.failure, budget.attempts) from None
             try:
-                if self._shutting_down:
+                if self._shutting_down or self.hass.is_stopping:
                     raise _PanelConnectFailed(budget.failure, budget.attempts, shutdown=True)
                 if budget.attempts > 0 and _connect_retry_clock() > budget.deadline:
                     raise _PanelConnectFailed(budget.failure, budget.attempts)
                 budget.attempts += 1
+                await self._async_write_update_window("connect", budget)
                 try:
-                    shell = await self._connect_for_repair(
-                        trace, allow_repin=not budget.connected_once
-                    )
+                    shell = await self._connect_for_repair(trace)
                 except (OSError, asyncssh.Error) as error:
                     failure: OSError | asyncssh.Error = error
                     budget.failure = error
                 else:
-                    self._set_update_retry(None)
-                    yield shell
-                    return
+                    try:
+                        if self._shutting_down or self.hass.is_stopping:
+                            raise _PanelConnectFailed(
+                                budget.failure, budget.attempts, shutdown=True
+                            )
+                        self._set_update_retry(None)
+                        yield shell
+                        return
+                    finally:
+                        budget.close_ok = await self._async_close_shell(shell)
             finally:
                 self._ssh_lock.release()
             _log_connect_failure(self.panel, failure)
@@ -898,11 +927,9 @@ class PanelManager:
             )
             if reason is None:
                 raise _PanelConnectFailed(failure, budget.attempts, permanent=True) from None
-            await self._async_update_backoff(budget, "connect", reason)
+            await self._async_update_backoff(budget, reason)
 
-    async def _async_update_backoff(
-        self, budget: _UpdateRetryBudget, stage: Literal["connect", "admission"], reason: str
-    ) -> None:
+    async def _async_update_backoff(self, budget: _UpdateRetryBudget, reason: str) -> None:
         """Wait before the next attempt of the shared budget, or give up.
 
         Raises ``_PanelConnectFailed`` when the attempts are spent, the backoff would
@@ -919,31 +946,17 @@ class PanelManager:
         deadline = budget.deadline if budget.deadline is not None else now
         if now + delay > deadline:
             raise _PanelConnectFailed(budget.failure, attempt)
-        if stage == "connect":
-            _LOGGER.warning(
-                "%s: agent update connect attempt %d/%d failed (%s); retrying in %.1f s",
-                self.panel,
-                attempt,
-                _CONNECT_RETRY_MAX_ATTEMPTS,
-                reason,
-                delay,
-            )
-        else:
-            _LOGGER.warning(
-                "%s: agent update %s attempt %d/%d lost the panel connection (%s); "
-                "retrying in %.1f s",
-                self.panel,
-                stage,
-                attempt,
-                _CONNECT_RETRY_MAX_ATTEMPTS,
-                reason,
-                delay,
-            )
-            # A resumed admission starts over: no completed work is shown meanwhile.
-            self._set_update_progress(10)
+        _LOGGER.warning(
+            "%s: agent update connect attempt %d/%d failed (%s); retrying in %.1f s",
+            self.panel,
+            attempt,
+            _CONNECT_RETRY_MAX_ATTEMPTS,
+            reason,
+            delay,
+        )
         self._set_update_retry(
             {
-                "stage": stage,
+                "stage": "connect",
                 "attempt": attempt,
                 "max_attempts": _CONNECT_RETRY_MAX_ATTEMPTS,
                 "reason": reason,
@@ -951,13 +964,13 @@ class PanelManager:
                 "next_attempt_at": wall_clock_in(now + delay, now).isoformat(),
             }
         )
-        await self._async_write_update_window(stage, budget)
+        await self._async_write_update_window("connect", budget)
         await _connect_retry_sleep(delay)
         if self._shutting_down:
             raise _PanelConnectFailed(budget.failure, attempt, shutdown=True)
 
     async def _async_write_update_window(
-        self, stage: Literal["connect", "admission"], budget: _UpdateRetryBudget
+        self, stage: Literal["connect", "admission", "outcome_unknown"], budget: _UpdateRetryBudget
     ) -> None:
         """Best-effort durable window record (see update_intent)."""
         now = _connect_retry_clock()
@@ -966,10 +979,18 @@ class PanelManager:
             now,
         )
         try:
-            await self._interrupted.async_begin_window(
+            recorded = await self._interrupted.async_begin_window(
                 stage, budget.attempts, _CONNECT_RETRY_MAX_ATTEMPTS, deadline
             )
+            if stage == "outcome_unknown" and not recorded:
+                raise ValueError("update_target_unreadable")
         except Exception as error:
+            if stage == "outcome_unknown":
+                raise _UpdateFailed(
+                    "admission",
+                    "provisioning_recovery_required",
+                    "Update admission could not be durably guarded; check storage and payload",
+                ) from None
             _LOGGER.warning(
                 "%s: update window could not be recorded (%s)", self.panel, type(error).__name__
             )
@@ -1066,6 +1087,10 @@ class PanelManager:
         # Latch shutdown FIRST: a repair wedged in the ssh_lock checks this flag
         # before (re-)arming a timer, so it cannot schedule one past this cancel.
         self._shutting_down = True
+        update = self._update_task
+        if update is not None and update is not asyncio.current_task() and not update.done():
+            update.cancel()
+            await asyncio.gather(update, return_exceptions=True)
         # Cancel any in-flight timers BEFORE dropping the subscriptions so an entry
         # unload (or reload) never leaves a grace/recovery callback dangling.
         failures: list[BaseException] = []
@@ -2000,6 +2025,7 @@ class PanelManager:
         progress: Callable[[int], None] | None = None,
         *,
         release_override: Mapping[str, object] | None = None,
+        expected_target: UpdateTarget | None = None,
     ) -> None:
         """Push the bundled agent payload, refresh configs, restart, verify via LWT.
 
@@ -2018,13 +2044,12 @@ class PanelManager:
         update inside a repair's recovery window can't orphan a timer that would
         outlive shutdown (facet a).
 
-        Retries (#219) draw on ONE budget (attempts + deadline): a transient connect
-        failure and a session lost during release admission are retried; nothing
-        after admission is ever re-run. While in the connect/admission window a
-        durable record lets an HA stop surface the interrupted update as a Repair; it
-        is cleared before baseline capture and on every terminal outcome, kept on
-        cancellation or an unload stop, and always cleared before ``_repairing`` is
-        released.
+        Only the initial connect retries, within five attempts and 120 seconds.
+        A private intent preserves the exact target through Repair Retry. Before
+        admission can publish anything, a strict durable unknown-outcome guard
+        prevents another management writer after loss or restart. The journal
+        takes ownership before deployment. Unknown work requires operator
+        settlement; admission, capture and activation are never repeated.
 
         Unlike async_repair (timers/button → swallow + escalate), this runs only from
         the update.install service call, so on failure it escalates AND re-raises as
@@ -2036,6 +2061,7 @@ class PanelManager:
                 translation_domain=DOMAIN, translation_key="already_in_progress"
             )
         self._repairing = True
+        self._update_task = asyncio.current_task()
         # Cancel any pending grace timer (as async_repair does) so an outage that armed
         # it can't fire a spurious needs_attention during this update's recovery window.
         self._cancel("_grace_cancel")
@@ -2044,17 +2070,54 @@ class PanelManager:
         keep_window = False
         try:
             try:
-                await self._async_run_update(release_override)
+                try:
+                    saved = await update_intent_store(self.hass).async_get(self.management_id)
+                except Exception:
+                    keep_window = True
+                    raise _UpdateFailed(
+                        "admission",
+                        "provisioning_recovery_required",
+                        "Update intent storage is unreadable; establish recovery state first",
+                    ) from None
+                if saved is not None and saved.stage == "outcome_unknown":
+                    keep_window = True
+                    raise _UpdateFailed(
+                        "admission",
+                        "mutation_outcome_unknown",
+                        "Prior command outcome unknown; establish remote settlement externally; "
+                        "see docs/canary-rollback.md",
+                    )
+                await self._async_run_update(release_override, expected_target)
             except _UpdateFailed as failed:
                 # An unload stop keeps the window: that is the HA-restart case.
-                keep_window = failed.code == "update_stopped"
+                keep_window = keep_window or failed.code in {
+                    "update_stopped",
+                    "mutation_outcome_unknown",
+                }
                 raise self._update_failure(failed) from None
+            except (PanelOpError, ProvisioningJournalError) as error:
+                keep_window = True
+                raise self._update_failure(
+                    _UpdateFailed(
+                        "admission",
+                        _update_error_code("admission", error),
+                        _safe_failure_summary("agent update requires operator recovery", error),
+                    )
+                ) from None
             except asyncio.CancelledError:
                 keep_window = True
+                if self._shutting_down:
+                    raise self._update_failure(
+                        _UpdateFailed(
+                            "connect", "update_stopped", _UNLOADING_SUMMARY, escalate=False
+                        )
+                    ) from None
                 raise
         finally:
             try:
-                if not keep_window:
+                if not keep_window and not (
+                    self._update_budget is not None and self._update_budget.admission_started
+                ):
                     await self._async_end_update_window()
             finally:
                 self._update_progress_callback = None
@@ -2062,6 +2125,7 @@ class PanelManager:
                 self.update_progress = None
                 self._set_update_retry(None)
                 self._repairing = False
+                self._update_task = None
 
     def _update_failure(self, failed: _UpdateFailed) -> HomeAssistantError:
         """Record the typed final error, escalate, and build the service error."""
@@ -2085,13 +2149,6 @@ class PanelManager:
             # The entry is unloading/reloading — not a panel fault, so no Repair
             # issue; the service call still reports the stop.
             return _UpdateFailed("connect", "update_stopped", _UNLOADING_SUMMARY, escalate=False)
-        if budget.connected_once and not failed.permanent:
-            # Lock timeout, deadline or exhausted budget after a lost admission.
-            return _UpdateFailed(
-                "admission",
-                "admission_connection_lost",
-                _after_attempts(_ADMISSION_LOST_SUMMARY, failed.attempts),
-            )
         summary = _CONNECT_SUMMARY
         if failed.attempts > 1:
             summary = f"{summary} after {failed.attempts} attempts"
@@ -2099,7 +2156,11 @@ class PanelManager:
             "connect", "connect_failed", _safe_failure_summary(summary, failed.error)
         )
 
-    async def _async_run_update(self, release_override: Mapping[str, object] | None) -> None:
+    async def _async_run_update(
+        self,
+        release_override: Mapping[str, object] | None,
+        expected_target: UpdateTarget | None = None,
+    ) -> None:
         self._set_update_progress(10)
         try:
             version = await self._payload_version()
@@ -2109,8 +2170,11 @@ class PanelManager:
                 "payload_unreadable",
                 _safe_failure_summary("agent update could not read the bundled release", error),
             ) from None
-        target = await self.async_update_target()
-        if target is not None and target.version != version:
+        current = await self.async_update_target()
+        target = expected_target if expected_target is not None else current
+        if (expected_target is not None and current != expected_target) or (
+            target is not None and target.version != version
+        ):
             raise _UpdateFailed(
                 "admission", "release_candidate_changed", _CANDIDATE_CHANGED_SUMMARY
             )
@@ -2118,35 +2182,10 @@ class PanelManager:
         self._interrupted.bind_target(target)
         self._update_budget = budget
         await self._async_write_update_window("connect", budget)
-        resumed = False
-        while True:
-            if resumed:
-                # A resumed admission must admit exactly the release first targeted.
-                current = await self.async_update_target()
-                if current is None:
-                    raise _UpdateFailed(
-                        "admission",
-                        "admission_connection_lost",
-                        _ADMISSION_LOST_SUMMARY,
-                    )
-                if current != target:
-                    raise _UpdateFailed(
-                        "admission", "release_candidate_changed", _CANDIDATE_CHANGED_SUMMARY
-                    )
-            try:
-                attempt = await self._async_update_attempt(budget, version, release_override)
-                if attempt.outcome != "resume":
-                    break
-                if target is None:  # unreadable payload: nothing to compare a resume to
-                    raise _UpdateFailed(
-                        "admission",
-                        "admission_connection_lost",
-                        _ADMISSION_LOST_SUMMARY,
-                    )
-                await self._async_update_backoff(budget, "admission", "connection_lost")
-            except _PanelConnectFailed as failed:
-                raise self._connect_failure(failed, budget) from None
-            resumed = True
+        try:
+            attempt = await self._async_update_attempt(budget, version, release_override)
+        except _PanelConnectFailed as failed:
+            raise self._connect_failure(failed, budget) from None
         if attempt.outcome == "noop":
             return
         self._set_update_progress(100)
@@ -2158,17 +2197,6 @@ class PanelManager:
         # _arm_recovery cancels any prior pending recovery handle itself, so a repair's
         # timer (if this update lands in its window) can't be orphaned.
         self._arm_recovery("update")
-
-    async def _async_admission_resumable(
-        self, release_override: Mapping[str, object] | None
-    ) -> bool:
-        """Whether a lost admission may be resumed. Call under the fleet SSH lock."""
-        if release_override is not None:
-            return False
-        try:
-            return await ProvisioningJournal(self.hass).async_load() is None
-        except Exception:
-            return False  # an unreadable journal counts as present
 
     async def _async_update_attempt(
         self,
@@ -2186,7 +2214,7 @@ class PanelManager:
                     self._async_locked_update_connect(budget)
                 )
             except _HostKeyChanged:
-                # A rotated host key with auto-re-pin OFF (or a resumed update): never
+                # A rotated host key with auto-re-pin OFF: never
                 # offer the password to the new-key host. Service-call context →
                 # escalate AND raise so HA reports the install as failed.
                 raise _UpdateFailed(
@@ -2195,15 +2223,25 @@ class PanelManager:
                     self._host_key_changed_guidance(),
                     translation_key="host_key_changed",
                 ) from None
-            budget.connected_once = True
             self._set_update_progress(25)
             await self._async_write_update_window("admission", budget)
+            if self._shutting_down or self.hass.is_stopping:
+                raise _UpdateFailed(
+                    "admission", "update_stopped", _UNLOADING_SUMMARY, escalate=False
+                )
             stage = "admission"
             retirement_result: bool | None = None
             try:
                 if budget.target is None and budget.attempts > 1:
                     raise _UpdateFailed(
                         "admission", "admission_connection_lost", _ADMISSION_LOST_SUMMARY
+                    )
+                # Audit publication makes admission a single attempt.
+                await self._async_write_update_window("outcome_unknown", budget)
+                budget.admission_started = True
+                if self._shutting_down or self.hass.is_stopping:
+                    raise _UpdateFailed(
+                        "admission", "update_stopped", _UNLOADING_SUMMARY, escalate=False
                     )
                 async with panel_ops.release_transaction(
                     shell,
@@ -2218,12 +2256,22 @@ class PanelManager:
                         and update_target_from_candidate(admission.candidate) != budget.target
                     ):
                         raise PanelOpError("release_candidate_changed")
+                    if self._shutting_down or self.hass.is_stopping:
+                        raise _UpdateFailed(
+                            "admission", "update_stopped", _UNLOADING_SUMMARY, escalate=False
+                        )
                     if admission.noop:
+                        budget.admission_started = False
                         return _UpdateAttempt("noop")
-                    # Never resumed past this point: the journal owns recovery.
-                    await self._async_end_update_window()
                     stage = "baseline"
                     async with self._async_canary_update(shell, version) as transaction:
+                        # The durable provisioning guard now owns this transaction.
+                        await self._async_end_update_window()
+                        budget.admission_started = False
+                        if self._shutting_down or self.hass.is_stopping:
+                            raise _UpdateFailed(
+                                "deployment", "update_stopped", _UNLOADING_SUMMARY, escalate=False
+                            )
                         stage = "deployment"
                         unit = await self._unit_contents()
                         env = await self._async_stage_broker_ca(shell)
@@ -2254,21 +2302,34 @@ class PanelManager:
                                 "Legacy HA mirror retirement could not be verified"
                             )
                         self._set_update_progress(95)
-            except (OSError, asyncssh.Error, PanelOpError) as err:
+            except (
+                OSError,
+                asyncssh.Error,
+                PanelOpError,
+                PanelHealthError,
+                ProvisioningJournalError,
+            ) as err:
                 lost = shell.transport_lost()
-                if stage in _RESUMABLE_UPDATE_STAGES and lost:
-                    if release_override is not None:
-                        raise _UpdateFailed(
-                            stage,
-                            "release_override_used_or_write_failed",
-                            _ADMISSION_OVERRIDE_LOST_SUMMARY,
-                        ) from None
-                    if await self._async_admission_resumable(release_override):
-                        return _UpdateAttempt("resume", stage)
+                if budget.admission_started and not lost and not shell.mutation_outcome_unknown():
+                    # Acknowledged commands plus a known local refusal leave no
+                    # outstanding writer. Preserve any independent journal guard.
+                    try:
+                        active = await ProvisioningJournal(self.hass).async_load()
+                    except Exception:
+                        active = None
+                    else:
+                        if (
+                            active is None
+                            or active.last_error is None
+                            or active.last_error.code != "mutation_outcome_unknown"
+                        ):
+                            budget.admission_started = False
+                if budget.admission_started and (lost or shell.mutation_outcome_unknown()):
                     raise _UpdateFailed(
                         stage,
-                        "admission_connection_lost",
-                        _ADMISSION_LOST_SUMMARY,
+                        "mutation_outcome_unknown",
+                        "Command outcome unknown; establish remote settlement externally; "
+                        "see docs/canary-rollback.md",
                     ) from None
                 if stage == "baseline" and lost:
                     if await self.async_journal_owns_panel():
@@ -2283,9 +2344,7 @@ class PanelManager:
                     _update_error_code(stage, err),
                     _safe_failure_summary("agent update failed during deployment", err),
                 ) from None
-            finally:
-                close_ok = await self._async_close_shell(shell)
-            self._complete_ha_mirror_retirement_after_close(retirement_result, close_ok)
+        self._complete_ha_mirror_retirement_after_close(retirement_result, budget.close_ok)
         return _UpdateAttempt("deployed")
 
     async def async_uninstall(self) -> None:
@@ -2307,8 +2366,9 @@ class PanelManager:
                 raise HomeAssistantError(
                     translation_domain=DOMAIN, translation_key="host_key_changed"
                 ) from None
-            except (OSError, asyncssh.Error) as err:
-                _log_connect_failure(self.panel, err)
+            except (OSError, asyncssh.Error, PanelOpError) as err:
+                if isinstance(err, (OSError, asyncssh.Error)):
+                    _log_connect_failure(self.panel, err)
                 summary = _safe_failure_summary(
                     "agent uninstall could not connect to the panel",
                     err,
@@ -2368,8 +2428,9 @@ class PanelManager:
                 raise HomeAssistantError(
                     translation_domain=DOMAIN, translation_key="host_key_changed"
                 ) from None
-            except (OSError, asyncssh.Error) as err:
-                _log_connect_failure(self.panel, err)
+            except (OSError, asyncssh.Error, PanelOpError) as err:
+                if isinstance(err, (OSError, asyncssh.Error)):
+                    _log_connect_failure(self.panel, err)
                 summary = _safe_failure_summary(
                     "panel reboot could not connect to the panel",
                     err,
@@ -2432,8 +2493,9 @@ class PanelManager:
                 raise HomeAssistantError(
                     translation_domain=DOMAIN, translation_key="host_key_changed"
                 ) from None
-            except (OSError, asyncssh.Error) as err:
-                _log_connect_failure(self.panel, err)
+            except (OSError, asyncssh.Error, PanelOpError) as err:
+                if isinstance(err, (OSError, asyncssh.Error)):
+                    _log_connect_failure(self.panel, err)
                 summary = _safe_failure_summary(
                     "voice satellite could not connect to the panel",
                     err,
@@ -2893,6 +2955,7 @@ class PanelManager:
         """Post-OTA hygiene when the bridge survived: re-write /etc + staged copies."""
         try:
             async with self._ssh_lock:
+                await self._async_assert_update_settled()
                 shell = self._shell()
                 await shell.connect()
                 try:

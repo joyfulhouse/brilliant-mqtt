@@ -1,12 +1,9 @@
-"""Durable record of a pre-mutation agent update window (#219).
+"""Durable requested target, pre-admission Retry and unknown-outcome guard (#219).
 
-An agent update keeps a small record while it is in its retryable window (the
-connect and release-admission stages, before any baseline capture). If Home
-Assistant stops inside that window the record survives and, on the next setup,
-the interrupted update is SURFACED as a fixable Repair issue. It is never
-resumed automatically: the operator chooses Retry (a fresh update with a fresh
-retry budget) or Dismiss. Once baseline capture begins the provisioning journal
-owns recovery, so the record is cleared before that stage.
+Only the nonmutating connect may retry automatically. A stopped connect surfaces
+Retry/Dismiss. Before release admission may publish an audit, the same private
+record becomes a sticky outcome_unknown guard. The guarded provisioning journal
+then takes ownership before deployment; no unknown work resumes automatically.
 """
 
 from __future__ import annotations
@@ -18,18 +15,17 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Literal, Protocol
+from typing import Literal, Protocol
 
 import asyncssh
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import issue_registry as ir
-from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN
 from .panel_ops import PanelOpError, candidate_identities
-from .provisioning_journal import ProvisioningJournal, StoredPanelRequest
+from .provisioning_journal import ProvisioningJournal, Store, StoredPanelRequest
 from .release_identity import ReleaseIdentity
 
 _LOGGER = logging.getLogger(__name__)
@@ -56,7 +52,7 @@ _VERSION = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._+-]{0,127}$")
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _MAX_ATTEMPTS_BOUND = 100
 
-type IntentStage = Literal["connect", "admission"]
+type IntentStage = Literal["connect", "admission", "outcome_unknown"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,7 +144,7 @@ class UpdateIntent:
             or _DIGEST.fullmatch(self.target_digest) is None
             or not isinstance(self.target_set_digest, str)
             or _DIGEST.fullmatch(self.target_set_digest) is None
-            or self.stage not in ("connect", "admission")
+            or self.stage not in ("connect", "admission", "outcome_unknown")
             or not _count(self.attempts, minimum=0)
             or not _count(self.max_attempts, minimum=1)
             or not isinstance(self.started_at, datetime)
@@ -190,7 +186,11 @@ class UpdateIntent:
         started_at = _aware(raw["started_at"])
         deadline = _aware(raw["deadline"])
         stage = raw["stage"]
-        if started_at is None or deadline is None or stage not in ("connect", "admission"):
+        if (
+            started_at is None
+            or deadline is None
+            or stage not in ("connect", "admission", "outcome_unknown")
+        ):
             return None
         try:
             return cls(
@@ -199,7 +199,9 @@ class UpdateIntent:
                 target_ordinal=raw["target_ordinal"],
                 target_digest=raw["target_digest"],
                 target_set_digest=raw["target_set_digest"],
-                stage="connect" if stage == "connect" else "admission",
+                stage="connect"
+                if stage == "connect"
+                else ("admission" if stage == "admission" else "outcome_unknown"),
                 attempts=raw["attempts"],
                 max_attempts=raw["max_attempts"],
                 started_at=started_at,
@@ -214,14 +216,12 @@ class UpdateIntentStore:
 
     Every mutation builds a NEW mapping, awaits ``Store.async_save`` and only then
     replaces the cache, so a save that raises leaves the previous record in place.
-    Honest limit: HA's ``Store`` swallows write I/O errors itself
-    (``helpers/storage.py`` ``_async_handle_write_data`` logs and returns), so a
-    disk failure is NOT observable here; only exceptions raised before the write
-    (for example while serializing) reach the caller.
+    Uses the provisioning journal's strict atomic Store so admission never starts
+    when persistence fails. An unknown outcome is sticky until operator recovery.
     """
 
     def __init__(self, hass: HomeAssistant) -> None:
-        self._store: Store[dict[str, Any]] = Store(
+        self._store = Store(
             hass,
             UPDATE_INTENT_STORAGE_VERSION,
             UPDATE_INTENT_STORAGE_KEY,
@@ -233,10 +233,7 @@ class UpdateIntentStore:
 
     async def _async_records(self) -> dict[str, dict[str, object]]:
         if self._cache is None:
-            try:
-                raw = await self._store.async_load()
-            except HomeAssistantError:
-                raw = None  # unreadable storage: no record survives
+            raw = await self._store.async_load()
             records = raw.get("intents") if isinstance(raw, dict) else None
             self._cache = (
                 {
@@ -256,15 +253,21 @@ class UpdateIntentStore:
     async def async_set(self, key: str, intent: UpdateIntent) -> None:
         async with self._lock:
             records = await self._async_records()
+            current = UpdateIntent.from_dict(records.get(key))
+            if current is not None and current.stage == "outcome_unknown" and current != intent:
+                raise HomeAssistantError("mutation_outcome_unknown")
             updated = {**records, key: intent.as_dict()}
             await self._store.async_save({"intents": updated})
             self._cache = updated
 
-    async def async_clear(self, key: str) -> None:
+    async def async_clear(self, key: str, *, expected: UpdateIntent | None = None) -> None:
         async with self._lock:
             records = await self._async_records()
             if key not in records:
                 return
+            current = UpdateIntent.from_dict(records[key])
+            if current is not None and current.stage == "outcome_unknown" and current != expected:
+                raise HomeAssistantError("mutation_outcome_unknown")
             updated = {name: value for name, value in records.items() if name != key}
             await self._store.async_save({"intents": updated})
             self._cache = updated
@@ -363,7 +366,7 @@ class UpdatePanel(Protocol):
 
     def notify_update_state(self) -> None: ...
 
-    async def async_update_agent(self) -> None: ...
+    async def async_update_agent(self, *, expected_target: UpdateTarget | None = None) -> None: ...
 
 
 class InterruptedUpdates:
@@ -375,6 +378,7 @@ class InterruptedUpdates:
         self._window_started: datetime | None = None
         self._window_target: UpdateTarget | None = None
         self._window_target_bound = False
+        self._window_intent: UpdateIntent | None = None
         self.surfaced: UpdateIntent | None = None
 
     def bind_target(self, target: UpdateTarget | None) -> None:
@@ -414,6 +418,7 @@ class InterruptedUpdates:
             deadline=deadline,
         )
         await self._store.async_set(self._panel.management_id, intent)
+        self._window_intent = intent
         self._drop_surfaced()
         return True
 
@@ -422,7 +427,8 @@ class InterruptedUpdates:
         self._window_started = None
         self._window_target = None
         self._window_target_bound = False
-        await self._store.async_clear(self._panel.management_id)
+        await self._store.async_clear(self._panel.management_id, expected=self._window_intent)
+        self._window_intent = None
         self._drop_surfaced()
 
     def _drop_surfaced(self) -> None:
@@ -438,7 +444,7 @@ class InterruptedUpdates:
             intent = await self._store.async_get(self._panel.management_id)
             if intent is None:
                 return
-            if await self._panel.async_journal_owns_panel():
+            if intent.stage != "outcome_unknown" and await self._panel.async_journal_owns_panel():
                 # The provisioning journal owns recovery of this panel: it wins.
                 await self._store.async_clear(self._panel.management_id)
                 return
@@ -493,6 +499,8 @@ class InterruptedUpdates:
         intent = self.surfaced
         if intent is None:
             return "interrupted_update_unavailable"
+        if intent.stage == "outcome_unknown":
+            return "mutation_outcome_unknown"
         if not intent.matches(await self._panel.async_update_target()):
             return "interrupted_update_target_changed"
         if await self._panel.async_journal_owns_panel():
@@ -504,13 +512,22 @@ class InterruptedUpdates:
         if self._panel.update_running:
             return "already_in_progress"
         self._panel.hass.async_create_task(
-            self._async_run_retry(), f"{DOMAIN}-retry-{self._panel.panel}", eager_start=True
+            self._async_run_retry(
+                UpdateTarget(
+                    intent.target_version,
+                    intent.target_ordinal,
+                    intent.target_digest,
+                    intent.target_set_digest,
+                )
+            ),
+            f"{DOMAIN}-retry-{self._panel.panel}",
+            eager_start=True,
         )
         return None
 
-    async def _async_run_retry(self) -> None:
+    async def _async_run_retry(self, target: UpdateTarget) -> None:
         try:
-            await self._panel.async_update_agent()
+            await self._panel.async_update_agent(expected_target=target)
         except HomeAssistantError:
             pass  # already escalated and recorded by the update itself
 

@@ -12,10 +12,10 @@ import asyncio
 import os
 import posixpath
 import stat
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass
-from functools import partial
-from typing import Protocol, cast
+from functools import partial, wraps
+from typing import Any, Concatenate, Protocol, cast
 
 import asyncssh
 from asyncssh import SFTPAttrs
@@ -27,6 +27,34 @@ _LOGIN_TIMEOUT = 15
 _KEEPALIVE_INTERVAL = 15
 _KEEPALIVE_COUNT_MAX = 3
 _OPERATION_TIMEOUT = 120
+
+
+class MutationMonitor:
+    """Sticky missing-result evidence, including failures hidden by a caller."""
+
+    _mutation_failed = False
+
+    def mutation_outcome_unknown(self) -> bool:
+        return self._mutation_failed
+
+    def mark_mutation_unknown(self) -> None:
+        self._mutation_failed = True
+
+
+def track_remote_result[S: MutationMonitor, **P, T](
+    operation: Callable[Concatenate[S, P], Awaitable[T]],
+) -> Callable[Concatenate[S, P], Coroutine[Any, Any, T]]:
+    """An exception after remote dispatch cannot prove the remote writer stopped."""
+
+    @wraps(operation)
+    async def tracked(self: S, /, *args: P.args, **kwargs: P.kwargs) -> T:
+        try:
+            return await operation(self, *args, **kwargs)
+        except BaseException:
+            self._mutation_failed = True
+            raise
+
+    return tracked
 
 
 _UPLOAD_CHUNK_BYTES = 64 * 1024
@@ -408,6 +436,8 @@ class PanelShell(Protocol):
     def pinned_host_key(self) -> str | None: ...
     def connect_reached_auth(self) -> bool: ...
     def transport_lost(self) -> bool: ...
+    def mutation_outcome_unknown(self) -> bool: ...
+    def mark_mutation_unknown(self) -> None: ...
 
 
 class PanelProcess(Protocol):
@@ -579,7 +609,7 @@ class _AuthProgressClient(asyncssh.SSHClient):
             self._on_transport_lost()
 
 
-class _ShellOperations:
+class _ShellOperations(MutationMonitor):
     """Connected AsyncSSH operations shared by fleet and legacy adapters."""
 
     def __init__(self, host: str, password: str, pinned_host_key: str | None) -> None:
@@ -676,6 +706,7 @@ class _ShellOperations:
             raise RuntimeError("not connected — call connect() first")
         return self._conn
 
+    @track_remote_result
     async def run(self, command: str) -> RunResult:
         conn = self._require_conn()
         result = await conn.run(
@@ -683,12 +714,15 @@ class _ShellOperations:
             check=False,
             timeout=_OPERATION_TIMEOUT,
         )
+        if result.exit_status is None:
+            self.mark_mutation_unknown()
         return RunResult(
             exit_status=result.exit_status if result.exit_status is not None else -1,
             stdout=str(result.stdout or ""),
             stderr=str(result.stderr or ""),
         )
 
+    @track_remote_result
     async def start(self, command: str) -> PanelProcess:
         """Start a bounded binary-output child without retaining its command."""
         conn = self._require_conn()
@@ -715,6 +749,7 @@ class _ShellOperations:
         self._children.add(process)
         return process
 
+    @track_remote_result
     async def put_bytes(self, data: bytes, remote_path: str, mode: int) -> None:
         conn = self._require_conn()
         # asyncssh.SFTPClient is itself an async context manager (not start_sftp_client)
@@ -750,6 +785,7 @@ class _ShellOperations:
                 if idle_timeout is not None:
                     idle_timeout.reschedule(asyncio.get_running_loop().time() + _OPERATION_TIMEOUT)
 
+    @track_remote_result
     async def put_dir(self, local_dir: str, remote_dir: str) -> None:
         conn = self._require_conn()
         async with asyncio.timeout(_OPERATION_TIMEOUT) as idle_timeout:
@@ -783,6 +819,7 @@ class _ShellOperations:
                         )
                         await sftp.chmod(target, entry.mode)
 
+    @track_remote_result
     async def put_file(self, local_path: str, remote_path: str, mode: int) -> None:
         conn = self._require_conn()
         async with asyncio.timeout(_OPERATION_TIMEOUT) as idle_timeout:

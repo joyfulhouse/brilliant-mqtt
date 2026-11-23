@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import shutil
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -67,13 +67,6 @@ def instant_update_connect_retry(monkeypatch: pytest.MonkeyPatch) -> None:
         await asyncio.sleep(0)
 
     monkeypatch.setattr(manager, "_connect_retry_sleep", no_wait)
-    from custom_components.brilliant_mqtt import panel_provisioner
-
-    async def no_backoff(_delay: float, stopping: Callable[[], bool]) -> bool:
-        await asyncio.sleep(0)
-        return not stopping()
-
-    monkeypatch.setattr(panel_provisioner, "_reconnect_backoff", no_backoff)
 
 
 @pytest.fixture
@@ -102,23 +95,6 @@ def durable_journal_store(
 ) -> None:
     """Persist the provisioning journal to a temporary config dir."""
     update_harness.install_durable_store(hass, tmp_path / "ha-config", monkeypatch)
-
-
-@pytest.fixture
-def reconnect_sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
-    """Record the managed-update rollback reconnect backoff (jitter pinned to 1.0)."""
-    from custom_components.brilliant_mqtt import connect_retry, panel_provisioner
-
-    delays: list[float] = []
-
-    async def record(delay: float, stopping: Callable[[], bool]) -> bool:
-        delays.append(delay)
-        await asyncio.sleep(0)
-        return not stopping()
-
-    monkeypatch.setattr(panel_provisioner, "_reconnect_backoff", record)
-    monkeypatch.setattr(connect_retry, "jitter", lambda: 1.0)
-    return delays
 
 
 @pytest.fixture(autouse=True)
