@@ -114,7 +114,6 @@ from custom_components.brilliant_mqtt.panel_provisioner import (
     PanelProvisioningError,
     ProvisionedPanel,
     ProvisioningProgress,
-    panel_snapshot_from_stored,
 )
 from custom_components.brilliant_mqtt.provisioning_journal import (
     ProvisioningJournal,
@@ -5492,6 +5491,7 @@ async def test_v0122_persisted_armed_baseline_can_be_discarded_then_panel_readde
     hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     from custom_components.brilliant_mqtt.provisioning_journal import JOURNAL_STORAGE_KEY
+    from tests.test_panel_ops import _absent_snapshot
     from tests.test_provisioning_journal import _install_real_store
 
     _install_real_store(hass, monkeypatch, tmp_path)
@@ -5532,6 +5532,7 @@ async def test_v0122_persisted_armed_baseline_can_be_discarded_then_panel_readde
     identity = _identity()
     shell = FakeShell(pinned=identity.public_key)
     shell_factory = Mock(return_value=shell)
+    live_snapshot = AsyncMock(return_value=_absent_snapshot())
     baseline_action = AsyncMock()
     candidate_probe = AsyncMock(return_value=RunResult(0, "0", ""))
     form = await hass.config_entries.subentries.async_init(
@@ -5542,11 +5543,7 @@ async def test_v0122_persisted_armed_baseline_can_be_discarded_then_panel_readde
         patch.object(flow_gateway, "_async_inspect_candidate", AsyncMock(return_value=_facts())),
         patch.object(fleet_manager, "async_verify_host_identity", AsyncMock(return_value=identity)),
         patch.object(fleet_manager, "AsyncsshShell", shell_factory),
-        patch.object(
-            panel_ops,
-            "snapshot_panel",
-            AsyncMock(return_value=panel_snapshot_from_stored(retained.record.prior_snapshot)),
-        ),
+        patch.object(panel_ops, "snapshot_panel", live_snapshot),
         patch.object(panel_ops, "_baseline_action", baseline_action),
         patch.object(panel_ops, "_provisioning_run", candidate_probe),
     ):
@@ -5565,6 +5562,7 @@ async def test_v0122_persisted_armed_baseline_can_be_discarded_then_panel_readde
     shell_factory.assert_called_once_with(
         retained.record.panel_request.host, fresh_password, identity.public_key
     )
+    live_snapshot.assert_awaited_once_with(shell)
     assert [call.args[2] for call in baseline_action.await_args_list] == [
         "verify",
         "check_restored",
@@ -5574,6 +5572,14 @@ async def test_v0122_persisted_armed_baseline_can_be_discarded_then_panel_readde
     probe_call = candidate_probe.await_args
     assert probe_call is not None
     assert "BRILLIANT_CANDIDATE_ABSENT" in probe_call.args[1]
+    assert (
+        "/var/brilliant-mqtt/releases/0.11.4--1234567812344abc8def1234567890ab"
+        in (probe_call.args[1])
+    )
+    assert (
+        "/var/brilliant-mqtt/releases/.0.11.4--1234567812344abc8def1234567890ab.tmp"
+        in (probe_call.args[1])
+    )
     assert await ProvisioningJournal(hass).async_retained_records() == ()
     assert not shell.connected
 
