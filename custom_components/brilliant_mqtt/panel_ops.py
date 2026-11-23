@@ -1007,7 +1007,7 @@ def _layout_probe_command(sampling: SnapshotSampling = SNAPSHOT_SAMPLING) -> str
 
     The heredoc runs on the panel's Python 3.10. Each round is ONE batched
     ``systemctl show`` for the three core units; any malformed reading, failed or
-    timed-out call, missed deadline, or round gap over 4 s exits 45 so
+    timed-out call, missed deadline, or observation span over 4 s exits 45 so
     ``snapshot_panel`` fails closed with ``snapshot_probe_failed``.
     """
     legacy_paths = (
@@ -1141,11 +1141,13 @@ def _layout_probe_command(sampling: SnapshotSampling = SNAPSHOT_SAMPLING) -> str
         "        raise SystemExit(45)\n"
         "    if previous_round is not None and round_started - previous_round > maximum_gap:\n"
         "        raise SystemExit(45)\n"
-        "    previous_round = round_started\n"
         "    readings = sample_round()\n"
-        # Bound the reading itself too, not only the gap between round starts.
-        "    if time.monotonic() - previous_round > maximum_gap:\n"
+        # A unit can be read anywhere inside a batched call: bound the whole
+        # previous-start to current-end span, not just each call or start gap.
+        "    earliest_read = round_started if previous_round is None else previous_round\n"
+        "    if time.monotonic() - earliest_read > maximum_gap:\n"
         "        raise SystemExit(45)\n"
+        "    previous_round = round_started\n"
         "    rounds += 1\n"
         "    for (component_id, _), reading in zip(services, readings):\n"
         "        samples[component_id].append('|'.join(reading))\n"
@@ -1336,11 +1338,11 @@ async def snapshot_panel(shell: PanelShell) -> PanelSnapshot:
     """Capture bounded, exact rollback state for the three fleet-owned services.
 
     Each core unit is sampled over a bounded window (see ``SnapshotSampling``).
-    On an installed layout (anything but ABSENT) a crash-looping unit raises
+    A crash-looping unit raises
     ``service_crash_looping`` before any file probe: no safe rollback baseline
     exists for a bridge that cannot stay up, and accepting it would leave a later
-    rollback waiting forever for its health. On an ABSENT layout (no agent files)
-    crash evidence only records the unit as not active.
+    rollback waiting forever for its health. Missing agent files do not prove
+    systemd absence: a loaded, disabled unit can still be auto-restarting.
     """
     layout_result = await _provisioning_run(
         shell,
@@ -1373,9 +1375,7 @@ async def snapshot_panel(shell: PanelShell) -> PanelSnapshot:
     ):
         raise PanelOpError("snapshot_payload_invalid")
     # Crash evidence outranks an unsettled final state on any other unit.
-    if layout is not PanelLayout.ABSENT and any(
-        _crash_looping(samples[component_id]) for component_id in _CORE_COMPONENT_ORDER
-    ):
+    if any(_crash_looping(samples[component_id]) for component_id in _CORE_COMPONENT_ORDER):
         raise PanelOpError("service_crash_looping")
     activities = {
         component_id: classify_service_samples(samples[component_id])
@@ -1497,6 +1497,11 @@ async def capture_baseline(
     # The published archive/pin never authorised a mutation, so retire it now
     # instead of leaving a stranded baseline that blocks this panel.
     finalized, cancellation = await _settled_finalize(shell, captured)
+    if not finalized:
+        _LOGGER.warning(
+            "baseline_capture_interrupted: unused rollback baseline may remain; "
+            "preserve any journal and baseline; see docs/canary-rollback.md"
+        )
     if isinstance(failure, asyncio.CancelledError):
         raise failure
     if cancellation is not None:
@@ -1518,12 +1523,19 @@ async def _settled_finalize(
     swallowed. Past the bound the finalize is cancelled, which terminates the
     remote process and fences the shell (see ``_provisioning_run``).
     """
-    task = asyncio.create_task(
-        asyncio.wait_for(
-            _baseline_action(shell, snapshot, "finalize"),
-            _BASELINE_FINALIZE_SECONDS,
-        )
-    )
+
+    async def finalize() -> bool:
+        # HA reports exceptions from cancelled shields. Keep remote failures
+        # inside this task and report only the sanitized capture outcome.
+        try:
+            await asyncio.wait_for(
+                _baseline_action(shell, snapshot, "finalize"), _BASELINE_FINALIZE_SECONDS
+            )
+        except (Exception, asyncio.CancelledError):
+            return False
+        return True
+
+    task = asyncio.create_task(finalize())
     owner = asyncio.current_task()
     initial_cancellations = owner.cancelling() if owner is not None else 0
     cancellation: asyncio.CancelledError | None = None
@@ -1539,7 +1551,7 @@ async def _settled_finalize(
                 cancellation = error
         except Exception:
             pass
-    finalized = not task.cancelled() and task.exception() is None
+    finalized = not task.cancelled() and task.exception() is None and task.result()
     return finalized, cancellation
 
 

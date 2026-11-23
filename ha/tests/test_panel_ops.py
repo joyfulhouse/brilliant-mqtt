@@ -2939,7 +2939,10 @@ async def test_snapshot_panel_refuses_restart_counter_crash_loop() -> None:
         await panel_ops.snapshot_panel(shell)
 
 
-async def test_snapshot_panel_crash_evidence_on_absent_layout_is_not_active() -> None:
+@pytest.mark.parametrize("component", _CORE_COMPONENTS)
+async def test_snapshot_panel_refuses_crash_evidence_despite_absent_disk_layout(
+    component: str,
+) -> None:
     shell = await _connected(
         FakeShell(
             responses=_snapshot_responses(
@@ -2953,15 +2956,15 @@ async def test_snapshot_panel_crash_evidence_on_absent_layout_is_not_active() ->
                 bridge_state=(False, False),
                 wifi_state=(False, False),
                 bus_state=(False, False),
-                samples={COMPONENT_BRIDGE: _CRASH_LOOP_SAMPLES},
+                samples={component: _CRASH_LOOP_SAMPLES},
             )
         )
     )
 
-    snapshot = await panel_ops.snapshot_panel(shell)
-
-    assert snapshot == _absent_snapshot()
-    assert snapshot.bridge_service.active is False
+    with pytest.raises(panel_ops.PanelOpError, match="^service_crash_looping$"):
+        await panel_ops.snapshot_panel(shell)
+    assert shell.commands == [panel_ops.SNAPSHOT_LAYOUT_COMMAND]
+    assert shell.uploads == []
 
 
 async def test_snapshot_panel_maps_reloading_to_running() -> None:
@@ -4870,7 +4873,7 @@ async def test_settled_finalize_preserves_owner_cancellation(
     ) -> None:
         finalized.set()
 
-    def cancel_at_completion(task: asyncio.Task[None]) -> asyncio.Future[None]:
+    def cancel_at_completion(task: asyncio.Task[bool]) -> asyncio.Future[bool]:
         # Queue owner cancellation before shield's completion callback so the
         # owner resumes after the finalizer has already finished.
         task.add_done_callback(lambda _task: owner.cancel())
@@ -4938,3 +4941,40 @@ async def test_settled_finalize_does_not_resurrect_handled_owner_cancellation(
         assert cancellation is None
     finally:
         owner.uncancel()
+
+
+@pytest.mark.parametrize("phase", ["resnapshot", "finalize"])
+async def test_capture_cancel_plus_finalize_failure_warns_without_secrets(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, phase: str
+) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def resnapshot(_shell: PanelShell) -> panel_ops.PanelSnapshot:
+        if phase == "resnapshot":
+            entered.set()
+            await asyncio.Event().wait()
+        raise panel_ops.PanelOpError("snapshot_probe_failed: SECRET snapshot")
+
+    async def finalize() -> None:
+        if phase == "finalize":
+            entered.set()
+            await release.wait()
+        raise panel_ops.PanelOpError("baseline_finalize_failed: SECRET finalize")
+
+    shell, calls = await _capture_with(monkeypatch, resnapshot, finalize)
+    task = asyncio.create_task(panel_ops.capture_baseline(shell, _release_snapshot()))
+    await entered.wait()
+    task.cancel()
+    release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    warnings = [record for record in caplog.records if record.name == panel_ops.__name__]
+    assert [action for action, _ in calls] == ["finalize"]
+    assert any("baseline_capture_interrupted" in record.getMessage() for record in warnings)
+    assert all(
+        "SECRET" not in record.getMessage() and record.exc_info is None for record in warnings
+    )
+    assert all("SECRET" not in record.getMessage() for record in caplog.records)

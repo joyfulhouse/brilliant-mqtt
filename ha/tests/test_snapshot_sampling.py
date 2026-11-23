@@ -436,6 +436,43 @@ def test_round_gap_over_four_seconds_fails_closed(tmp_path: Path) -> None:
     assert observed["count"] == 2
 
 
+def test_asymmetric_batched_latency_cannot_hide_five_second_restart_wait() -> None:
+    """Run the production sampler with deterministic per-call observation latency."""
+    command = panel_ops._layout_probe_command()
+    body = command.split("\n", 1)[1].rsplit("\nBRILLIANT_MQTT_SNAPSHOT", 1)[0]
+    harness = f"""
+import atexit, json, subprocess, sys, time
+clock = [0.0]
+observations = []
+time.monotonic = lambda: clock[0]
+def sleep(seconds):
+    clock[0] += seconds
+time.sleep = sleep
+def run(arguments, **kwargs):
+    if arguments[1] == 'is-enabled':
+        return subprocess.CompletedProcess(arguments, 0, 'disabled\\n', '')
+    assert arguments[1:8] == ('show', '-p', 'ActiveState', '-p', 'SubState', '-p', 'NRestarts')
+    index = len(observations)
+    duration = [2.60, 2.55][index] if index < 2 else 0
+    # Unit one is observed at the start of round one and end of round two.
+    observations.append(clock[0] if index == 0 else clock[0] + duration)
+    clock[0] += duration
+    block = 'ActiveState=active\\nSubState=running\\nNRestarts=\\n'
+    return subprocess.CompletedProcess(arguments, 0, '\\n'.join([block] * 3), '')
+subprocess.run = run
+atexit.register(lambda: print(json.dumps(observations), file=sys.stderr))
+exec({body!r})
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-c", harness], check=False, capture_output=True, text=True, timeout=15
+    )
+
+    assert result.returncode == 45, result.stdout + result.stderr
+    assert json.loads(result.stderr) == [0, 5.65]
+    assert result.stdout == ""
+
+
 # --- integration-side parser and classifier ------------------------------------
 
 

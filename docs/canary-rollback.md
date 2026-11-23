@@ -221,6 +221,9 @@ and the bounded attempt to remove that capture's unused baseline also failed.
 No candidate mutation was authorized. The baseline may exist without an HA
 retained record, so the named `canary_finalize` action cannot necessarily settle
 it. Uninstall can refuse with `baseline_retained_finalize_first`.
+If the operation is cancelled and cleanup also fails, cancellation propagates
+and a sanitized `baseline_capture_interrupted` warning reports the possible
+stranded baseline. Preserve any existing journal and baseline in this case too.
 
 Restore connectivity, preserve the installation, and collect redacted HA
 diagnostics and read-only service status for maintainer assistance. Settle any

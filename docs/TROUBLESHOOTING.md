@@ -38,10 +38,12 @@ Reset to `LOG_LEVEL=INFO` when done.
 
 The pre-change snapshot samples the bridge and both watchdogs with batched
 `systemctl show` calls for about 13.5 seconds, at 0.5-second intervals. An
-`auto-restart` sample or a restart counter increase of at least two refuses an
-installed layout with `service_crash_looping` before file reads or candidate
-mutation. A final `reloading` state counts as running; unsettled final states,
-malformed readings, timeouts, or gaps over four seconds fail closed with
+`auto-restart` sample or a restart counter increase of at least two refuses the
+snapshot with `service_crash_looping` before file reads or candidate mutation,
+even when agent files are absent: a loaded service can outlive its files.
+A final `reloading` state counts as running; unsettled final states,
+malformed readings, timeouts, or spans from the previous round's start through
+the current round's end over four seconds fail closed with
 `snapshot_probe_failed`. The sampler has a 40-second deadline and 32-round cap.
 Two consecutive all-stopped rounds may end sampling early. Two snapshots add
 about 27 seconds to a typical installed-panel add/update, and rollback
@@ -60,7 +62,8 @@ retry may need a fresh approval; an automatic admission can also be recorded.
 
 If a crash loop starts during baseline capture, the re-snapshot refuses it and
 removes that capture's unused baseline. If removal fails, the error becomes
-`baseline_capture_interrupted`; follow
+`baseline_capture_interrupted`. Cancellation still propagates, with a sanitized
+warning carrying that code if cleanup also fails; follow
 [Interrupted baseline capture](canary-rollback.md#interrupted-baseline-capture).
 
 For an existing HA panel owner, uninstall/re-add is an alternative only after

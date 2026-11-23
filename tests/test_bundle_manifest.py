@@ -477,3 +477,35 @@ def test_finalize_keeps_a_symlinked_pin(tmp_path: Path) -> None:
 
 def test_finalize_without_a_pin_still_retires_the_baseline(tmp_path: Path) -> None:
     assert not os.path.lexists(_finalize_fixture(tmp_path, None))
+
+
+def test_finalize_reads_at_most_33_bytes_and_preserves_oversized_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    read = os.read
+    open_descriptor = os.open
+    sizes: list[int] = []
+    pin_flags: list[int] = []
+
+    def nofollow_open(
+        path: str | Path, flags: int, mode: int = 0o777, *, dir_fd: int | None = None
+    ) -> int:
+        if Path(path).name == ".rollback-retained":
+            pin_flags.append(flags)
+            assert flags & os.O_NOFOLLOW
+            assert flags & os.O_NONBLOCK
+        return open_descriptor(path, flags, mode, dir_fd=dir_fd)
+
+    def bounded_read(descriptor: int, size: int) -> bytes:
+        sizes.append(size)
+        assert size == 33
+        return read(descriptor, size)
+
+    monkeypatch.setattr(os, "read", bounded_read)
+    monkeypatch.setattr(os, "open", nofollow_open)
+    marker = "c" * 32 + "x" * 4096
+    pin = _finalize_fixture(tmp_path, marker)
+
+    assert pin.read_text() == marker
+    assert sizes == [33]
+    assert len(pin_flags) == 1

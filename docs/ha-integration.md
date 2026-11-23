@@ -577,21 +577,22 @@ for the three core services with one batched `systemctl show` every 0.5 seconds.
 While any core service runs it watches for about 13.5 seconds, longer than the
 shipped restart delays (5 seconds for the bridge, 10 seconds for the watchdogs),
 so a restart in that window normally shows up as an `auto-restart` sample
-(a reading slower than 4 seconds fails the probe instead). It stops after about a second once two
-consecutive rounds show every service stopped, and it is hard-bounded at 40
-seconds and 32 rounds. Each install or update on an existing panel takes two
+(the span from the previous round's start through the current round's end must
+not exceed 4 seconds). It stops after about a second once two consecutive rounds
+show every service stopped, and it is hard-bounded at 40 seconds and 32 rounds.
+Each install or update on an existing panel takes two
 snapshots, about 27 seconds. A service whose last sample is `active` or
 `reloading` counts as running; `inactive` or `failed` counts as stopped. A unit
 that showed `auto-restart` (or whose restart counter rose by two or more) is
-crash-looping: on an installed panel the update stops with
+crash-looping: even if agent files are absent, the update stops with
 `service_crash_looping` before any write (see
 [`service_crash_looping`](#service_crash_looping)). A last sample that is still
 transitional (`activating`, `deactivating`) or `unknown`, or any malformed or
 slow reading, fails the probe itself (`snapshot_probe_failed`). Retry once the
-  unit has settled. For an
-installed panel, the baseline capture then requires the bridge to be running and
-`/etc/brilliant-mqtt.env` to exist. If the bridge is stopped or the file is
-missing, it stops with `baseline_correlation_unsupported` before any write. A
+unit has settled. For an installed panel, the baseline capture then requires the
+bridge to be running and `/etc/brilliant-mqtt.env` to exist. If the bridge is
+stopped or the file is missing, it stops with `baseline_correlation_unsupported`
+before any write. A
 panel with no agent layout at all is exempt from the baseline requirement. The
 requirement holds because rollback restarts the restored bridge with the retained
 environment and waits for a fresh MQTT session.
