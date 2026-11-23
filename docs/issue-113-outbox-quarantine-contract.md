@@ -103,8 +103,9 @@ A failure is attributed to the head record only when all of these hold:
   session was acknowledged by the broker.
 - **The head record was sent.** The delivery loop marks it in flight right
   before handing it to the broker.
-- **The connection dropped within 2 s of sending it.** The MQTT adapter fires a
-  connection-lost signal as soon as its reader sees the drop, and the outbox
+- **The connection dropped within 2 s of sending it.** The MQTT adapter observes
+  the pinned aiomqtt transport-disconnected future independently of inbound
+  command dispatch, so a full command lane cannot delay the signal. The outbox
   compares that time with the send time.
 
 The healthy-session signal uses existing per-session QoS-1 traffic; no probe
@@ -134,6 +135,9 @@ clears its evidence.
   `<state file>.quarantine.json`, and not in new state-file fields. After a
   canary rollback, an older agent ignores the sidecar and retries the record
   instead of rejecting its state file.
+- Sidecar version 2 uses fixed-width SHA-256 record identities, including for
+  unbounded bus scene IDs. Version 1 candidate sidecars are ignored with a
+  warning and retried. The main outbox state schema and payload are unchanged.
 - The sidecar is written atomically with the same protocol as the state file:
   temporary file, fsync, rename, 0600 file in a 0700 directory. It goes through
   the same single-threaded state executor, so sidecar and state writes are
@@ -188,7 +192,7 @@ clears its evidence.
   transport. A test pins this.
 - Details go to the bridge meta `diag` object as `diag.outbox`, present only
   while there is evidence: `state` (`quarantined`, `suspect` or `blocked`),
-  `key`, `kind` (`event` or `result`), `payload_bytes`, `payload_sha256`,
+  bounded identity `key`, `kind` (`event` or `result`), `payload_bytes`, `payload_sha256`,
   `failure_count` and `quarantined_at_ms`. Payload contents are never included.
   The meta is republished on each reconcile and resync, so the details can lag
   the status topic by up to one resync interval.
@@ -208,8 +212,10 @@ The on-panel CLI is `python3 -m brilliant_mqtt.outbox_admin`. Usage is in
   lease. A missing, empty or unrecognised marker never proves the agent is
   stopped and never causes a refusal on its own, because the agent itself can
   unlink or rewrite the marker while it runs.
-- `list` prints key, kind, size, sha256, status and failure count for every
-  undelivered record.
+- `list` validates without modifying filesystem metadata, including on read-only
+  storage. It prints identity, kind, size, sha256, status, failure count and a
+  JSON-escaped full `source_key` for every undelivered record. Full bus IDs are
+  available locally only; they never enter MQTT diagnostics or the sidecar.
 - `release <key> <sha256>` clears the evidence so the record is retried.
 - `discard <key> <sha256>` removes a quarantined record. Discarding an event
   also discards the command results that depend on it.
@@ -219,7 +225,11 @@ The on-panel CLI is `python3 -m brilliant_mqtt.outbox_admin`. Usage is in
   and keeps three older generations (`.1` to `.3`). Either action is refused if
   its audit entry cannot be written first, and its outcome is recorded
   afterwards as `release_done` or `discard_done`. A failed sidecar or state
-  write is reported as an error, not a traceback. `list` is read-only and is
+  write is reported as an error, not a traceback. A failure after rename reports
+  the currently visible state separately from unknown crash durability; it
+  never claims that a mutation was rolled back. Inconclusive per-PID process
+  inspection refuses mutations rather than treating the process as absent.
+  `list` is read-only and is
   not audited.
 
 ## Rejected approaches

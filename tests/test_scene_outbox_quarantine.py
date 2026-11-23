@@ -15,10 +15,12 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
+import aiomqtt
 import pytest
 
 from brilliant_mqtt import outbox_quarantine as oq
 from brilliant_mqtt import scene_bridge as scene_bridge_module
+from brilliant_mqtt.bridge import Bridge
 from brilliant_mqtt.diagnostics import ResponseDiagnostics
 from brilliant_mqtt.ha_control_protocol import (
     scene_command_topic,
@@ -26,8 +28,10 @@ from brilliant_mqtt.ha_control_protocol import (
     scene_result_topic,
     transport_status_topic,
 )
+from brilliant_mqtt.mqttio import AioMqttAdapter
 from brilliant_mqtt.scene_bridge import SceneBridge
 from tests.fakes import FakeBus, FakeClockMs, FakeMqtt
+from tests.test_mqttio import _settings
 from tests.test_scene_bridge import (
     _NOW_MS,
     _PANEL,
@@ -45,8 +49,8 @@ _COMMAND_ID = "22222222-2222-4222-8222-222222222222"
 _MANIFEST_TOPIC = "brilliant/office/owned-topics"
 
 
-def _is_poison(topic: str, payload: str) -> bool:
-    return topic == scene_event_topic(_PANEL) and f'"scene_id":"{_POISON_SCENE}"' in payload
+def _is_poison(topic: str, payload: str, scene: str = _POISON_SCENE) -> bool:
+    return topic == scene_event_topic(_PANEL) and f'"scene_id":"{scene}"' in payload
 
 
 class _SessionMqtt(FakeMqtt):
@@ -57,11 +61,13 @@ class _SessionMqtt(FakeMqtt):
         self.mode = mode
         self.poison_offers = 0
         self.release_hold = asyncio.Event()
+        self.poison_scene = _POISON_SCENE
+        self.packet_limit: int | None = None
 
     async def publish(self, topic: str, payload: str, retain: bool = False, qos: int = 0) -> None:
         if self.connection_lost:
             raise ConnectionError("session closed")
-        if qos >= 1 and _is_poison(topic, payload):
+        if qos >= 1 and _is_poison(topic, payload, self.poison_scene):
             self.poison_offers += 1
             if self.mode == "drop":
                 # Mosquitto max_packet_size: the broker closes the connection.
@@ -69,6 +75,12 @@ class _SessionMqtt(FakeMqtt):
                 raise ConnectionError("broker closed the connection")
             if self.mode == "hold":
                 await self.release_hold.wait()
+        if (
+            self.packet_limit is not None
+            and len(topic.encode()) + len(payload.encode()) + 8 > self.packet_limit
+        ):
+            self.drop_connection()
+            raise ConnectionError("broker packet ceiling")
         await super().publish(topic, payload, retain, qos)
 
 
@@ -81,6 +93,8 @@ class _Harness:
         # clock so tests can step either one alone.
         self.monotonic_s = 1_000.0
         self.diagnostics = ResponseDiagnostics()
+        self.poison_scene = _POISON_SCENE
+        self.packet_limit: int | None = None
 
     async def session(
         self,
@@ -97,10 +111,16 @@ class _Harness:
             ],
         )
         mqtt = _SessionMqtt(mode)
+        mqtt.poison_scene = self.poison_scene
+        mqtt.packet_limit = self.packet_limit
         if healthy:
             # The retained-ownership manifest every session publishes at QoS 1
             # before the scene bridge starts: existing per-session traffic.
             await mqtt.publish(_MANIFEST_TOPIC, "{}", retain=True, qos=1)
+        if self.packet_limit is not None:
+            # Production publishes panel metadata before starting the scene outbox.
+            panel_bridge = Bridge(bus, mqtt, _PANEL, diagnostics=self.diagnostics)
+            await panel_bridge.reconcile()
         bridge = SceneBridge(
             bus,
             mqtt,
@@ -121,7 +141,7 @@ class _Harness:
 
     def suspect(self) -> oq.SuspectRecord | None:
         for key, value in self.quarantine().suspects:
-            if _POISON_SCENE in key:
+            if key.startswith("event:"):
                 return value
         return None
 
@@ -257,7 +277,9 @@ async def test_quarantined_record_halts_outbox_without_churn_and_survives_restar
     assert isinstance(outbox, dict)
     assert outbox["state"] == "quarantined"
     assert outbox["kind"] == "event"
-    assert isinstance(outbox["key"], str) and _POISON_SCENE in outbox["key"]
+    original_key = next(key for key in stored["events"] if _POISON_SCENE in key)
+    assert outbox["key"] == oq.event_record_key(original_key)
+    assert _POISON_SCENE not in outbox["key"]
     assert outbox["failure_count"] == 3
     assert outbox["quarantined_at_ms"] == _NOW_MS + 60_000
     poison_payload = next(
@@ -508,4 +530,64 @@ async def test_shutdown_right_after_a_drop_waits_for_the_evidence(
     mqtt.drop_connection()
     await bridge.async_shutdown()
 
+    assert _failures(harness) == 1
+
+
+async def test_long_poison_identity_never_poisoned_metadata_or_sidecar(tmp_path: Path) -> None:
+    harness = _Harness(tmp_path)
+    long_scene = _POISON_SCENE + "s" * 65_536
+    harness.poison_scene = long_scene
+    harness.packet_limit = 4096
+    for index in range(3):
+        bridge, bus, mqtt = await harness.session("size")
+        if index == 0:
+            await bus.emit(_execution(long_scene, harness.clock.now_ms))
+        await _offered(mqtt)
+        await _failures_reach(harness, index + 1)
+        assert len(json.dumps(harness.diagnostics.meta())) < 2048
+        await bridge.async_shutdown()
+        await harness.clock.advance_ms(30_000)
+    bridge, _, mqtt = await harness.session("size")
+    try:
+        await asyncio.sleep(0.05)
+        assert mqtt.poison_offers == 0
+        assert _last_status(mqtt, "scene")["reason"] == "outbox_quarantine"
+    finally:
+        await bridge.async_shutdown()
+
+
+async def test_backpressured_transport_attributes_exactly_one_prompt_drop(tmp_path: Path) -> None:
+    harness = _Harness(tmp_path)
+    bridge, bus, mqtt = await harness.session("hold")
+    adapter = AioMqttAdapter(_settings(tls_enabled=False))
+    adapter._acknowledged_qos1 = 1
+    bridge._session_signals = adapter
+    adapter.on_connection_lost(bridge._connection_lost_callback)
+    release = asyncio.Event()
+    started = asyncio.Event()
+
+    async def hold(topic: str, payload: str, retained: bool) -> None:
+        started.set()
+        await release.wait()
+
+    adapter.on_message(hold)
+    for index in range(10):
+        adapter._client._queue.put_nowait(
+            aiomqtt.Message(scene_command_topic(_PANEL), b"{}", 0, False, index, None)
+        )
+    reader = asyncio.create_task(adapter._read_loop())
+    try:
+        await asyncio.wait_for(started.wait(), 2)
+        await _until(adapter._client._queue.empty, "backpressured inbound lane")
+        await bus.emit(_execution(_POISON_SCENE, harness.clock.now_ms))
+        await _offered(mqtt)
+        adapter._client._disconnected.set_result(None)
+        await _failures_reach(harness, 1)
+        assert not release.is_set()
+        harness.monotonic_s += 3.0
+    finally:
+        release.set()
+        with pytest.raises(aiomqtt.MqttError):
+            await asyncio.wait_for(reader, 5)
+        await bridge.async_shutdown()
     assert _failures(harness) == 1

@@ -954,6 +954,11 @@ class AioMqttAdapter:
         retains strict ordering.
         """
         dispatcher = self._get_topic_dispatcher()
+        # aiomqtt 2.5.1's pinned transport future completes even while dispatch
+        # is backpressured. Its iterator alone cannot time a broker disconnect.
+        disconnected = getattr(self._client, "_disconnected", None)
+        if isinstance(disconnected, asyncio.Future):
+            disconnected.add_done_callback(self._transport_disconnected)
         broker_dropped = False
         try:
             messages = self._client.messages.__aiter__()
@@ -1029,13 +1034,20 @@ class AioMqttAdapter:
                     latest_wins=_is_latest_wins_topic(topic),
                 )
         finally:
-            # aiomqtt's message iterator raises as soon as the broker link drops,
-            # so this is the earliest observation of an unexpected session loss.
-            # Fire before the (possibly slow) dispatcher drain so the drop is
-            # timed against the in-flight publish, not against teardown.
+            if isinstance(disconnected, asyncio.Future):
+                disconnected.remove_done_callback(self._transport_disconnected)
+            # Retain the iterator fallback for protocol doubles without the
+            # transport future. Production normally fired its callback earlier.
             if broker_dropped and not self._closing and not self._closed:
                 self._fire_connection_lost()
             await dispatcher.shutdown()
+
+    def _transport_disconnected(self, disconnected: asyncio.Future[None]) -> None:
+        if disconnected.cancelled():
+            return
+        disconnected.exception()
+        if not self._closing and not self._closed:
+            self._fire_connection_lost()
 
     def _fire_connection_lost(self) -> None:
         if self._connection_lost_fired:

@@ -27,7 +27,7 @@ from brilliant_mqtt.scene_state import StateKey, atomic_write_private_file
 
 logger = logging.getLogger(__name__)
 
-SIDECAR_VERSION = 1
+SIDECAR_VERSION = 2
 MAX_SIDECAR_BYTES = 64 * 1024
 # A connection drop counts against the in-flight head record only when it is
 # observed within this window after the record was handed to the broker.
@@ -84,25 +84,25 @@ class QuarantineState:
 
 
 def event_record_key(event_key: str) -> str:
-    """Return the namespaced quarantine key for one outbox event."""
-    return f"{_EVENT_PREFIX}{event_key}"
+    """Return a bounded identity; bus-provided event IDs have no length bound."""
+    return f"{_EVENT_PREFIX}{payload_sha256(event_key)}"
 
 
 def result_record_key(kind: str, command_id: str) -> str:
     """Return the namespaced quarantine key for one outbox command result."""
-    return f"{_RESULT_PREFIX}{kind}:{command_id}"
+    return f"{_RESULT_PREFIX}{kind}:{payload_sha256(command_id)}"
 
 
 ParsedRecordKey = tuple[Literal["event"], str] | tuple[Literal["result"], StateKey]
 
 
 def parse_record_key(record: str) -> ParsedRecordKey:
-    """Split a namespaced key into its outbox map and native key, or raise ValueError."""
-    if record.startswith(_EVENT_PREFIX) and len(record) > len(_EVENT_PREFIX):
+    """Split a bounded identity into its kind and digest, or raise ValueError."""
+    if record.startswith(_EVENT_PREFIX) and _is_sha256(record[len(_EVENT_PREFIX) :]):
         return ("event", record[len(_EVENT_PREFIX) :])
     if record.startswith(_RESULT_PREFIX):
         kind, separator, command_id = record[len(_RESULT_PREFIX) :].partition(":")
-        if separator and command_id and kind in ("scene", "mode"):
+        if separator and _is_sha256(command_id) and kind in ("scene", "mode"):
             return ("result", (cast(Literal["scene", "mode"], kind), command_id))
     raise ValueError("invalid outbox record key")
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import stat
@@ -23,13 +24,15 @@ def _fail(
     return oq.record_attributed_failure(state, _EVENT, sha, session, at_ms)
 
 
-def test_record_keys_are_namespaced_and_round_trip() -> None:
-    assert _EVENT == "event:scene:office:all_off:1700000000000"
-    assert _RESULT == "result:scene:22222222-2222-4222-8222-222222222222"
-    assert oq.parse_record_key(_EVENT) == ("event", "scene:office:all_off:1700000000000")
+def test_record_keys_are_namespaced_hashes_and_round_trip() -> None:
+    event_digest = hashlib.sha256(b"scene:office:all_off:1700000000000").hexdigest()
+    result_digest = hashlib.sha256(b"22222222-2222-4222-8222-222222222222").hexdigest()
+    assert _EVENT == f"event:{event_digest}"
+    assert _RESULT == f"result:scene:{result_digest}"
+    assert oq.parse_record_key(_EVENT) == ("event", event_digest)
     assert oq.parse_record_key(_RESULT) == (
         "result",
-        ("scene", "22222222-2222-4222-8222-222222222222"),
+        ("scene", result_digest),
     )
     for bad in ("", "event:", "result:scene", "result:light:x", "other:x"):
         with pytest.raises(ValueError):
@@ -40,6 +43,22 @@ def test_payload_hash_is_sha256_of_utf8_payload() -> None:
     assert oq.payload_sha256("{}") == (
         "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
     )
+
+
+def test_long_record_identities_fit_the_bounded_sidecar(tmp_path: Path) -> None:
+    key = oq.event_record_key("scene:office:" + "s" * 65_536 + ":1")
+    result_key = oq.result_record_key("scene", "c" * 65_536)
+    assert len(key) <= 80
+    assert len(result_key) <= 80
+    state = oq.QuarantineState()
+    for index in range(3):
+        state = oq.record_attributed_failure(state, key, _SHA, str(index), index * 30_000)
+    path = tmp_path / "sidecar.json"
+    oq.write_sidecar(path, state)
+    assert oq.load_sidecar(path) == state
+    assert path.stat().st_size < 1024
+    suspect = state.get(key)
+    assert suspect is not None and suspect.quarantined_at_ms is not None
 
 
 def test_three_failures_in_distinct_sessions_spanning_a_minute_quarantine() -> None:
@@ -202,14 +221,15 @@ def test_missing_sidecar_loads_empty_without_warning(
         b"{corrupt",
         b"\xff\xfe",
         b"[]",
-        json.dumps({"version": 2, "suspects": {}, "blocked": None}).encode(),
-        json.dumps({"version": 1, "suspects": {}}).encode(),
+        json.dumps({"version": 999, "suspects": {}, "blocked": None}).encode(),
+        json.dumps({"version": 1, "suspects": {}, "blocked": None}).encode(),
+        json.dumps({"version": oq.SIDECAR_VERSION, "suspects": {}}).encode(),
         json.dumps(
-            {"version": 1, "suspects": {"bogus": {}}, "blocked": None},
+            {"version": oq.SIDECAR_VERSION, "suspects": {"bogus": {}}, "blocked": None},
         ).encode(),
         json.dumps(
             {
-                "version": 1,
+                "version": oq.SIDECAR_VERSION,
                 "suspects": {
                     _EVENT: {"sha256": "nothex", "failures": [], "quarantined_at_ms": None}
                 },
@@ -218,7 +238,7 @@ def test_missing_sidecar_loads_empty_without_warning(
         ).encode(),
         json.dumps(
             {
-                "version": 1,
+                "version": oq.SIDECAR_VERSION,
                 "suspects": {
                     _EVENT: {
                         "sha256": _SHA,

@@ -550,6 +550,61 @@ class _DroppingMessages:
         raise aiomqtt.MqttError("Disconnected during message iteration")
 
 
+async def test_transport_drop_is_observed_while_inbound_lane_is_full() -> None:
+    adapter = mqttio.AioMqttAdapter(_settings(tls_enabled=False))
+    release = asyncio.Event()
+    started = asyncio.Event()
+    lost = asyncio.Event()
+    calls: list[int] = []
+
+    async def hold(topic: str, payload: str, retained: bool) -> None:
+        started.set()
+        await release.wait()
+
+    def dropped() -> None:
+        calls.append(1)
+        lost.set()
+
+    adapter.on_message(hold)
+    adapter.on_connection_lost(dropped)
+    for index in range(10):
+        adapter._client._queue.put_nowait(
+            aiomqtt.Message(
+                "brilliant/ha-control/v1/scene/command/office", b"{}", 0, False, index, None
+            )
+        )
+    reader = asyncio.create_task(adapter._read_loop())
+    try:
+        await asyncio.wait_for(started.wait(), 2)
+        for _ in range(500):
+            if adapter._client._queue.empty():
+                break
+            await asyncio.sleep(0)
+        assert adapter._client._queue.empty()
+        adapter._client._disconnected.set_result(None)
+        await asyncio.wait_for(lost.wait(), 1)
+        assert not release.is_set()
+    finally:
+        release.set()
+        with pytest.raises(aiomqtt.MqttError):
+            await asyncio.wait_for(reader, 5)
+    assert calls == [1]
+
+
+@pytest.mark.parametrize("state", ["_closing", "_closed"])
+async def test_transport_future_does_not_attribute_intentional_teardown(state: str) -> None:
+    adapter = mqttio.AioMqttAdapter(_settings(tls_enabled=False))
+    calls: list[int] = []
+    adapter.on_connection_lost(lambda: calls.append(1))
+    reader = asyncio.create_task(adapter._read_loop())
+    await asyncio.sleep(0)
+    setattr(adapter, state, True)
+    adapter._client._disconnected.set_result(None)
+    with pytest.raises(aiomqtt.MqttError):
+        await asyncio.wait_for(reader, 5)
+    assert calls == []
+
+
 async def test_unexpected_reader_end_fires_connection_lost_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -386,6 +386,10 @@ systemctl start brilliant-mqtt
 ```
 
 `<key>` and `<sha256>` come from the `list` output, and the hash must match.
+The key is a bounded record digest; the full original identity appears only in
+the local JSON-escaped `source_key` column. Listing works on readable read-only
+storage. If a write reports unknown durability after rename, inspect `list`
+again before deciding whether to retry: the action may already be visible.
 Every release and discard is appended to `scene-watermarks.json.outbox-audit.log`
 next to the state file, and either is refused if that audit entry cannot be
 written. The

@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import fcntl
 import io
 import json
 import os
+import stat
 import subprocess
+import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import cast
@@ -17,11 +20,14 @@ import pytest
 from brilliant_mqtt import outbox_admin
 from brilliant_mqtt import outbox_quarantine as oq
 from brilliant_mqtt.ha_control_protocol import (
+    MAPPING_VERSION,
+    SCHEMA_VERSION,
+    encode_json,
     scene_command_topic,
     scene_event_topic,
     scene_result_topic,
 )
-from brilliant_mqtt.scene_state import load_state
+from brilliant_mqtt.scene_state import SceneState, StateEvent, atomic_write_state, load_state
 from tests.test_scene_bridge import _PANEL, _command, _execution, _published, _wait_for_bus_commands
 from tests.test_scene_outbox_quarantine import (
     _COMMAND_ID,
@@ -127,7 +133,7 @@ async def test_list_shows_key_kind_size_hash_and_status_without_payloads(
 
     assert status == 0
     lines = output.splitlines()
-    assert lines[0] == "key\tkind\tbytes\tsha256\tstatus\tfailures"
+    assert lines[0] == "key\tkind\tbytes\tsha256\tstatus\tfailures\tsource_key"
     rows = {line.split("\t")[0]: line.split("\t") for line in lines[1:]}
     stored = json.loads(harness.path.read_text())
     event_payload = next(iter(stored["events"].values()))["payload"]
@@ -138,12 +144,276 @@ async def test_list_shows_key_kind_size_hash_and_status_without_payloads(
         event_sha,
         "quarantined",
         "3",
+        json.dumps(next(iter(stored["events"]))),
     ]
     assert rows[_RESULT_KEY][1] == "result"
     assert rows[_RESULT_KEY][4] == "pending"
+    assert json.loads(rows[_RESULT_KEY][6]) == f"scene:{_COMMAND_ID}"
     assert event_payload not in output
     # list is read-only and is not audited.
     assert not outbox_admin.audit_log_path(harness.path).exists()
+
+
+@pytest.mark.parametrize("readonly", [False, True])
+async def test_list_never_changes_permissions_or_syncs_storage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, readonly: bool
+) -> None:
+    harness = await _quarantined_with_dependent(tmp_path)
+    harness.path.chmod(0o640)
+    harness.path.parent.chmod(0o750)
+    before = (harness.path.read_bytes(), harness.sidecar.read_bytes())
+    mutations: list[str] = []
+    real_chmod = os.chmod
+    real_fsync = os.fsync
+
+    def chmod(path: str | Path, mode: int) -> None:
+        mutations.append("chmod")
+        if readonly:
+            raise OSError(errno.EROFS, "read-only filesystem")
+        real_chmod(path, mode)
+
+    def fsync(descriptor: int) -> None:
+        mutations.append("fsync")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(os, "chmod", chmod)
+    monkeypatch.setattr(os, "fsync", fsync)
+    code, output = _run(harness, tmp_path, "list")
+
+    assert code == 0
+    assert _event_key(harness)[0] in output
+    assert mutations == []
+    assert stat.S_IMODE(harness.path.stat().st_mode) == 0o640
+    assert stat.S_IMODE(harness.path.parent.stat().st_mode) == 0o750
+    assert (harness.path.read_bytes(), harness.sidecar.read_bytes()) == before
+
+
+def test_list_preserves_full_source_key_with_json_escaping(tmp_path: Path) -> None:
+    harness = _Harness(tmp_path)
+    identifier = 'scene"\\\t\n' + "s" * 4096
+    native = f"scene:{_PANEL}:{identifier}:1000"
+    payload = encode_json(
+        {
+            "schema_version": SCHEMA_VERSION,
+            "mapping_version": MAPPING_VERSION,
+            "panel": _PANEL,
+            "scene_id": identifier,
+            "executed_at_ms": 1000,
+            "deduplication_key": f"{_PANEL}:{identifier}:1000",
+        }
+    )
+    atomic_write_state(
+        harness.path,
+        SceneState(events=((native, StateEvent(scene_event_topic(_PANEL), payload, False, 1000)),)),
+    )
+
+    code, output = _run(harness, tmp_path, "list")
+
+    assert code == 0
+    header, row = output.splitlines()
+    assert header.split("\t") == [
+        "key",
+        "kind",
+        "bytes",
+        "sha256",
+        "status",
+        "failures",
+        "source_key",
+    ]
+    columns = row.split("\t")
+    assert columns[:6] == [
+        oq.event_record_key(native),
+        "event",
+        str(len(payload.encode())),
+        oq.payload_sha256(payload),
+        "pending",
+        "0",
+    ]
+    assert json.loads(columns[6]) == native
+    assert payload not in output
+
+
+@pytest.mark.parametrize("action", ["release", "discard"])
+@pytest.mark.parametrize("failure_errno", [errno.EACCES, errno.EIO])
+async def test_unreadable_pid_cmdline_refuses_without_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    action: str,
+    failure_errno: int,
+) -> None:
+    harness = await _quarantined_with_dependent(tmp_path)
+    record, sha256 = _event_key(harness)
+    proc_root = _proc(tmp_path, (321, _AGENT_CMDLINE))
+    before = (harness.path.read_bytes(), harness.sidecar.read_bytes())
+    real_read = Path.read_bytes
+
+    def read(path: Path) -> bytes:
+        if path == proc_root / "321" / "cmdline":
+            raise OSError(failure_errno, "cannot inspect process")
+        return real_read(path)
+
+    monkeypatch.setattr(Path, "read_bytes", read)
+    code, _ = _run(harness, tmp_path, action, record, sha256, proc_root=proc_root)
+
+    assert code == 1
+    assert "321" in capsys.readouterr().err
+    assert (harness.path.read_bytes(), harness.sidecar.read_bytes()) == before
+    assert not outbox_admin.audit_log_path(harness.path).exists()
+
+
+@pytest.mark.parametrize("failure_errno", [errno.ENOENT, errno.ESRCH])
+def test_vanished_pid_cmdline_does_not_refuse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_errno: int
+) -> None:
+    proc_root = _proc(tmp_path, (321, _AGENT_CMDLINE), (322, b"unrelated\0"))
+    real_read = Path.read_bytes
+
+    def read(path: Path) -> bytes:
+        if path == proc_root / "321" / "cmdline":
+            raise OSError(failure_errno, "process exited")
+        return real_read(path)
+
+    monkeypatch.setattr(Path, "read_bytes", read)
+    assert outbox_admin.running_agent("", systemctl=_stopped, proc_root=proc_root) is None
+
+
+@pytest.mark.parametrize("action", ["release", "discard"])
+@pytest.mark.parametrize("failure_point", ["chmod", "directory_fsync"])
+async def test_postrename_failure_reports_visible_change_with_unknown_durability(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    action: str,
+    failure_point: str,
+) -> None:
+    harness = await _quarantined_with_dependent(tmp_path)
+    record, sha256 = _event_key(harness)
+    target = harness.sidecar if action == "release" else harness.path
+    real_replace, real_chmod, real_fsync = os.replace, os.chmod, os.fsync
+    renamed = False
+    injected = False
+
+    def replace(source: str | Path, destination: str | Path) -> None:
+        nonlocal renamed
+        real_replace(source, destination)
+        if Path(destination) == target:
+            renamed = True
+
+    def chmod(path: str | Path, mode: int) -> None:
+        nonlocal injected
+        if renamed and Path(path) == target and failure_point == "chmod":
+            injected = True
+            raise OSError(errno.EROFS, "post-rename chmod failed")
+        real_chmod(path, mode)
+
+    def fsync(descriptor: int) -> None:
+        nonlocal injected
+        if renamed and stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            if failure_point == "directory_fsync":
+                injected = True
+                raise OSError(errno.EIO, "final directory fsync failed")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(os, "replace", replace)
+    monkeypatch.setattr(os, "chmod", chmod)
+    monkeypatch.setattr(os, "fsync", fsync)
+    code, output = _run(harness, tmp_path, action, record, sha256)
+
+    assert injected and code == 1
+    error = capsys.readouterr().err
+    assert "durability unknown" in error
+    assert "still quarantined" not in error
+    assert "nothing discarded" not in error
+    assert output == ""
+    done = _audit(harness)[-1]
+    assert done["action"] == f"{action}_done"
+    assert done["outcome"] == "visible"
+    assert done["durability"] == "unknown"
+    assert done["visibility"] == ("pending" if action == "release" else "absent")
+    if action == "discard":
+        assert done["dependent_visibility"] == {_RESULT_KEY: "absent"}
+
+    # A new interpreter must observe the replacement, independent of in-memory state.
+    reloaded = await asyncio.to_thread(
+        subprocess.run,
+        [
+            sys.executable,
+            "-c",
+            "import json,sys; from pathlib import Path; "
+            "from brilliant_mqtt.scene_state import load_state; "
+            "from brilliant_mqtt.outbox_quarantine import load_sidecar; "
+            "s=load_state(Path(sys.argv[1]),normalize_permissions=False); "
+            "q=load_sidecar(Path(sys.argv[2])); "
+            "print(json.dumps([s.trusted,len(s.state.events),len(s.state.results),"
+            "q.get(sys.argv[3]) is not None]))",
+            str(harness.path),
+            str(harness.sidecar),
+            record,
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert json.loads(reloaded.stdout) == (
+        [True, 1, 1, False] if action == "release" else [True, 0, 0, True]
+    )
+
+
+@pytest.mark.parametrize("action", ["release", "discard"])
+async def test_write_error_with_invalid_reread_reports_unknown_visibility(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    action: str,
+) -> None:
+    harness = await _quarantined_with_dependent(tmp_path)
+    record, sha256 = _event_key(harness)
+    target = harness.sidecar if action == "release" else harness.path
+    real_replace = os.replace
+
+    def corrupt_on_replace(source: str | Path, destination: str | Path) -> None:
+        real_replace(source, destination)
+        if Path(destination) == target:
+            target.write_bytes(b"{")
+            raise OSError(errno.EIO, "replacement cannot be validated")
+
+    monkeypatch.setattr(os, "replace", corrupt_on_replace)
+    code, output = _run(harness, tmp_path, action, record, sha256)
+
+    assert code == 1 and output == ""
+    error = capsys.readouterr().err
+    assert "unknown; durability unknown" in error
+    assert "still quarantined" not in error and "nothing discarded" not in error
+    done = _audit(harness)[-1]
+    assert done["outcome"] == "unknown"
+    assert done["visibility"] == "unknown"
+    assert done["durability"] == "unknown"
+
+
+async def test_discard_prerename_error_reports_record_and_dependents_still_visible(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    harness = await _quarantined_with_dependent(tmp_path)
+    record, sha256 = _event_key(harness)
+    before = harness.path.read_bytes()
+
+    def refuse_replace(source: str | Path, destination: str | Path) -> None:
+        raise OSError(errno.EROFS, "read-only filesystem")
+
+    monkeypatch.setattr(os, "replace", refuse_replace)
+    code, _ = _run(harness, tmp_path, "discard", record, sha256)
+
+    assert code == 1
+    assert "current visibility: present; durability unknown" in capsys.readouterr().err
+    assert harness.path.read_bytes() == before
+    done = _audit(harness)[-1]
+    assert done["outcome"] == "failed"
+    assert done["visibility"] == "present"
+    assert done["dependent_visibility"] == {_RESULT_KEY: "present"}
+    assert done["durability"] == "unknown"
 
 
 async def test_hash_mismatch_is_refused_without_change(tmp_path: Path) -> None:
@@ -303,6 +573,40 @@ async def test_discard_event_removes_dependent_results_and_is_audited(tmp_path: 
     assert _published(mqtt, scene_event_topic(_PANEL)) == []
     assert _last_status(mqtt, "scene")["available"] is True
     await bridge.async_shutdown()
+
+
+@pytest.mark.parametrize("record_type", ["event", "result"])
+async def test_discard_resolves_native_identity_without_decoding_the_record_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, record_type: str
+) -> None:
+    harness = await _quarantined_with_dependent(tmp_path)
+    record, sha256 = _event_key(harness)
+    if record_type == "result":
+        record, sha256 = _RESULT_KEY, _result_sha(harness)
+        evidence = harness.quarantine()
+        for index in range(3):
+            evidence = oq.record_attributed_failure(
+                evidence, record, sha256, f"result-session-{index}", index * 30_000
+            )
+        oq.write_sidecar(harness.sidecar, evidence)
+
+    # The coordinated sidecar API returns digests; they cannot index native maps.
+    def digest_parser(key: str) -> oq.ParsedRecordKey:
+        kind, native = oq.parse_record_key(key)
+        if kind == "event":
+            return "event", "a" * 64
+        assert isinstance(native, tuple)
+        return "result", (native[0], "a" * 64)
+
+    monkeypatch.setattr(outbox_admin, "parse_record_key", digest_parser)
+    code, _ = _run(harness, tmp_path, "discard", record, sha256)
+
+    assert code == 0
+    loaded = load_state(harness.path)
+    assert loaded.trusted
+    assert loaded.state.results == ()
+    assert len(loaded.state.events) == (0 if record_type == "event" else 1)
+    assert _audit(harness)[-1]["outcome"] == "ok"
 
 
 async def test_discard_is_refused_when_the_audit_write_fails(tmp_path: Path) -> None:
@@ -477,6 +781,8 @@ async def test_release_sidecar_write_failure_is_reported_cleanly(
     entries = _audit(harness)
     assert [item["action"] for item in entries] == ["release", "release_done"]
     assert entries[1]["outcome"] == "failed"
+    assert entries[1]["visibility"] == "quarantined"
+    assert entries[1]["durability"] == "unknown"
     assert harness.suspect() is not None
 
 

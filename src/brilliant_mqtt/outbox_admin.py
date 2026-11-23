@@ -23,7 +23,9 @@ printed or logged.
 from __future__ import annotations
 
 import argparse
+import errno
 import fcntl
+import json
 import os
 import subprocess
 import sys
@@ -36,11 +38,13 @@ from typing import TextIO
 from brilliant_mqtt.config import Settings
 from brilliant_mqtt.ha_control_protocol import encode_json
 from brilliant_mqtt.outbox_quarantine import (
+    MAX_SIDECAR_BYTES,
     QuarantineState,
     clear_record,
     event_record_key,
     load_sidecar,
     parse_record_key,
+    parse_sidecar,
     payload_sha256,
     result_record_key,
     retain_live,
@@ -116,8 +120,13 @@ def _agent_pids(proc_root: Path, own_pid: int) -> list[int]:
             continue
         try:
             raw = (entry / "cmdline").read_bytes()
-        except OSError:
-            continue  # exited meanwhile or unreadable: not evidence of the agent
+        except OSError as error:
+            if error.errno in (errno.ENOENT, errno.ESRCH):
+                continue  # The process exited during inspection.
+            raise AdminRefusal(
+                f"cannot read /proc/{entry.name}/cmdline to rule out a running agent "
+                f"({type(error).__name__})"
+            ) from None
         argv = [part.decode("utf-8", "replace") for part in raw.split(b"\x00") if part]
         if _runs_agent(argv):
             pids.append(int(entry.name))
@@ -194,6 +203,16 @@ def _live(records: Mapping[str, tuple[str, str]]) -> dict[str, str]:
     return {key: payload_sha256(payload) for key, (_, payload) in records.items()}
 
 
+def _source_keys(state: SceneState) -> dict[str, str]:
+    return {
+        **{event_record_key(key): key for key, _ in state.events},
+        **{
+            result_record_key(kind, command_id): f"{kind}:{command_id}"
+            for (kind, command_id), _ in state.results
+        },
+    }
+
+
 def _status(record: str, sha256: str, quarantine: QuarantineState) -> tuple[str, int]:
     suspect = quarantine.get(record)
     if suspect is not None and suspect.sha256 == sha256:
@@ -266,7 +285,7 @@ class _Admin:
         self._clock = clock
 
     def _load(self) -> tuple[SceneState, QuarantineState]:
-        loaded = load_state(self._state_path)
+        loaded = load_state(self._state_path, normalize_permissions=False)
         if not loaded.trusted:
             raise AdminRefusal(f"outbox state {self._state_path} is unreadable or invalid")
         return loaded.state, load_sidecar(self._sidecar)
@@ -316,13 +335,14 @@ class _Admin:
     def list_records(self) -> None:
         state, quarantine = self._load()
         records = _undelivered(state)
-        print("key\tkind\tbytes\tsha256\tstatus\tfailures", file=self._out)
+        sources = _source_keys(state)
+        print("key\tkind\tbytes\tsha256\tstatus\tfailures\tsource_key", file=self._out)
         for record, (record_type, payload) in sorted(records.items()):
             sha256 = payload_sha256(payload)
             status, failures = _status(record, sha256, quarantine)
             print(
                 f"{record}\t{record_type}\t{len(payload.encode('utf-8'))}\t{sha256}\t"
-                f"{status}\t{failures}",
+                f"{status}\t{failures}\t{json.dumps(sources[record])}",
                 file=self._out,
             )
 
@@ -346,10 +366,38 @@ class _Admin:
         try:
             write_sidecar(self._sidecar, released)
         except OSError as error:
-            self._audit_best_effort(self._entry("release_done", key=record, outcome="failed"))
+            # A failed chmod/fsync can follow a successful rename. Re-read without
+            # writes, and keep visibility separate from crash durability.
+            try:
+                with self._sidecar.open("rb") as handle:
+                    content = handle.read(MAX_SIDECAR_BYTES + 1)
+                if len(content) > MAX_SIDECAR_BYTES:
+                    raise ValueError("sidecar exceeds byte limit")
+                current = parse_sidecar(json.loads(content.decode("utf-8")))
+                visibility, _ = _status(record, sha256, current)
+            except FileNotFoundError:
+                visibility = "pending"
+            except (OSError, ValueError):
+                visibility = "unknown"
+            outcome = (
+                "visible"
+                if visibility == "pending"
+                else "unknown"
+                if visibility == "unknown"
+                else "failed"
+            )
+            self._audit_best_effort(
+                self._entry(
+                    "release_done",
+                    key=record,
+                    outcome=outcome,
+                    visibility=visibility,
+                    durability="unknown",
+                )
+            )
             raise AdminRefusal(
                 f"could not write the quarantine sidecar ({type(error).__name__}); "
-                f"{record} is still quarantined"
+                f"{record} current status: {visibility}; durability unknown"
             ) from None
         self._audit_best_effort(self._entry("release_done", key=record, outcome="ok"))
         print(f"released {record}", file=self._out)
@@ -359,11 +407,11 @@ class _Admin:
         status, failures = _status(record, sha256, quarantine)
         if status != "quarantined":
             raise AdminRefusal(f"{record} is not quarantined (only quarantined records)")
-        _, native = parse_record_key(record)
         events = dict(state.events)
         results = dict(state.results)
         dependents: list[str] = []
-        if isinstance(native, str):
+        if record_type == "event":
+            native = next(key for key in events if event_record_key(key) == record)
             events.pop(native)
             for result_key, result in list(results.items()):
                 if result.event_key != native:
@@ -375,7 +423,8 @@ class _Admin:
                     results.pop(result_key)
                     dependents.append(result_record_key(*result_key))
         else:
-            results.pop(native)
+            native_result = next(key for key in results if result_record_key(*key) == record)
+            results.pop(native_result)
         self._audit_or_refuse(
             self._entry(
                 "discard",
@@ -395,11 +444,38 @@ class _Admin:
         try:
             atomic_write_state(self._state_path, discarded)
         except OSError as error:
+            loaded = load_state(self._state_path, normalize_permissions=False)
+            current_keys = _source_keys(loaded.state)
+            visibility = (
+                ("present" if record in current_keys else "absent") if loaded.trusted else "unknown"
+            )
+            dependent_visibility = {
+                key: ("present" if key in current_keys else "absent")
+                if loaded.trusted
+                else "unknown"
+                for key in dependents
+            }
+            outcome = (
+                "visible"
+                if visibility == "absent"
+                else "unknown"
+                if visibility == "unknown"
+                else "failed"
+            )
             self._audit_best_effort(
-                self._entry("discard_done", key=record, dependents=dependents, outcome="failed")
+                self._entry(
+                    "discard_done",
+                    key=record,
+                    dependents=dependents,
+                    outcome=outcome,
+                    visibility=visibility,
+                    dependent_visibility=dependent_visibility,
+                    durability="unknown",
+                )
             )
             raise AdminRefusal(
-                f"could not write the outbox state ({type(error).__name__}); nothing discarded"
+                f"could not write the outbox state ({type(error).__name__}); "
+                f"{record} current visibility: {visibility}; durability unknown"
             ) from None
         cleaned = clear_record(quarantine, record)
         for dependent in dependents:

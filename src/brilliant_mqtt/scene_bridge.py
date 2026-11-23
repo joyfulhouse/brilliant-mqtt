@@ -1588,13 +1588,15 @@ class SceneBridge:
             return None
         payload: str | None = None
         if isinstance(native, str):
-            event = self._events.get(native)
-            if event is not None and not event.delivered:
-                payload = event.payload
+            for event_key, event in self._events.items():
+                if event_record_key(event_key) == record and not event.delivered:
+                    payload = event.payload
+                    break
         else:
-            result = self._results.get(native)
-            if result is not None and not result.delivered:
-                payload = result.payload
+            for result_key, result in self._results.items():
+                if result_record_key(*result_key) == record and not result.delivered:
+                    payload = result.payload
+                    break
         if payload is None or payload_sha256(payload) != sha256:
             return None
         return payload
