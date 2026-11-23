@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -20,6 +21,30 @@ _REPOSITORY_ROOT = Path(__file__).parents[1]
 _SCRIPT = _REPOSITORY_ROOT / "scripts/brilliant-panel/bundle_manifest.py"
 _PAYLOAD = _REPOSITORY_ROOT / "custom_components/brilliant_mqtt/agent_payload"
 _RELEASE_NAME = "0.6.0--0123456789abcdef0123456789abcdef"
+_SYSTEMD_PATHS = (
+    "etc/systemd/system.control",
+    "run/systemd/system.control",
+    "run/systemd/transient",
+    "run/systemd/generator.early",
+    "etc/systemd/system",
+    "etc/systemd/system.attached",
+    "run/systemd/system",
+    "run/systemd/system.attached",
+    "run/systemd/generator",
+    "usr/local/lib/systemd/system",
+    "usr/lib/systemd/system",
+    "lib/systemd/system",
+    "run/systemd/generator.late",
+)
+_STOCK_ENVIRONMENT = (
+    'BRILLIANT_PANEL="test"\nMQTT_HOST="broker.invalid"\nMQTT_PORT=1883\n'
+    'MQTT_USERNAME="test"\nMQTT_PASSWORD="synthetic \\"value\\" \\\\ # $"\n'
+    "MQTT_TLS_ENABLED=0\nMQTT_TLS_CA_FILE=/var/brilliant-mqtt/tls/ca.pem\n"
+    "BRILLIANT_DEPLOYMENT_ID=0123456789abcdef0123456789abcdef\n"
+    "RETAINED_TOPICS_FILE=/var/brilliant-mqtt/retained-topics.json\n"
+    "MESH_PRIORITY=1\nSCENE_BRIDGE_ENABLED=0\nHOT_POLL_SECONDS=5\nRESYNC_SECONDS=300\n"
+    "LOG_LEVEL=INFO\n"
+)
 
 
 def _run(
@@ -473,9 +498,13 @@ def _make_legacy_panel(tmp_path: Path, payload: Path) -> tuple[Path, Path, Path]
     _write(panel / "VERSION", version)
     _write(panel / "wifi_watchdog/VERSION", version)
     _write(panel / "bus_watchdog/VERSION", version)
-    units = tmp_path / "units"
-    units.mkdir()
-    return panel, units, tmp_path / "absent.env"
+    units = tmp_path / "image/etc/systemd/system"
+    units.mkdir(parents=True)
+    for service in ("brilliant-mqtt", "brilliant-wifi-watchdog", "brilliant-bus-watchdog"):
+        shutil.copyfile(_PAYLOAD / (service + ".service"), units / (service + ".service"))
+    env = tmp_path / "image/etc/brilliant-mqtt.env"
+    _write(env, _STOCK_ENVIRONMENT)
+    return panel, units, env
 
 
 def _identity_run(
@@ -701,16 +730,16 @@ def test_missing_installed_component_prints_missing(tmp_path: Path) -> None:
 
 def test_release_link_layout_is_detected(tmp_path: Path) -> None:
     payload = _make_payload(tmp_path)
-    panel = tmp_path / "panel"
+    panel, units, env = _make_legacy_panel(tmp_path, payload)
     release = panel / "releases" / _RELEASE_NAME
     shutil.copytree(payload, release)
     (panel / "current").symlink_to(release)
     shutil.copyfile(payload / "VERSION", panel / "VERSION")
-    units = tmp_path / "units"
-    units.mkdir()
+    for unit in units.glob("*.service"):
+        shutil.copyfile(_PAYLOAD / unit.name.replace(".service", "-release.service"), unit)
     helper = _load_helper()
 
-    result = _identity_run(panel, units, tmp_path / "absent.env", *_COMPONENTS)
+    result = _identity_run(panel, units, env, *_COMPONENTS)
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.splitlines() == [
@@ -752,7 +781,12 @@ def test_unit_code_directives_select_the_actual_tree(
     assert result.returncode == 0, result.stderr
     digest = release_digest if release_unit else fixed_digest
     layout = "release_link" if release_unit else "legacy_fixed"
-    assert result.stdout == f"bridge\t0.11.3\tunknown\t{digest}\t{layout}\n"
+    if decoration.lstrip().startswith(("#", ";")):
+        assert result.stdout == f"bridge\t0.11.3\tunknown\t{digest}\t{layout}\n"
+    else:
+        _assert_unproven(result, "bridge", "unit template differs")
+    admitted = helper.installed_identities(panel, units, env)["bridge"]
+    assert admitted["digest"] == digest and admitted["layout"] == layout
 
 
 @pytest.mark.parametrize(
@@ -775,9 +809,10 @@ def test_unit_with_ambiguous_code_selection_fails(tmp_path: Path, directives: st
 
     result = _identity_run(panel, units, env, "bridge")
 
-    assert result.returncode == 2
-    assert result.stdout == ""
-    assert result.stderr == "bundle-manifest: ambiguous installed code selection\n"
+    _assert_unproven(result, "bridge", "unit template differs")
+    helper = _load_helper()
+    with pytest.raises(helper.ManifestError, match="ambiguous installed code selection"):
+        helper.installed_identities(panel, units, env)
 
 
 @pytest.mark.parametrize(
@@ -804,9 +839,275 @@ def test_unit_code_selection_handles_quotes_continuations_and_execstart(
 
     result = _identity_run(panel, units, env, "bridge")
 
+    _assert_unproven(result, "bridge", "unit template differs")
+    helper = _load_helper()
+    admitted = helper.installed_identities(panel, units, env)["bridge"]
+    assert admitted["digest"] == helper.code_digest(release, "bridge")
+    assert admitted["layout"] == "release_link"
+
+
+def _assert_unproven(result: subprocess.CompletedProcess[str], component: str, reason: str) -> None:
     assert result.returncode == 0, result.stderr
-    digest = _load_helper().code_digest(release, "bridge")
-    assert result.stdout == f"bridge\t0.11.3\tunknown\t{digest}\trelease_link\n"
+    assert result.stdout == f"{component}\tunknown\n"
+    assert result.stderr == f"bundle-manifest: {component} selection unproven ({reason})\n"
+
+
+@pytest.mark.parametrize("component", _COMPONENTS)
+@pytest.mark.parametrize("release_link", [False, True])
+def test_embedded_qualification_templates_match_shipped_sources(
+    component: str, release_link: bool
+) -> None:
+    helper = _load_helper()
+    service = (
+        "brilliant-mqtt" if component == "bridge" else "brilliant-" + component.replace("_", "-")
+    )
+    filename = service + ("-release" if release_link else "") + ".service"
+    source = (_REPOSITORY_ROOT / "deploy" / filename).read_text()
+    assert (_PAYLOAD / filename).read_text() == source
+    fingerprint = hashlib.sha256(helper._normalized_unit(source).encode()).hexdigest()
+    assert helper._STOCK_UNIT_DIGESTS[component][int(release_link)] == fingerprint
+
+
+def test_qualification_environment_policy_matches_renderer_contract() -> None:
+    source = (_REPOSITORY_ROOT / "custom_components/brilliant_mqtt/panel_ops.py").read_text()
+    rendered = set(re.findall(r'^ENV_\w+ = "(\w+)"$', source, re.MULTILINE)) | {"LOG_LEVEL"}
+    assert _load_helper()._STOCK_ENVIRONMENT_NAMES == rendered
+
+
+@pytest.mark.parametrize("kind", ["missing", "directory", "symlink", "fifo", "non_utf8"])
+def test_qualification_requires_readable_regular_environment(tmp_path: Path, kind: str) -> None:
+    payload = _make_payload(tmp_path)
+    panel, units, env = _make_legacy_panel(tmp_path, payload)
+    env.unlink()
+    if kind == "directory":
+        env.mkdir()
+    elif kind == "symlink":
+        env.symlink_to(tmp_path / "absent")
+    elif kind == "fifo":
+        os.mkfifo(env)
+    elif kind == "non_utf8":
+        env.write_bytes(b"\xff-private")
+
+    _assert_unproven(_identity_run(panel, units, env, "bridge"), "bridge", "environment unreadable")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        'MQTT_HOST="unterminated\n',
+        "MQTT_HOST=bare\\\n",
+        'MQTT_HOST="multiline\nvalue"\n',
+        "MQTT_HOST=x\nMQTT_HOST=y\n",
+        'MQTT_HOST="x" PYTHONPATH=x\n',
+        "not an assignment\n",
+    ],
+)
+def test_qualification_rejects_unhandled_environment_syntax(tmp_path: Path, text: str) -> None:
+    payload = _make_payload(tmp_path)
+    panel, units, env = _make_legacy_panel(tmp_path, payload)
+    _write(env, text)
+    _assert_unproven(_identity_run(panel, units, env, "bridge"), "bridge", "environment schema")
+
+
+@pytest.mark.parametrize("dangling", [False, True])
+def test_qualification_does_not_follow_unit_alias(tmp_path: Path, dangling: bool) -> None:
+    payload = _make_payload(tmp_path)
+    panel, units, env = _make_legacy_panel(tmp_path, payload)
+    unit = units / "brilliant-mqtt.service"
+    unit.unlink()
+    target = panel / "system" / unit.name
+    if not dangling:
+        _write(target, (_PAYLOAD / unit.name).read_text())
+    unit.symlink_to(target)
+    _assert_unproven(_identity_run(panel, units, env, "bridge"), "bridge", "unit alias")
+
+
+@pytest.mark.parametrize(
+    "source", [path for path in _SYSTEMD_PATHS if path != "etc/systemd/system"]
+)
+def test_qualification_rejects_additional_base_unit_sources(tmp_path: Path, source: str) -> None:
+    payload = _make_payload(tmp_path)
+    panel, units, env = _make_legacy_panel(tmp_path, payload)
+    unit = "brilliant-mqtt.service"
+    _write(tmp_path / "image" / source / unit, (_PAYLOAD / unit).read_text())
+    _assert_unproven(_identity_run(panel, units, env, "bridge"), "bridge", "additional unit source")
+
+
+def test_qualification_image_default_env_never_reads_host_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    payload = _make_payload(tmp_path)
+    panel, units, env = _make_legacy_panel(tmp_path, payload)
+    helper = _load_helper()
+    _enroll(helper, panel, units, env, 5)
+    original = Path.read_text
+
+    def guarded(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+        assert path != Path("/etc/brilliant-mqtt.env"), "read the real host environment"
+        return original(path, encoding=encoding, errors=errors)
+
+    monkeypatch.setattr(Path, "read_text", guarded)
+    assert (
+        helper.main(
+            ["component-identities", str(panel), "--component", "bridge", "--unit-root", str(units)]
+        )
+        == 0
+    )
+    result = capsys.readouterr()
+    assert result.out.startswith("bridge\t0.11.3\t5\t")
+    assert result.err == ""
+
+
+@pytest.mark.parametrize("source", _SYSTEMD_PATHS)
+@pytest.mark.parametrize(
+    "dropin", ["brilliant-mqtt.service.d", "brilliant-.service.d", "service.d"]
+)
+def test_qualification_rejects_dropins_in_every_systemd_path(
+    tmp_path: Path, source: str, dropin: str
+) -> None:
+    payload = _make_payload(tmp_path)
+    panel, units, env = _make_legacy_panel(tmp_path, payload)
+    _enroll(_load_helper(), panel, units, env, 5)
+    _write(tmp_path / "image" / source / dropin / "override.conf", "[Service]\nNice=10\n")
+    before = _snapshot(tmp_path)
+
+    result = _identity_run(panel, units, env, "bridge")
+
+    _assert_unproven(result, "bridge", "unit drop-ins")
+    assert _snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize(
+    "assignment", ["PYTHONPATH", "PYTHONHOME", "LD_PRELOAD", "UNKNOWN_VARIABLE"]
+)
+def test_qualification_rejects_unlisted_environment_names(tmp_path: Path, assignment: str) -> None:
+    payload = _make_payload(tmp_path)
+    panel, units, env = _make_legacy_panel(tmp_path, payload)
+    helper = _load_helper()
+    _enroll(helper, panel, units, env, 5)
+    _write(env, _STOCK_ENVIRONMENT + f'{assignment}="private-value"\n')
+    before = _snapshot(tmp_path)
+
+    result = _identity_run(panel, units, env, "bridge")
+
+    _assert_unproven(result, "bridge", "environment schema")
+    assert _snapshot(tmp_path) == before
+    assert helper.installed_identities(panel, units, env)["bridge"]["release_ordinal"] == 5
+
+
+@pytest.mark.parametrize("component", _COMPONENTS)
+@pytest.mark.parametrize("release_link", [False, True])
+def test_qualification_matches_all_six_shipped_units_and_stock_environment(
+    tmp_path: Path, component: str, release_link: bool
+) -> None:
+    payload = _make_payload(tmp_path)
+    panel, units, env = _make_legacy_panel(tmp_path, payload)
+    if release_link:
+        release = panel / "releases" / _RELEASE_NAME
+        shutil.copytree(payload, release)
+        (panel / "current").symlink_to(release)
+        for unit in units.glob("*.service"):
+            shutil.copyfile(_PAYLOAD / unit.name.replace(".service", "-release.service"), unit)
+    _enroll(_load_helper(), panel, units, env, 5)
+
+    result = _identity_run(panel, units, env, component)
+    candidate = _run("payload-identities", payload, "--component", component)
+
+    assert result.returncode == candidate.returncode == 0
+    assert result.stderr == ""
+    assert result.stdout.rsplit("\t", 1)[0] + "\n" == candidate.stdout
+    layout = "release_link" if release_link else "legacy_fixed"
+    assert result.stdout.endswith(f"\t{layout}\n")
+
+
+@pytest.mark.parametrize(
+    "alteration",
+    ["execstart", "environmentfile", "pythonpath", "workingdirectory", "extra_directive"],
+)
+@pytest.mark.parametrize("component", _COMPONENTS)
+@pytest.mark.parametrize("release_link", [False, True])
+def test_qualification_nonstock_unit_is_unknown(
+    tmp_path: Path, alteration: str, component: str, release_link: bool
+) -> None:
+    payload = _make_payload(tmp_path)
+    panel, units, env = _make_legacy_panel(tmp_path, payload)
+    service = (
+        "brilliant-mqtt" if component == "bridge" else "brilliant-" + component.replace("_", "-")
+    )
+    unit = units / (service + ".service")
+    if release_link:
+        release = panel / "releases" / _RELEASE_NAME
+        shutil.copytree(payload, release)
+        (panel / "current").symlink_to(release)
+        shutil.copyfile(_PAYLOAD / (service + "-release.service"), unit)
+    _enroll(_load_helper(), panel, units, env, 5)
+    content = unit.read_text()
+    if alteration == "execstart":
+        content = content.replace("ExecStart=", "ExecStart=/unexpected ")
+    elif alteration == "environmentfile":
+        content = content.replace("/etc/brilliant-mqtt.env", "/private/alternate.env")
+    elif alteration == "pythonpath":
+        content = content.replace(
+            "Environment=PYTHONPATH=", "Environment=PYTHONPATH=/private/alternate:"
+        )
+    elif alteration == "workingdirectory":
+        content = content.replace("[Service]", "[Service]\nWorkingDirectory=/private/alternate")
+    else:
+        content = content.replace(
+            "[Service]", "[Service]\nEnvironment=LD_PRELOAD=/private/alternate"
+        )
+    _write(unit, content)
+
+    result = _identity_run(panel, units, env, component)
+
+    _assert_unproven(result, component, "unit template differs")
+
+
+@pytest.mark.parametrize("override", ["runtime", "vendor", "environment_file"])
+def test_qualification_reviewer_effective_selection_repros(tmp_path: Path, override: str) -> None:
+    payload = _make_payload(tmp_path)
+    panel, units, env = _make_legacy_panel(tmp_path, payload)
+    helper = _load_helper()
+    _enroll(helper, panel, units, env, 5)
+    release = panel / "releases" / _RELEASE_NAME
+    shutil.copytree(payload, release)
+    _write(release / "app/brilliant_mqtt/bridge.py", "different active code")
+    (panel / "current").symlink_to(release)
+    assert helper.code_digest(panel, "bridge") != helper.code_digest(release, "bridge")
+    assignment = "PYTHONPATH=/var/brilliant-mqtt/current/app:/var/brilliant-mqtt/current/vendor"
+    if override == "environment_file":
+        _write(env, _STOCK_ENVIRONMENT + assignment + "\n")
+    else:
+        directory = "run/systemd/system" if override == "runtime" else "usr/lib/systemd/system"
+        _write(
+            tmp_path / "image" / directory / "brilliant-mqtt.service.d/override.conf",
+            "[Service]\nWorkingDirectory=/var/brilliant-mqtt/current/app\nEnvironment="
+            + assignment,
+        )
+
+    result = _identity_run(panel, units, env, "bridge")
+
+    reason = "environment schema" if override == "environment_file" else "unit drop-ins"
+    _assert_unproven(result, "bridge", reason)
+    assert helper.installed_identities(panel, units, env)["bridge"]["layout"] == "legacy_fixed"
+
+
+def test_qualification_mixed_rows_preserve_order_and_only_warn_for_unknown(tmp_path: Path) -> None:
+    payload = _make_payload(tmp_path)
+    panel, units, env = _make_legacy_panel(tmp_path, payload)
+    _enroll(_load_helper(), panel, units, env, 5)
+    _write(units / "brilliant-bus-watchdog.service", "[Service]\nExecStart=/alternate\n")
+
+    result = _identity_run(panel, units, env, "bus_watchdog", "bridge")
+
+    assert result.returncode == 0
+    lines = result.stdout.splitlines()
+    assert lines[0] == "bus_watchdog\tunknown"
+    assert lines[1].startswith("bridge\t0.11.3\t5\t")
+    assert (
+        result.stderr
+        == "bundle-manifest: bus_watchdog selection unproven (unit template differs)\n"
+    )
 
 
 def _installed_or_staged_unit(panel: Path, units: Path, component: str, staged: bool) -> Path:
@@ -814,6 +1115,8 @@ def _installed_or_staged_unit(panel: Path, units: Path, component: str, staged: 
         "brilliant-mqtt" if component == "bridge" else "brilliant-" + component.replace("_", "-")
     )
     directory = panel / ("system" if component == "bridge" else component) if staged else units
+    if staged:
+        (units / (service + ".service")).unlink(missing_ok=True)
     directory.mkdir(parents=True, exist_ok=True)
     return directory / (service + ".service")
 
@@ -834,9 +1137,8 @@ def test_present_release_unit_requires_selector(
 
     result = _identity_run(panel, units, env, component)
 
-    assert result.returncode == 2
-    assert result.stdout == ""
-    assert result.stderr == "bundle-manifest: installed release selector is missing\n"
+    reason = "unit unavailable" if staged else "release selector unavailable"
+    _assert_unproven(result, component, reason)
     assert _snapshot(tmp_path) == before
     with pytest.raises(helper.ManifestError, match="installed release selector is missing"):
         helper.installed_identities(panel, units, env)
@@ -878,9 +1180,8 @@ def test_unit_dropins_cannot_verify_base_selection(
 
     result = _identity_run(panel, units, env, component)
 
-    assert result.returncode == 2
-    assert result.stdout == ""
-    assert result.stderr == "bundle-manifest: unhandled installed unit drop-ins\n"
+    reason = "unit drop-ins" if installed_dropin else "unit unavailable"
+    _assert_unproven(result, component, reason)
     assert _snapshot(tmp_path) == before
     with pytest.raises(helper.ManifestError, match="unhandled installed unit drop-ins"):
         helper.installed_identities(panel, units, env)
@@ -912,9 +1213,8 @@ def test_present_ambiguous_unit_fails_without_selector(
 
     result = _identity_run(panel, units, env, "bridge")
 
-    assert result.returncode == 2
-    assert result.stdout == ""
-    assert result.stderr == "bundle-manifest: ambiguous installed code selection\n"
+    reason = "unit unavailable" if staged else "unit template differs"
+    _assert_unproven(result, "bridge", reason)
     with pytest.raises(helper.ManifestError, match="ambiguous installed code selection"):
         helper.installed_identities(panel, units, env)
 
@@ -951,9 +1251,8 @@ def test_unhandled_unit_dropin_entries_are_rejected(
 
     result = _identity_run(panel, units, env, "bridge")
 
-    assert result.returncode == 2
-    assert result.stdout == ""
-    assert result.stderr == "bundle-manifest: unhandled installed unit drop-ins\n"
+    reason = "unit drop-ins" if installed_dropin else "unit unavailable"
+    _assert_unproven(result, "bridge", reason)
 
 
 @pytest.mark.parametrize("staged", [False, True])
@@ -971,9 +1270,7 @@ def test_shared_unit_dropins_are_also_unhandled(
 
     result = _identity_run(panel, units, env, "wifi_watchdog")
 
-    assert result.returncode == 2
-    assert result.stdout == ""
-    assert result.stderr == "bundle-manifest: unhandled installed unit drop-ins\n"
+    _assert_unproven(result, "wifi_watchdog", "unit drop-ins")
 
 
 @pytest.mark.parametrize("component", _COMPONENTS)
@@ -995,7 +1292,11 @@ def test_present_fixed_unit_without_selector_still_matches(
 
     assert result.returncode == 0, result.stderr
     digest = helper.code_digest(panel, component)
-    assert result.stdout == f"{component}\t0.11.3\t5\t{digest}\tlegacy_fixed\n"
+    if staged:
+        _assert_unproven(result, component, "unit unavailable")
+    else:
+        assert result.stdout == f"{component}\t0.11.3\t5\t{digest}\tlegacy_fixed\n"
+    assert helper.installed_identities(panel, units, env)[component]["digest"] == digest
 
 
 def test_dangling_installed_unit_cannot_fall_back_to_staged_unit(tmp_path: Path) -> None:
@@ -1009,9 +1310,9 @@ def test_dangling_installed_unit_cannot_fall_back_to_staged_unit(tmp_path: Path)
 
     result = _identity_run(panel, units, env, "bridge")
 
-    assert result.returncode == 2
-    assert result.stdout == ""
-    assert result.stderr == "bundle-manifest: installed identity unreadable (FileNotFoundError)\n"
+    _assert_unproven(result, "bridge", "unit alias")
+    with pytest.raises(FileNotFoundError):
+        helper.installed_identities(panel, units, env)
 
 
 def test_bridge_only_does_not_inspect_unselected_watchdog_dropins(tmp_path: Path) -> None:
@@ -1109,6 +1410,7 @@ def test_unit_root_and_env_are_forwarded_only_when_given(
         return {component: None for component in _COMPONENTS}
 
     monkeypatch.setattr(helper, "installed_identities", recording)
+    monkeypatch.setattr(helper, "_selection_unproven", lambda *_args: None)
     base = ["component-identities", str(tmp_path), "--component", "bridge"]
 
     assert helper.main(base) == 0

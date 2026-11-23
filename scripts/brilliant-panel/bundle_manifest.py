@@ -34,6 +34,55 @@ CORE_TREES = {
 }
 _VERSION_PATTERN = re.compile(r"[0-9A-Za-z][0-9A-Za-z._+-]{0,127}")
 _IDENTITY_LAYOUTS = ("payload-identities", "component-identities")
+# Qualification policy travels with this helper, including when executed from stdin.
+# Pinned to deploy/{service}{,-release}.service and panel_ops.render_env; parity-tested.
+_STOCK_UNIT_DIGESTS = {
+    "bridge": (
+        "04e32ebf857c70bf06aa64efb0ba322937d96f15f686da20a7f52e8107d24e25",
+        "3d23b0fe139c815e47fd169760af1c3a1fd55a0e4a237fb760b0f34bdc0d356c",
+    ),
+    "wifi_watchdog": (
+        "29213506eccd36332feb07f64cd94df23e049eaceea6d8479625de3c4713a0ca",
+        "092054695b3d69d3fa1301a02cd60085dda69802294078b2bb3eda70445bdbd2",
+    ),
+    "bus_watchdog": (
+        "c919411e1f4960d4bebd50d9e35ac53c1b37bce2c106464ae1dda8f9105e7280",
+        "fcce7d35c953ea491f4417c13cd4ce12e219e314659600cc54b0cc353fd424f3",
+    ),
+}
+_STOCK_ENVIRONMENT_NAMES = frozenset(
+    {
+        "BRILLIANT_PANEL",
+        "BRILLIANT_DEPLOYMENT_ID",
+        "MQTT_HOST",
+        "MQTT_PORT",
+        "MQTT_USERNAME",
+        "MQTT_PASSWORD",
+        "MQTT_TLS_ENABLED",
+        "MQTT_TLS_CA_FILE",
+        "RETAINED_TOPICS_FILE",
+        "MESH_PRIORITY",
+        "SCENE_BRIDGE_ENABLED",
+        "HOT_POLL_SECONDS",
+        "RESYNC_SECONDS",
+        "LOG_LEVEL",
+    }
+)
+_SYSTEMD_SEARCH_PATHS = (
+    "etc/systemd/system.control",
+    "run/systemd/system.control",
+    "run/systemd/transient",
+    "run/systemd/generator.early",
+    "etc/systemd/system",
+    "etc/systemd/system.attached",
+    "run/systemd/system",
+    "run/systemd/system.attached",
+    "run/systemd/generator",
+    "usr/local/lib/systemd/system",
+    "usr/lib/systemd/system",
+    "lib/systemd/system",
+    "run/systemd/generator.late",
+)
 
 
 class ManifestError(RuntimeError):
@@ -1139,6 +1188,99 @@ def _payload_identities(root: Path, components: list[str]) -> list[str]:
     return lines
 
 
+def _normalized_unit(text: str) -> str:
+    lines = []
+    for raw in text.split("\n"):
+        line = raw.strip(" \t\r")
+        if not line or line.startswith(("#", ";")):
+            continue
+        key, separator, value = line.partition("=")
+        lines.append(key.strip(" \t") + "=" + value.strip(" \t") if separator else line)
+    return "\n".join(lines)
+
+
+def _qualification_file(path: Path) -> str:
+    parent, _ = _open_directory_path(path.parent, "qualification source")
+    try:
+        descriptor = os.open(path.name, _FILE_FLAGS | os.O_NONBLOCK, dir_fd=parent)
+    finally:
+        os.close(parent)
+    with os.fdopen(descriptor, "r", encoding="utf-8") as source:
+        metadata = os.fstat(source.fileno())
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 65536:
+            raise ValueError("invalid qualification source")
+        text = source.read(65537)
+    if len(text) > 65536:
+        raise ValueError("invalid qualification source")
+    return text
+
+
+def _stock_environment(text: str) -> bool:
+    seen: set[str] = set()
+    for raw in text.split("\n"):
+        line = raw.strip(" \t\r")
+        if not line or line.startswith(("#", ";")):
+            continue
+        key, separator, value = line.partition("=")
+        key, value = key.strip(" \t"), value.strip(" \t")
+        if not separator or key not in _STOCK_ENVIRONMENT_NAMES or key in seen:
+            return False
+        seen.add(key)
+        # Accept the renderer's single-line quoted strings or simple bare values.
+        if (
+            re.fullmatch(r"""(?:"(?:[^"\\\x00-\x1f]|\\["\\])*"|[^\s"'\\\x00-\x1f]*)""", value)
+            is None
+        ):
+            return False
+    return True
+
+
+def _selection_unproven(
+    root: Path, component: str, unit_root: Path, env_path: Path | None
+) -> str | None:
+    """CLI-only proof; never infer effective systemd state from staged files."""
+    if unit_root.parts[-3:] != ("etc", "systemd", "system"):
+        return "systemd root unavailable"
+    filesystem = unit_root.parents[2]
+    service = (
+        "brilliant-mqtt" if component == "bridge" else "brilliant-" + component.replace("_", "-")
+    )
+    unit = unit_root / (service + ".service")
+    try:
+        for relative in _SYSTEMD_SEARCH_PATHS:
+            other = filesystem / relative / unit.name
+            _reject_unit_dropins(other)
+            if other != unit and os.path.lexists(other):
+                return "additional unit source"
+    except (OSError, ManifestError):
+        return "unit drop-ins"
+    if unit.is_symlink():
+        return "unit alias"
+    try:
+        fingerprint = hashlib.sha256(
+            _normalized_unit(_qualification_file(unit)).encode()
+        ).hexdigest()
+    except (OSError, ValueError, ManifestError):
+        return "unit unavailable"
+    templates = _STOCK_UNIT_DIGESTS[component]
+    if fingerprint not in templates:
+        return "unit template differs"
+    try:
+        selector = _panel_release_selector(root) if os.path.lexists(root / "current") else None
+    except (OSError, ValueError, ManifestError):
+        return "release selector unavailable"
+    if fingerprint == templates[1] and selector is None:
+        return "release selector unavailable"
+    # --env maps the one stock EnvironmentFile for disposable/off-device images.
+    if env_path is None or env_path == Path("/etc/brilliant-mqtt.env"):
+        env_path = filesystem / "etc/brilliant-mqtt.env"
+    try:
+        environment = _qualification_file(env_path)
+    except (OSError, ValueError, ManifestError):
+        return "environment unreadable"
+    return None if _stock_environment(environment) else "environment schema"
+
+
 def _component_identities(
     root: Path,
     components: list[str],
@@ -1146,13 +1288,36 @@ def _component_identities(
 ) -> list[str]:
     if not os.path.isdir(root):
         raise ManifestError("installed root is unavailable")
+    unit_root = overrides.get("unit_root", Path("/etc/systemd/system"))
+    reasons = {
+        component: _selection_unproven(root, component, unit_root, overrides.get("env_path"))
+        for component in components
+    }
+    proven = [component for component in components if reasons[component] is None]
+    scan_overrides = dict(overrides)
+    if (
+        unit_root.parts[-3:] == ("etc", "systemd", "system")
+        and unit_root.parents[2] != Path("/")
+        and overrides.get("env_path", Path("/etc/brilliant-mqtt.env"))
+        == Path("/etc/brilliant-mqtt.env")
+    ):
+        scan_overrides["env_path"] = unit_root.parents[2] / "etc/brilliant-mqtt.env"
     try:
-        identities = installed_identities(root, persist=False, components=components, **overrides)
+        identities = (
+            installed_identities(root, persist=False, components=proven, **scan_overrides)
+            if proven
+            else {}
+        )
     except (OSError, ValueError, RecursionError) as error:
         # ValueError covers undecodable files and corrupt JSON identity records.
         raise ManifestError(f"installed identity unreadable ({type(error).__name__})") from None
     lines = []
     for component in components:
+        reason = reasons[component]
+        if reason is not None:
+            lines.append(f"{component}\tunknown")
+            print(f"bundle-manifest: {component} selection unproven ({reason})", file=sys.stderr)
+            continue
         identity = identities[component]
         if identity is None:
             lines.append(f"{component}\tmissing")

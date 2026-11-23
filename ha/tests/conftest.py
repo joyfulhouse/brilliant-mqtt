@@ -182,15 +182,12 @@ def payload_dir(tmp_path: Path) -> Iterator[Path]:
     (tmp_path / "vendor").mkdir()
     (tmp_path / "VERSION").write_text("0.2.0")
     (tmp_path / "RELEASE_ORDINAL").write_text("1\n")
-    (tmp_path / "brilliant-mqtt.service").write_text("[Unit]\nDescription=test unit\n")
-    (tmp_path / "brilliant-wifi-watchdog.service").write_text(
-        "[Unit]\nDescription=test wifi watchdog unit\n"
-    )
+    deploy_dir = Path(__file__).parents[2] / "deploy"
+    for service in ("brilliant-mqtt", "brilliant-wifi-watchdog", "brilliant-bus-watchdog"):
+        filename = f"{service}.service"
+        (tmp_path / filename).write_text((deploy_dir / filename).read_text())
     (tmp_path / "wifi_watchdog" / "brilliant_wifi_watchdog").mkdir(parents=True)
     (tmp_path / "wifi_watchdog" / "brilliant_wifi_watchdog" / "run.py").write_text("# stub\n")
-    (tmp_path / "brilliant-bus-watchdog.service").write_text(
-        "[Unit]\nDescription=test bus watchdog unit\n"
-    )
     (tmp_path / "bus_watchdog" / "brilliant_bus_watchdog").mkdir(parents=True)
     (tmp_path / "bus_watchdog" / "brilliant_bus_watchdog" / "run.py").write_text("# stub\n")
     (tmp_path / "brilliant-ha-mirror.service").write_text(

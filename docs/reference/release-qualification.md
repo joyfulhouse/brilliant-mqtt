@@ -112,7 +112,10 @@ example does not prescribe a downgrade. If that release predates the
 `scripts/brilliant-panel/bundle_manifest.py`, run the helper from a checkout
 that contains them and point `payload-identities` at the selected release's
 payload. An identity covers only the core code trees, `VERSION` and
-`RELEASE_ORDINAL`, none of which a newer helper changes.
+`RELEASE_ORDINAL`, none of which a newer helper changes. The installed-selection
+proof also pins the six unit templates shipped with the helper's release. A
+different release's templates can therefore produce an unproven selection;
+use a reviewed helper whose template policy matches the release being qualified.
 
 ### Comparing component identities
 
@@ -136,7 +139,8 @@ uv run python "$manifest_helper" payload-identities "$release_payload" $componen
 ssh -o NumberOfPasswordPrompts=1 office-qualified \
   "/data/switch-embedded/env/bin/python3 -B -I - component-identities /var/brilliant-mqtt $components" \
   < "$manifest_helper" \
-  > "$legacy_evidence/installed.tsv"
+  > "$legacy_evidence/installed.tsv" \
+  2> "$legacy_evidence/installed.stderr"
 
 cut -f1-4 "$legacy_evidence/installed.tsv" > "$legacy_evidence/installed-identity.tsv"
 diff -u "$legacy_evidence/expected.tsv" "$legacy_evidence/installed-identity.tsv" \
@@ -151,19 +155,56 @@ selected component, separated by tabs. It fails if the payload has no
 `RELEASE_ORDINAL` or lacks a selected component. `component-identities` prints
 the same four fields followed by the layout (`legacy_fixed` or
 `release_link`), or the component followed by `missing`, in the order of the
-`--component` arguments. `cut -f1-4` drops the layout so the two files compare
-directly; keep `installed.tsv` as the layout evidence.
+`--component` arguments. An unproven selection instead prints exactly two
+fields, `<component>\tunknown`, with one sanitized reason on stderr. Collection
+still exits successfully, but this row has no version, ordinal, digest or layout
+and cannot equal a candidate's four-field identity. `cut -f1-4` drops the layout
+from proven rows so the two files compare directly; keep `installed.tsv` and
+`installed.stderr` as evidence. An unknown row stops qualification at the diff.
+
+Installed selection is proven only for a regular installed unit matching one
+of the six stock templates embedded in the helper. The comparison ignores
+blank lines, whole-line comments and padding around directives; directive order
+and values must match. It accepts the stock `EnvironmentFile` and `PYTHONPATH`
+directives only as part of that complete template. A different `ExecStart`,
+extra directive, alias or symlink, or missing installed base unit is unproven.
+Staged units alone never prove which unit systemd uses.
+
+Any applicable `.conf` drop-in makes selection unproven, including unit-specific,
+dash-prefix and type-wide overrides. The fixed search list covers `/etc`, `/run`,
+`/usr/local/lib`, `/usr/lib` and `/lib` systemd roots, plus control, transient,
+attached and early/normal/late generator directories. An additional base unit
+in another search directory is also unproven. The helper refuses these cases
+instead of attempting to reproduce systemd's effective configuration.
+
+The stock environment file must be readable, regular and contain only the
+single-line assignments accepted by `_STOCK_ENVIRONMENT_NAMES` in the reviewed
+helper. This frozen policy matches `panel_ops.render_env`, including `LOG_LEVEL`;
+template and environment-policy parity are tested against the shipped sources.
+`PYTHONPATH`, `PYTHONHOME`, loader settings, unlisted custom agent settings,
+duplicate names and unsupported quoting or continuations make selection
+unproven. Environment values are never included in the reason. Even an optional
+stock environment-file reference must be readable for this proof.
+
+For an offline image, `--unit-root` must end in `/etc/systemd/system`. All search
+paths and the default environment path are rooted in that image; `--env` can
+explicitly map its stock environment file to another fixture path. The helper
+does not use the real host's environment file for an image scan.
 
 ### Read-only collection and manual installs
 
 `component-identities` is strictly read-only. It consults the panel's existing
 private identity records but never creates or updates them and never creates a
 directory, so it is safe to run over SSH on a production panel. It prints an
-ordinal only when an existing record proves it for exactly the installed code;
-otherwise it prints `unknown`, which never equals a candidate ordinal. The
+ordinal only when selection is proven and an existing record proves it for
+exactly the installed code; otherwise it prints `unknown`, which never equals
+a candidate ordinal. The
 remote command uses `-B -I` so the panel interpreter writes no bytecode and
 ignores environment variables, the user site directory and the current
 directory; the helper still runs from standard input with its arguments.
+
+The conservative selection policy is CLI-only. It does not change the
+integration's persisting `installed_identities` admission behavior.
 
 The integration publishes an ordinal only after an install that changes code:
 it hashes the newly selected bytes and then records the candidate's ordinal.

@@ -1467,7 +1467,8 @@ async def test_stopped_pre_ordinal_bridge_recovers_only_through_canaried_update(
         package.mkdir(parents=True)
         (package / "run.py").write_text("old_watchdog = True\n")
         (shell.panel / f"{watchdog}/VERSION").write_text("0.10.2\n")
-        (shell.units / f"{service}.service").write_text("old watchdog unit\n")
+        template = Path(__file__).parents[2] / "deploy" / f"{service}.service"
+        (shell.units / f"{service}.service").write_text(shell.translate(template.read_text()))
         states[service] = [True, True]
         selected[watchdog] = not already_off
     shell.state.write_text(json.dumps(states))
@@ -1548,7 +1549,10 @@ async def test_manager_update_cannot_reach_ca_without_durable_complete_baseline(
         package.mkdir(parents=True)
         (package / "run.py").write_text("old_watchdog = True\n")
         (shell.panel / "wifi_watchdog/VERSION").write_text("0.10.2\n")
-        (shell.units / "brilliant-wifi-watchdog.service").write_text("old watchdog unit\n")
+        template = Path(__file__).parents[2] / "deploy/brilliant-wifi-watchdog.service"
+        (shell.units / "brilliant-wifi-watchdog.service").write_text(
+            shell.translate(template.read_text())
+        )
         shell.state.write_text(
             json.dumps({"brilliant-mqtt": [True, True], "brilliant-wifi-watchdog": [True, True]})
         )

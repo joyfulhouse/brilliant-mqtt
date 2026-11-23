@@ -117,6 +117,8 @@ class RehearsalShell(FakeShell):
 
     async def put_bytes(self, data: bytes, remote_path: str, mode: int) -> None:
         path = Path(self.translate(remote_path))
+        if remote_path.endswith(".service"):
+            data = self.translate(data.decode()).encode()
         await asyncio.to_thread(path.write_bytes, data)
         await asyncio.to_thread(path.chmod, mode)
 
