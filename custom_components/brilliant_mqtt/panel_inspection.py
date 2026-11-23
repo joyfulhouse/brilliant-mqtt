@@ -445,7 +445,14 @@ async def async_inspect_panel(
     qualified = architecture in _QUALIFIED_ARCHITECTURES
     experimental = architecture in _EXPERIMENTAL_ARCHITECTURES and allow_aarch64 is True
     if not qualified and not experimental:
-        raise PanelCompatibilityError("unsupported_architecture", architecture=architecture)
+        architecture_metadata = (
+            architecture
+            if architecture.isascii() and architecture.isidentifier() and len(architecture) <= 32
+            else None
+        )
+        raise PanelCompatibilityError(
+            "unsupported_architecture", architecture=architecture_metadata
+        )
     python_match = _PYTHON_VERSION.fullmatch(values["python_version"])
     if python_match is None:
         raise PanelCompatibilityError("unsupported_python")
