@@ -149,12 +149,20 @@ def record_attributed_failure(
     else:
         failures = ()
     failures = (*failures, AttributedFailure(session, at_ms))
-    # Evaluate on the full history, then bound it while always keeping the
-    # FIRST failure: it anchors the 60 s span, so truncation can never shrink
-    # the span below the real elapsed time at a fast session-rebuild cadence.
+    # Preserve the first failure and both time extrema when bounding history:
+    # wall-clock adjustments can put the span's anchors anywhere in the list.
     quarantined_at_ms = at_ms if _qualifies(failures) else None
     if len(failures) > FAILURE_HISTORY_LIMIT:
-        failures = (failures[0], *failures[-(FAILURE_HISTORY_LIMIT - 1) :])
+        retained = {
+            0,
+            min(range(len(failures)), key=lambda index: failures[index].at_ms),
+            max(range(len(failures)), key=lambda index: failures[index].at_ms),
+        }
+        for index in range(len(failures) - 1, -1, -1):
+            if len(retained) == FAILURE_HISTORY_LIMIT:
+                break
+            retained.add(index)
+        failures = tuple(failures[index] for index in sorted(retained))
     suspect = SuspectRecord(sha256, failures, quarantined_at_ms)
     updated = _with_suspect(state, record, suspect)
     if updated.blocked is not None and updated.blocked.record == record:
@@ -244,7 +252,7 @@ def load_sidecar(path: Path) -> QuarantineState:
         return parse_sidecar(json.loads(content.decode("utf-8")))
     except FileNotFoundError:
         return QuarantineState()
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, RecursionError) as error:
         # UnicodeError and JSONDecodeError are ValueError subclasses.
         logger.warning(
             "outbox quarantine sidecar %s is unreadable (%s); treating every record "
@@ -293,6 +301,12 @@ def _parse_suspect(raw: object) -> SuspectRecord:
     if quarantined_at_ms is not None and not _is_ms(quarantined_at_ms):
         raise ValueError("invalid quarantine time")
     failures = tuple(_parse_failure(item) for item in failures_raw)
+    # The recorder uses the latest observation's time, even if NTP moved it
+    # backwards; requiring a monotonic history would reject genuine evidence.
+    if quarantined_at_ms is not None and (
+        not _qualifies(failures) or quarantined_at_ms != failures[-1].at_ms
+    ):
+        raise ValueError("quarantine requires qualifying failures and matching time")
     return SuspectRecord(cast(str, sha256), failures, cast("int | None", quarantined_at_ms))
 
 

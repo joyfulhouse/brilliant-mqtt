@@ -194,6 +194,12 @@ clears its evidence.
   while there is evidence: `state` (`quarantined`, `suspect` or `blocked`),
   bounded identity `key`, `kind` (`event` or `result`), `payload_bytes`, `payload_sha256`,
   `failure_count` and `quarantined_at_ms`. Payload contents are never included.
+  While evidence exists, these details replace the optional response-metrics
+  snapshot within its ordinary metadata byte budget. If details exceed that
+  budget, only state, identity and kind are sent; full evidence remains local.
+  Response counters continue accumulating and return after evidence clears.
+  This prevents diagnostics from making an otherwise accepted startup packet
+  too large before the outbox can advance its failure count.
   The meta is republished on each reconcile and resync, so the details can lag
   the status topic by up to one resync interval.
 

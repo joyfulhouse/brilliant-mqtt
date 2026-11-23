@@ -11,6 +11,13 @@ from pathlib import Path
 import pytest
 
 from brilliant_mqtt import outbox_quarantine as oq
+from tests.test_scene_outbox_quarantine import (
+    _POISON_SCENE,
+    _failures_reach,
+    _Harness,
+    _offered,
+    _quarantine_poison,
+)
 
 _SHA = "a" * 64
 _OTHER_SHA = "b" * 64
@@ -264,3 +271,138 @@ def test_corrupt_sidecar_fails_safe_to_not_quarantined_with_warning(
     assert any("quarantine sidecar" in record.getMessage() for record in caplog.records)
     # Fail-safe never deletes or rewrites the operator-visible evidence.
     assert path.read_bytes() == content
+
+
+@pytest.mark.parametrize(
+    ("failures", "quarantined_at_ms"),
+    [
+        ((), 60_000),
+        ((("s1", 0),), 60_000),
+        ((("s1", 0), ("s1", 30_000), ("s2", 60_000)), 60_000),
+        ((("s1", 0), ("s2", 30_000), ("s3", 59_999)), 59_999),
+        ((("s1", 0), ("s2", 30_000), ("s3", 60_000)), 60_001),
+        ((("s1", 0), ("s2", 30_000), ("s3", 60_000)), 0),
+    ],
+    ids=["empty", "one-session", "repeated-session", "short-span", "later-time", "earlier-time"],
+)
+def test_persisted_halt_requires_qualifying_evidence_and_its_last_failure_time(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    failures: tuple[tuple[str, int], ...],
+    quarantined_at_ms: int,
+) -> None:
+    suspect = oq.SuspectRecord(
+        _SHA,
+        tuple(oq.AttributedFailure(session, at_ms) for session, at_ms in failures),
+        quarantined_at_ms,
+    )
+    raw = oq.sidecar_payload(oq.QuarantineState(suspects=((_EVENT, suspect),)))
+    path = tmp_path / "sidecar.json"
+    content = json.dumps(raw).encode()
+    path.write_bytes(content)
+
+    with pytest.raises(ValueError, match="quarantine"):
+        oq.parse_sidecar(raw)
+    assert oq.load_sidecar(path) == oq.QuarantineState()
+    assert "quarantine sidecar" in caplog.text
+    assert path.read_bytes() == content
+
+
+@pytest.mark.parametrize(
+    "times",
+    [
+        (0, 30_000, 60_000),
+        (90_000, 60_000, 30_000),
+        (60_000, 90_000, 0),
+        (100_000, 150_000, 110_000, 110_000, 110_000, 110_000, 110_000, 110_000, 90_000),
+    ],
+    ids=["forward", "backward", "nonmonotonic", "bounded-history-clock-step"],
+)
+def test_genuine_halt_round_trips_with_wall_clock_adjustments(
+    tmp_path: Path, times: tuple[int, ...]
+) -> None:
+    state = oq.QuarantineState()
+    for index, at_ms in enumerate(times):
+        state = _fail(state, f"s{index}", at_ms)
+    suspect = state.get(_EVENT)
+    assert suspect is not None and suspect.quarantined_at_ms == times[-1]
+    assert len(suspect.failures) <= oq.FAILURE_HISTORY_LIMIT
+    retained_times = [failure.at_ms for failure in suspect.failures]
+    assert max(retained_times) - min(retained_times) >= oq.QUARANTINE_SPAN_MS
+    path = tmp_path / "private" / "sidecar.json"
+    oq.write_sidecar(path, state)
+    assert oq.load_sidecar(path) == state
+    assert oq.active_quarantine(oq.load_sidecar(path), {_EVENT: _SHA}) == [(_EVENT, suspect)]
+
+
+@pytest.mark.parametrize("genuine", [False, True], ids=["corrupt-single-failure", "genuine"])
+async def test_restart_honors_only_a_halt_with_qualifying_evidence(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, genuine: bool
+) -> None:
+    harness = _Harness(tmp_path)
+    if genuine:
+        await _quarantine_poison(harness)
+    else:
+        bridge, _, mqtt = await harness.session(execution_scene=_POISON_SCENE)
+        await _offered(mqtt)
+        await _failures_reach(harness, 1)
+        await bridge.async_shutdown()
+        raw = json.loads(harness.sidecar.read_bytes())
+        for suspect in raw["suspects"].values():
+            suspect["quarantined_at_ms"] = harness.clock.now_ms
+        harness.sidecar.write_text(json.dumps(raw))
+    content = harness.sidecar.read_bytes()
+    caplog.clear()
+
+    bridge, _, mqtt = await harness.session("accept")
+    try:
+        if genuine:
+            assert bridge._outbox_reason() == "outbox_quarantine"
+            assert mqtt.poison_offers == 0
+            assert "quarantine sidecar" not in caplog.text
+        else:
+            assert bridge._outbox_reason() != "outbox_quarantine"
+            await _offered(mqtt)
+            assert "quarantine sidecar" in caplog.text
+        assert not mqtt.connection_lost
+    finally:
+        await bridge.async_shutdown()
+    assert harness.sidecar.read_bytes() == content
+
+
+def test_deep_json_under_byte_limit_is_ignored_with_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    content = b"[" * 10_000 + b"0" + b"]" * 10_000
+    assert len(content) < oq.MAX_SIDECAR_BYTES
+    # Exercise the real decoder and prove this fixture reaches its recursion limit.
+    with pytest.raises(RecursionError):
+        json.loads(content)
+    path = tmp_path / "sidecar.json"
+    path.write_bytes(content)
+
+    assert oq.load_sidecar(path) == oq.QuarantineState()
+    assert "RecursionError" in caplog.text
+    assert path.read_bytes() == content
+
+
+async def test_deep_sidecar_does_not_abort_startup_and_pending_record_is_retried(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    harness = _Harness(tmp_path)
+    bridge, _, mqtt = await harness.session("hold", execution_scene=_POISON_SCENE)
+    await _offered(mqtt)
+    await bridge.async_shutdown()
+    content = b"[" * 10_000 + b"0" + b"]" * 10_000
+    harness.sidecar.write_bytes(content)
+    caplog.clear()
+
+    bridge, _, mqtt = await harness.session("accept")
+    try:
+        await _offered(mqtt)
+        assert not mqtt.connection_lost
+        assert bridge._outbox_reason() != "outbox_quarantine"
+        assert "RecursionError" in caplog.text
+    finally:
+        await bridge.async_shutdown()
+    assert harness.sidecar.read_bytes() == content

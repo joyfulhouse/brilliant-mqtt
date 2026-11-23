@@ -966,3 +966,27 @@ def test_outbox_details_appear_only_in_meta_while_reported_and_are_copied() -> N
     assert recorder.meta()["outbox"] == expected
     recorder.note_outbox(None)
     assert recorder.meta() == recorder.snapshot()
+
+
+@pytest.mark.parametrize("timestamp", [1234567890123, 10**600])
+def test_outbox_evidence_replaces_optional_metrics_within_ordinary_budget(timestamp: int) -> None:
+    recorder = ResponseDiagnostics(clock=lambda: 0.0)
+    recorder.note_write_settled("ok", 1.0, 2.0)
+    ordinary = recorder.meta()
+    recorder.note_outbox(
+        {
+            "state": "quarantined",
+            "key": "event:" + "a" * 64,
+            "kind": "event",
+            "payload_bytes": 4 * 1024 * 1024,
+            "payload_sha256": "b" * 64,
+            "failure_count": 8,
+            "quarantined_at_ms": timestamp,
+        }
+    )
+    meta = recorder.meta()
+    assert len(json.dumps(meta, sort_keys=True)) <= len(json.dumps(ordinary, sort_keys=True))
+    assert "outbox" in meta
+    assert recorder.snapshot()["write_ok"] == 1
+    recorder.note_outbox(None)
+    assert recorder.meta() == ordinary

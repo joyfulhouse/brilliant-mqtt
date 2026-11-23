@@ -29,6 +29,7 @@ from brilliant_mqtt.ha_control_protocol import (
     transport_status_topic,
 )
 from brilliant_mqtt.mqttio import AioMqttAdapter
+from brilliant_mqtt.retained_topics import RetainedTopicLedger
 from brilliant_mqtt.scene_bridge import SceneBridge
 from tests.fakes import FakeBus, FakeClockMs, FakeMqtt
 from tests.test_mqttio import _settings
@@ -119,7 +120,11 @@ class _Harness:
             await mqtt.publish(_MANIFEST_TOPIC, "{}", retain=True, qos=1)
         if self.packet_limit is not None:
             # Production publishes panel metadata before starting the scene outbox.
-            panel_bridge = Bridge(bus, mqtt, _PANEL, diagnostics=self.diagnostics)
+            owned = RetainedTopicLedger(_PANEL, self.path.parent / "owned-topics.json")
+            await owned.async_load()
+            panel_bridge = Bridge(
+                bus, mqtt, _PANEL, diagnostics=self.diagnostics, owned_topics=owned
+            )
             await panel_bridge.reconcile()
         bridge = SceneBridge(
             bus,
@@ -552,6 +557,30 @@ async def test_long_poison_identity_never_poisoned_metadata_or_sidecar(tmp_path:
         await asyncio.sleep(0.05)
         assert mqtt.poison_offers == 0
         assert _last_status(mqtt, "scene")["reason"] == "outbox_quarantine"
+    finally:
+        await bridge.async_shutdown()
+
+
+async def test_quarantine_metadata_fits_ordinary_startup_packet_budget(tmp_path: Path) -> None:
+    harness = _Harness(tmp_path)
+    harness.poison_scene = "s" * 2048
+    harness.packet_limit = 850
+    for index in range(3):
+        bridge, bus, mqtt = await harness.session("size")
+        try:
+            if index == 0:
+                await bus.emit(_execution(harness.poison_scene, harness.clock.now_ms))
+            await _offered(mqtt)
+            await _failures_reach(harness, index + 1)
+            await _until(lambda: "outbox" in harness.diagnostics.meta(), "outbox diagnostic")
+        finally:
+            await bridge.async_shutdown()
+        await harness.clock.advance_ms(30_000)
+    bridge, _, mqtt = await harness.session("size")
+    try:
+        assert _last_status(mqtt, "scene")["reason"] == "outbox_quarantine"
+        assert mqtt.poison_offers == 0
+        assert not mqtt.connection_lost
     finally:
         await bridge.async_shutdown()
 

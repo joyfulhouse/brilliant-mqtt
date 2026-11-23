@@ -377,7 +377,7 @@ class _Admin:
                 visibility, _ = _status(record, sha256, current)
             except FileNotFoundError:
                 visibility = "pending"
-            except (OSError, ValueError):
+            except (OSError, ValueError, RecursionError):
                 visibility = "unknown"
             outcome = (
                 "visible"

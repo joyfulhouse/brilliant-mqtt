@@ -8,6 +8,7 @@ with no await to interleave a read/modify/write; no locks or atomics are needed.
 
 from __future__ import annotations
 
+import json
 import time
 from collections import deque
 from collections.abc import Callable
@@ -128,12 +129,17 @@ class ResponseDiagnostics:
         }
 
     def meta(self) -> dict[str, object]:
-        """Return the bridge-meta ``diag`` object: the snapshot plus #113 details.
+        """Return diagnostics without enlarging startup meta for outbox evidence.
 
-        ``outbox`` is present only while the scene outbox has quarantine
-        evidence to report, so the ordinary diag shape is unchanged.
+        Counters keep accumulating while outbox details replace their optional
+        wire snapshot. Clearing the evidence restores the complete snapshot.
         """
         diag: dict[str, object] = dict(self.snapshot())
         if self._outbox is not None:
-            diag["outbox"] = dict(self._outbox)
+            evidence: dict[str, object] = {"v": diag["v"], "outbox": dict(self._outbox)}
+            # Meta is published before the outbox starts. Evidence must fit the
+            # ordinary frame's budget so it cannot poison the next bootstrap.
+            if len(json.dumps(evidence, sort_keys=True)) > len(json.dumps(diag, sort_keys=True)):
+                evidence["outbox"] = {key: self._outbox[key] for key in ("state", "key", "kind")}
+            return evidence
         return diag

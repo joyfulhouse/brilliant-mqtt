@@ -398,7 +398,7 @@ these categories:
 - **Power & electrical**: per-gang `Power` (W) — including always-on circuits —
   plus `Temperature` and a `Fault` problem sensor (diagnostic).
 - **Panel controls** (config category): `Microphone Mute`, `Screen`,
-  `Screen Brightness` (0–10), `Volume` / `Alert Volume` (0–100),
+  `Screen Brightness` (0–15), `Volume` / `Alert Volume` (0–100),
   `Child Lock`, `Night Mode`, `Faceplate LED`, `Illuminance Sensor` enable,
   and an `Identify` button. Disabled-by-default governance/audio extras: see
   [Governance & audio switches](#governance--audio-switches).

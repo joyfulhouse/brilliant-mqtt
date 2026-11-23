@@ -546,7 +546,7 @@ def test_hardware_screen_brightness_number() -> None:
     assert sb.command_var == "screen_brightness"
     assert sb.value_kind == "int"
     assert sb.min_value == 0
-    assert sb.max_value == 10
+    assert sb.max_value == 15
     assert sb.step == 1
     assert sb.entity_category == "config"
 
@@ -794,6 +794,11 @@ def test_payload_fields_hardware() -> None:
         "privacy_toggle": False,
         "current_release_tag": "v26.05.20.2",
     }
+
+
+def test_payload_fields_hardware_screen_brightness_max() -> None:
+    payload = payload_fields(_hardware(screen_brightness="15"))
+    assert payload["screen_brightness"] == 15
 
 
 def test_payload_fields_ui() -> None:

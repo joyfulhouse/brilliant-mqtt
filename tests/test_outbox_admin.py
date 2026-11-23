@@ -391,6 +391,38 @@ async def test_write_error_with_invalid_reread_reports_unknown_visibility(
     assert done["durability"] == "unknown"
 
 
+async def test_release_error_with_deep_json_reread_reports_unknown_visibility(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    harness = await _quarantined_with_dependent(tmp_path)
+    record, sha256 = _event_key(harness)
+    content = b"[" * 10_000 + b"0" + b"]" * 10_000
+    assert len(content) < oq.MAX_SIDECAR_BYTES
+    real_replace = os.replace
+
+    def corrupt_on_replace(source: str | Path, destination: str | Path) -> None:
+        real_replace(source, destination)
+        if Path(destination) == harness.sidecar:
+            harness.sidecar.write_bytes(content)
+            raise OSError(errno.EIO, "replacement cannot be validated")
+
+    monkeypatch.setattr(os, "replace", corrupt_on_replace)
+    code, output = _run(harness, tmp_path, "release", record, sha256)
+
+    assert code == 1 and output == ""
+    error = capsys.readouterr().err
+    assert "current status: unknown; durability unknown" in error
+    assert "Traceback" not in error
+    done = _audit(harness)[-1]
+    assert done["action"] == "release_done"
+    assert done["outcome"] == "unknown"
+    assert done["visibility"] == "unknown"
+    assert done["durability"] == "unknown"
+    assert harness.sidecar.read_bytes() == content
+
+
 async def test_discard_prerename_error_reports_record_and_dependents_still_visible(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
