@@ -13,8 +13,8 @@
 #   * read-only: writes nothing, starts/stops nothing, never connects to the bus
 #     (the bus library is imported only, with bytecode writing disabled);
 #   * systemctl is used only for is-enabled / is-active of message_bus.service;
-#   * no credentials, keys, network identity, Wi-Fi config or certificate
-#     contents are read -- the Hue CA paths are presence checks only;
+#   * no credentials, keys, Wi-Fi config or certificate contents are read;
+#     mount evidence omits network identity; Hue CA paths are presence only;
 #   * POSIX sh (dash / busybox ash), every child's stdin is /dev/null so the
 #     script also works when piped in via `sh -s`;
 #   * output: one header line, then unique key=value lines of printable ASCII.
@@ -114,16 +114,30 @@ fi
 
 # --- bus library -----------------------------------------------------------------
 SP=
-for candidate in "$R"/data/switch-embedded/env/lib/python3.*/site-packages; do
-    if [ -d "$candidate" ]; then
-        SP=$candidate
-        break
+sp_status=unknown
+if [ -x "$PANEL_PYTHON" ]; then
+    # Ask the isolated runtime; firmware updates may leave other versions behind.
+    active_sp=$(bounded 5 "$PANEL_PYTHON" -I -B -c '
+import os, sys, sysconfig
+configured = {sysconfig.get_path(key) for key in ("purelib", "platlib")}
+paths = {os.path.normpath(p) for p in sys.path
+         if (p in configured or p.endswith("/site-packages")) and os.path.isdir(p)}
+print(next(iter(paths)) if len(paths) == 1 else "missing" if not paths else "unknown")
+' </dev/null 2>/dev/null)
+    sp_rc=$?
+    if [ "$sp_rc" -eq 0 ]; then
+        case $active_sp in
+            "$R"/data/switch-embedded/env/lib/python3.*/site-packages | \
+            "$R"/data/switch-embedded/env/lib64/python3.*/site-packages)
+                if [ -d "$active_sp" ]; then SP=$active_sp; fi ;;
+            missing) sp_status=missing ;;
+        esac
     fi
-done
+fi
 if [ -n "$SP" ]; then
     kv site_packages_dir "$(printf '%s\n' "${SP#"$R"}" | first_line)"
 else
-    kv site_packages_dir missing
+    kv site_packages_dir "$sp_status"
 fi
 
 if [ -x "$PANEL_PYTHON" ]; then
@@ -151,6 +165,13 @@ elf_sample=none
 elf_class=none
 elf_machine=none
 elf_arch=none
+if [ -z "$SP" ] && [ "$sp_status" = unknown ]; then
+    so_count=unknown
+    elf_sample=unknown
+    elf_class=unknown
+    elf_machine=unknown
+    elf_arch=unknown
+fi
 if [ -n "$SP" ] && [ -d "$SP/lib" ]; then
     have_find=0
     if command -v find >/dev/null 2>&1; then have_find=1; fi
@@ -201,7 +222,11 @@ kv bus_library_elf_class "$(or_unknown "$elf_class")"
 kv bus_library_elf_machine "$(or_unknown "$elf_machine")"
 kv bus_library_elf_arch "$elf_arch"
 
-kv bus_socket_present "$(present "$R/var/run/brilliant/server_socket")"
+if [ -S "$R/var/run/brilliant/server_socket" ]; then
+    kv bus_socket_present 1
+else
+    kv bus_socket_present 0
+fi
 
 if command -v systemctl >/dev/null 2>&1; then
     kv message_bus_enabled "$(or_unknown "$(bounded 5 systemctl is-enabled message_bus.service \
@@ -217,7 +242,14 @@ fi
 for mp in var data; do
     mount_line=
     if [ -r "$R/proc/mounts" ]; then
-        mount_line=$(awk -v m="/$mp" '$2 == m { t = $3; o = $4; f = 1 }
+        # Only access mode is public qualification evidence; other options can
+        # contain server/client addresses, user names, and private paths.
+        mount_line=$(awk -v m="/$mp" '$2 == m {
+                t = $3; o = "unknown"; f = 1
+                n = split($4, options, ",")
+                for (i = 1; i <= n; i++)
+                    if (options[i] == "ro" || options[i] == "rw") o = options[i]
+            }
             END { if (f) print t " " o }' "$R/proc/mounts" </dev/null 2>/dev/null)
     fi
     if [ -n "$mount_line" ]; then
