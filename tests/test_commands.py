@@ -317,7 +317,8 @@ class TestTranslateAuxInt:
         assert translate_aux("", "int") is None
 
     def test_in_range_unchanged(self) -> None:
-        assert translate_aux("7", "int", min_value=0, max_value=10) == "7"
+        assert translate_aux("7", "int", min_value=0, max_value=15) == "7"
+        assert translate_aux("15", "int", min_value=0, max_value=15) == "15"
 
 
 class TestTranslateAuxNeverRaises:
