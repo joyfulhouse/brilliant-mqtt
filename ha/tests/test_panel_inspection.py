@@ -438,6 +438,31 @@ async def test_unsupported_or_undersized_panel_has_stable_code(
     assert str(raised.value) == code
 
 
+async def test_i350_aarch64_panel_is_still_refused() -> None:
+    """Issue #155: an i350 (aarch64, Python 3.10.13) panel stays gated until qualified."""
+    shell = await _connected_shell(
+        RunResult(0, _output(architecture="aarch64", python_version="Python 3.10.13"), "")
+    )
+
+    with pytest.raises(PanelCompatibilityError) as raised:
+        await async_inspect_panel(shell, _IDENTITY)
+
+    assert raised.value.code == "unsupported_architecture"
+
+
+@pytest.mark.parametrize(
+    "architecture",
+    ("aarch64", "x86_64", "armv8l", "arm64", "AARCH64", "aarch64 ", ""),
+)
+async def test_only_armv7l_architecture_is_accepted(architecture: str) -> None:
+    shell = await _connected_shell(RunResult(0, _output(architecture=architecture), ""))
+
+    with pytest.raises(PanelCompatibilityError) as raised:
+        await async_inspect_panel(shell, _IDENTITY)
+
+    assert raised.value.code == "unsupported_architecture"
+
+
 @pytest.mark.parametrize(
     "stdout",
     (
