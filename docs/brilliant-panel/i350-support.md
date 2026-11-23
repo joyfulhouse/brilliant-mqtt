@@ -11,28 +11,32 @@ Experimental admission does not establish full i350 qualification. Tracking issu
 
 The newer i350 panels report `aarch64` from `uname -m` and run a MediaTek
 kernel (`5.15.x-mtk`) with Python 3.10.x. The panel Python version is
-compatible. The contributor's pilot in #155 reports native bus import,
-onboarding, discovery, telemetry, watchdogs and Hue CA recovery on one i350.
-OTA persistence and HA Control remain unproven; a new panel still needs its
-own qualification evidence and rollback plan.
+compatible. A contributor reported a diagnostic and experimental opt-in pilot
+in [#155](https://github.com/joyfulhouse/brilliant-mqtt/issues/155#issuecomment-7065744176)
+(see [#281](https://github.com/joyfulhouse/brilliant-mqtt/pull/281)): native
+bus-library import and AArch64 ELF evidence, 56 entities with none unavailable,
+healthy Wi-Fi and bus watchdogs, and working Hue CA recovery. This is useful
+pilot evidence, but OTA survival of `/var` and HA Control remain unverified;
+voice was not installed. Full qualification is still pending.
 
 ## What is and isn't architecture-bound
 
 | Part | Architecture dependency | i350 status |
 |---|---|---|
 | Bridge agent payload (`brilliant_mqtt`, vendored `aiomqtt`/`paho-mqtt`) | None. It is pure Python with no native code. | Should load. It still depends on Brilliant's message-bus library on the panel. |
-| Brilliant message-bus library (`lib.message_bus_api`, compiled Cython `.so`) | Ships with the firmware and is built for the panel's own architecture | One contributor i350 reports an aarch64 import and working core entities; check the exact panel's schema and runtime (gates 1 and 3). |
+| Brilliant message-bus library (`lib.message_bus_api`, compiled Cython `.so`) | Ships with the firmware and is built for the panel's own architecture | Contributor reports native import and AArch64 ELF evidence. Full schema qualification remains pending (gates 1 and 3). |
 | Wi-Fi watchdog last-resort reset (GPIO 2/5 + `sdhci-esdhc-imx` unbind) | i.MX6 only. It copies Brilliant's i.MX6 reset sequence. | Requires the `mmc1` alias target to be bound to the i.MX sdhci driver; otherwise skips unbind and all GPIO writes with a warning. The guarded reboot still runs. The soft reconnect and service-restart rungs need `connmanctl` and `systemctl`. |
 | Voice satellite payload | armv7l only (prebuilt armv7hf Python, wheels and libraries) | Upload, configuration, enable and restart refuse other architectures, including repair of an existing payload and wake-word updates. Inspection and removal remain available. |
-| Hue CA recovery (`brilliant_hue_ca`) | Hardcoded `python3.10` site-packages path and Hue peripheral paths | Reported working on the contributor's pilot. The diagnostic reports whether each path is present on another panel. |
+| Hue CA recovery (`brilliant_hue_ca`) | Hardcoded `python3.10` site-packages path and Hue peripheral paths | Contributor reports working recovery. The diagnostic reports whether each path is present. |
 
 ## Run the read-only diagnostic
 
 [`scripts/brilliant-panel/panel_diagnostics.sh`](../../scripts/brilliant-panel/panel_diagnostics.sh)
 is a POSIX `sh` script that runs read-only on the panel. It writes nothing,
 starts or stops nothing, never connects to the message bus, and never reads
-credentials, keys, network identity, Wi-Fi configuration or certificate
-contents. Run it from a workstation checkout of this repo:
+credentials, keys, Wi-Fi configuration or certificate contents. Mount options
+are filtered to `ro`/`rw`; network identities and private paths are omitted.
+Run it from a workstation checkout of this repo:
 
 ```bash
 ssh -o NumberOfPasswordPrompts=1 root@<panel-ip> 'sh -s' \
@@ -48,12 +52,12 @@ followed by `key=value` lines:
 | `machine`, `kernel_release` | `uname -m` / `uname -r` |
 | `panel_python_present`, `panel_python_version` | The firmware Python at `/data/switch-embedded/env/bin/python3` |
 | `release_tag` | The firmware `release_tag` from `/etc/release_info.json` |
-| `site_packages_dir` | The firmware site-packages directory, or `missing` |
+| `site_packages_dir` | The active firmware interpreter's site-packages directory, found with isolated `python3 -I -B` using `sysconfig` and `sys.path`; `missing` if absent, `unknown` if ambiguous or the probe fails. Inactive version directories are ignored. |
 | `bus_library_import` | Whether `RPCObserver` imports (`ok`, `failed: …`, `failed: timed out`). The library is imported only (isolated `python3 -I -B`), never connected. The import is bounded at 20 s unless `timeout_mode=unbounded`. |
 | `bus_library_so_count`, `bus_library_elf_sample`, `bus_library_elf_class`, `bus_library_elf_machine`, `bus_library_elf_arch` | How many native `.so` files are under the bus library's `lib/` package (`unknown` without `find`), and the ELF class/machine of one sampled `.so` (`2`/`183` = AArch64, `1`/`40` = 32-bit ARM). The sample is the first `lib/message_bus_api/*.so`, else the first `.so` under `lib/`; its path is reported relative to site-packages. Without `od` the ELF fields are `unknown`. |
-| `bus_socket_present` | Whether `/var/run/brilliant/server_socket` exists |
+| `bus_socket_present` | Whether `/var/run/brilliant/server_socket` is a Unix socket (`-S`); no connection is made |
 | `message_bus_enabled`, `message_bus_active` | `systemctl is-enabled` / `is-active message_bus.service` |
-| `var_mount_*`, `data_mount_*`, `var_free_kib`, `data_free_kib` | Filesystem type and options of the mount entries for `/var` and `/data` (the last entry for each path in `/proc/mounts`), and the free space on each |
+| `var_mount_*`, `data_mount_*`, `var_free_kib`, `data_free_kib` | Filesystem type and allowlisted access mode (`ro`/`rw`, or `unknown`) for `/var` and `/data` (the last entry for each path in `/proc/mounts`), and free space. Other options, including network addresses and private paths, are omitted. |
 | `wlan0_present`, `iw_present`, `connmanctl_present` | Wi-Fi interface and tool presence. The tools are looked up only, never run. |
 | `mmc_drivers`, `imx_sdhci_driver_present` | The SD/MMC host drivers registered on the panel, and whether the i.MX driver that the watchdog reset targets is present |
 | `mem_total_kib`, `cpu_count` | Memory and CPU count |

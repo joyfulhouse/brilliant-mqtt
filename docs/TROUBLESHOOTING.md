@@ -36,9 +36,12 @@ Reset to `LOG_LEVEL=INFO` when done.
 
 Setup stopped with `unsupported_architecture`. brilliant-mqtt is qualified only
 on armv7l (i.MX6) Brilliant Controls. Newer i350 panels report `aarch64` and are
-**not supported yet**. This is deliberate. Do not patch the check out: nobody
-has verified that the bridge, its watchdogs or the voice satellite work on that
-hardware.
+**not supported yet**. This is deliberate. A contributor's experimental pilot
+in [#155](https://github.com/joyfulhouse/brilliant-mqtt/issues/155#issuecomment-7065744176)
+reports native bus-library import, core entities, healthy Wi-Fi and bus
+watchdogs, and working Hue CA recovery. OTA survival of `/var` and HA Control
+remain unverified; voice was not installed. Full qualification is still pending,
+so keep the architecture check in place.
 
 If you have an i350 and want to help qualify it, run the read-only diagnostic
 from a checkout of this repo and attach the output to

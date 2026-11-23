@@ -200,7 +200,21 @@ def _build(tmp_path: Path, panel: Panel) -> tuple[Path, Path, dict[str, str]]:
     if panel.release_info is not None:
         _write(root / "etc/release_info.json", panel.release_info)
     if panel.socket:
-        _write(root / "var/run/brilliant/server_socket", "")
+        socket_dir = root / "var/run/brilliant"
+        socket_dir.mkdir(parents=True)
+        # Bind a relative name to stay below AF_UNIX's path limit in long worktrees.
+        subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-B",
+                "-c",
+                "import socket; s = socket.socket(socket.AF_UNIX); "
+                "s.bind('server_socket'); s.close()",
+            ],
+            cwd=socket_dir,
+            check=True,
+        )
     _write(root / "proc/mounts", panel.mounts)
     _write(root / "proc/meminfo", "MemTotal:        1999580 kB\nMemFree:  12 kB\n")
     _write(root / "proc/cpuinfo", panel.cpuinfo)
@@ -249,20 +263,26 @@ def _run(
     shell: tuple[str, ...] = ("/bin/sh",),
 ) -> tuple[dict[str, str], Path, Path]:
     root, logs, env = _build(tmp_path, panel or Panel())
+    # Standalone BusyBox ash prefers applets over PATH. Shell functions still
+    # take precedence, so every fake script is executed by its absolute path.
+    prelude = "".join(
+        f'{tool.name}() {{ {shlex.quote(str(tool))} "$@"; }}\n'
+        for tool in sorted(Path(env["PATH"]).iterdir())
+        if not tool.is_symlink()
+    )
     if stdin_mode:
-        with SCRIPT.open("rb") as script:
-            result = subprocess.run(
-                [*shell, "-s"],
-                stdin=script,
-                cwd=cwd or tmp_path,
-                env=env,
-                check=False,
-                capture_output=True,
-                timeout=120,
-            )
+        result = subprocess.run(
+            [*shell, "-s"],
+            input=(prelude + SCRIPT.read_text()).encode("ascii"),
+            cwd=cwd or tmp_path,
+            env=env,
+            check=False,
+            capture_output=True,
+            timeout=120,
+        )
     else:
         result = subprocess.run(
-            [*shell, str(SCRIPT)],
+            [*shell, "-c", prelude + '. "$1"', "diagnostic-fixture", str(SCRIPT)],
             stdin=subprocess.DEVNULL,
             cwd=cwd or tmp_path,
             env=env,
@@ -300,9 +320,9 @@ def test_full_i350_style_report(tmp_path: Path) -> None:
         "message_bus_enabled": "enabled",
         "message_bus_active": "active",
         "var_mount_fstype": "ext4",
-        "var_mount_options": "rw,relatime",
+        "var_mount_options": "rw",
         "data_mount_fstype": "ext4",
-        "data_mount_options": "ro,relatime",
+        "data_mount_options": "ro",
         "var_free_kib": values["var_free_kib"],
         "data_free_kib": values["data_free_kib"],
         "wlan0_present": "1",
@@ -423,6 +443,95 @@ def test_no_socket(tmp_path: Path) -> None:
     assert values["bus_socket_present"] == "0"
 
 
+@pytest.mark.parametrize("kind", ("file", "directory", "dangling_link"))
+def test_non_socket_path_is_not_a_bus_socket(tmp_path: Path, kind: str) -> None:
+    root, _logs, env = _build(tmp_path, Panel(socket=False))
+    target = root / "var/run/brilliant/server_socket"
+    target.parent.mkdir(parents=True)
+    if kind == "file":
+        target.touch()
+    elif kind == "directory":
+        target.mkdir()
+    else:
+        target.symlink_to("missing")
+    report = subprocess.run(
+        ["/bin/sh", str(SCRIPT)],
+        env=env,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert _parse(report.stdout)["bus_socket_present"] == "0"
+
+
+def test_native_evidence_uses_active_runtime_not_first_package_tree(tmp_path: Path) -> None:
+    root, _logs, env = _build(tmp_path, Panel())
+    # This stale version sorts before the active Python 3.10 tree.
+    stale = root / "data/switch-embedded/env/lib/python3.1/site-packages/lib/message_bus_api"
+    stale.mkdir(parents=True)
+    (stale / "old.so").write_bytes(_elf_header(1, 40))
+    report = subprocess.run(
+        ["/bin/sh", str(SCRIPT)],
+        env=env,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    values = _parse(report.stdout)
+    assert values["bus_library_import"] == "ok"
+    assert values["site_packages_dir"] == "/" + _SP310
+    assert values["bus_library_elf_arch"] == "aarch64"
+    assert values["bus_library_so_count"] == "3"
+
+
+@pytest.mark.parametrize("probe", ("ambiguous", "failed"))
+def test_uncertain_runtime_does_not_guess_native_evidence(tmp_path: Path, probe: str) -> None:
+    root, _logs, env = _build(tmp_path, Panel())
+    if probe == "ambiguous":
+        extra = root / "data/switch-embedded/env/lib/python3.11/site-packages"
+        extra.mkdir(parents=True)
+        _write(root / _SP310 / "other-runtime.pth", str(extra) + "\n")
+    else:
+        python = root / "data/switch-embedded/env/bin/python3"
+        python.write_text(
+            python.read_text().replace(
+                "#!/bin/sh\n", '#!/bin/sh\ncase "$*" in *sysconfig*) exit 1 ;; esac\n', 1
+            )
+        )
+    report = subprocess.run(
+        ["/bin/sh", str(SCRIPT)],
+        env=env,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    values = _parse(report.stdout)
+    assert values["bus_library_import"] == "ok"
+    assert values["site_packages_dir"] == "unknown"
+    assert values["bus_library_so_count"] == "unknown"
+    assert values["bus_library_elf_sample"] == "unknown"
+    assert values["bus_library_elf_arch"] == "unknown"
+
+
+@pytest.mark.parametrize("mp", ("var", "data"))
+@pytest.mark.parametrize("access", ("ro", "rw"))
+def test_network_mount_options_do_not_expose_identity(tmp_path: Path, mp: str, access: str) -> None:
+    mounts = (
+        f"private-server:/export /{mp} nfs4 {access},vers=4.2,"
+        "clientaddr=192.0.2.17,addr=192.0.2.32,"
+        "clientaddr=2001:db8::17,addr=2001:db8::32,username=private-user 0 0\n"
+    )
+    values, _root, _logs = _run(tmp_path, Panel(mounts=mounts))
+    assert values[f"{mp}_mount_fstype"] == "nfs4"
+    assert values[f"{mp}_mount_options"] == access
+    output = "\n".join(values.values())
+    for private in ("private-server", "private-user", "192.0.2.", "2001:db8:", "/export"):
+        assert private not in output
+
+
 def test_no_panel_python(tmp_path: Path) -> None:
     values, _root, _logs = _run(tmp_path, Panel(python=False))
     assert values["panel_python_present"] == "0"
@@ -432,10 +541,11 @@ def test_no_panel_python(tmp_path: Path) -> None:
 
 def test_python311_layout(tmp_path: Path) -> None:
     values, _root, _logs = _run(tmp_path, Panel(py_dir="python3.11"))
-    assert values["site_packages_dir"] == "/data/switch-embedded/env/lib/python3.11/site-packages"
+    assert values["site_packages_dir"] == "missing"
     # The panel interpreter's venv only searches its own python3.X directory.
     assert values["bus_library_import"].startswith("failed: exit 1: ModuleNotFoundError")
-    assert values["bus_library_so_count"] == "3"
+    assert values["bus_library_so_count"] == "0"
+    assert values["bus_library_elf_arch"] == "none"
     # The Hue CA paths are hardcoded to python3.10 by src/brilliant_hue_ca.
     assert values["hue_site_packages_present"] == "0"
 
@@ -460,9 +570,9 @@ def test_stacked_mounts_last_entry_wins(tmp_path: Path) -> None:
     )
     values, _root, _logs = _run(tmp_path, Panel(mounts=mounts))
     assert values["var_mount_fstype"] == "overlay"
-    assert values["var_mount_options"] == "rw,lowerdir=/a"
+    assert values["var_mount_options"] == "rw"
     assert values["data_mount_fstype"] == "tmpfs"
-    assert values["data_mount_options"] == "rw,nosuid"
+    assert values["data_mount_options"] == "rw"
 
 
 def test_unmounted_paths_report_none(tmp_path: Path) -> None:
@@ -627,13 +737,16 @@ def test_unusable_timeout_runs_unbounded(
 
 
 @pytest.mark.skipif(shutil.which("busybox") is None, reason="busybox not installed")
-def test_busybox_sh_matches_posix_sh(tmp_path: Path) -> None:
+@pytest.mark.parametrize("stdin_mode", (False, True), ids=("script", "stdin"))
+@pytest.mark.parametrize("timeout_style", ("gnu", "busybox", "busybox_old", "broken"))
+def test_busybox_sh_matches_posix_sh(tmp_path: Path, stdin_mode: bool, timeout_style: str) -> None:
     busybox = shutil.which("busybox")
     assert busybox is not None
     (tmp_path / "a").mkdir()
     (tmp_path / "b").mkdir()
-    expected, _root, _logs = _run(tmp_path / "a")
-    actual, _root, _logs = _run(tmp_path / "b", shell=(busybox, "sh"))
+    panel = Panel(timeout=timeout_style)
+    expected, _root, _logs = _run(tmp_path / "a", panel, stdin_mode=stdin_mode)
+    actual, _root, _logs = _run(tmp_path / "b", panel, shell=(busybox, "sh"), stdin_mode=stdin_mode)
     for key in ("var_free_kib", "data_free_kib"):
         expected.pop(key)
         actual.pop(key)
