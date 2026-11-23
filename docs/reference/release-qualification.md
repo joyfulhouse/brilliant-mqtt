@@ -75,28 +75,26 @@ the 2026-10-26 rollback rehearsal exercised.
 **(b) Onboarding conversion: unqualified.** Adding a panel through onboarding
 runs `PanelProvisioner.async_install`, the journaled conversion from the fixed
 layout to `current`/`releases`. The flow reaches it from `_async_provision`
-(`custom_components/brilliant_mqtt/flow/onboarding.py:604`). It runs only if
+in `custom_components/brilliant_mqtt/flow/onboarding.py`. It runs only if
 all of the following hold:
 
 - The panel is not already configured. Onboarding looks up the panel's SSH
-  identity with `_duplicate_panel` (`flow/onboarding.py:260`) and aborts with
-  `already_configured` (`flow/onboarding.py:319`). The provisioner repeats the
-  check as `duplicate_panel` (`panel_provisioner.py:1129`).
+  identity with `_duplicate_panel` in `_async_accept_panel_connection` and
+  aborts with `already_configured`. `PanelProvisioner.async_install` repeats
+  the check as `duplicate_panel`.
 - The installed code differs from the bundle. Otherwise release admission is a
-  no-op and the install stops with `release_unchanged`
-  (`panel_provisioner.py:1168-1169`), which the flow shows as an abort
-  (`flow/onboarding.py:462-463`).
+  no-op for code and ordinal and the install stops with `release_unchanged`,
+  which `async_step_panel_confirm` shows as an abort.
 - Every selected component changes. Otherwise it stops with
-  `release_selection_conflict` (`panel_provisioner.py:1170-1171`).
+  `release_selection_conflict` in `PanelProvisioner.async_install`.
 
 When it runs, it snapshots the panel and journals the operation as `UPGRADE`
-for any snapshot that is not `ABSENT` (`panel_provisioner.py:1219-1223`),
-stages the release with `stage_release` (`panel_provisioner.py:1266`), and
-activation repoints `current` at the staged release (`activate_staged`,
-`panel_provisioner.py:1338`; the link swap is `panel_ops.py:1706-1709`). Rolling
+for any snapshot that is not `ABSENT`, stages the release with `stage_release`,
+and activation repoints `current` at the staged release (`activate_staged`
+and `_activation_commit_command` in `panel_ops.py`). Rolling
 back a converted legacy panel restores the saved fixed-layout files and removes
-`current` (`panel_ops.py:1906`). Off-panel coverage is partial: the tests in
-`ha/tests` exercise parts of this sequence with fakes, not a complete
+`current` (`rollback_snapshot` in `panel_ops.py`). Off-panel coverage is partial:
+the tests in `ha/tests` exercise parts of this sequence with fakes, not a complete
 legacy-to-release conversion and rollback on a real tree, and it has not been
 rehearsed on a panel. Use path (a) for qualified upgrades of legacy panels.
 
@@ -170,11 +168,14 @@ directory; the helper still runs from standard input with its arguments.
 The integration publishes an ordinal only after an install that changes code:
 it hashes the newly selected bytes and then records the candidate's ordinal.
 When the installed digest already equals the candidate, release admission is a
-no-op, so the Update entity and `brilliant_mqtt.redeploy` return without
-writing anything and onboarding aborts with `release_unchanged`. A legacy or
+no-op for code and ordinal, so the Update entity and `brilliant_mqtt.redeploy`
+return without changing code or ordinal and onboarding aborts with
+`release_unchanged`. Admission uses the persisting `installed_identities`
+scan and may still create or refresh a private identity record with an unknown
+ordinal. Only the identity CLI collection is strictly read-only. A legacy or
 manual install whose code already equals the current release therefore stays
 `unknown` until the next supported update that changes its code. Rerunning
-update or redeploy does not enroll it.
+update or redeploy does not prove or assign its release ordinal.
 
 In that case the `diff` above stops on the ordinal column alone. Record the
 result as **code matches, ordinal unproven**, not as a pass, and keep the
@@ -188,9 +189,10 @@ cover code, not the complete installed unit or mutable configuration: retain
 the provisioner's verified unit and configuration evidence, and check each
 component's installed unit, version, resource limits and running process
 separately. A match for only `bus.py`, `mqttio.py` or `VERSION` does not
-substitute for complete component parity. Both modes print no file contents,
-environment values, credentials, deployment ID or paths, and report an
-unreadable installed file only by its error type.
+substitute for complete component parity. Successful TSV output from both modes
+contains no file contents, environment values, credentials, deployment ID or
+paths. Errors on stderr can include logical relative filenames; review stderr
+before sharing it.
 
 ## Rollback rehearsal
 
@@ -300,7 +302,7 @@ path/hash manifests where appropriate.
 ```text
 Decision: PASS / FAIL / ABORTED / INCONCLUSIVE
 Timestamp and operator/reviewer:
-Release tag / commit / version / ordinal (current: v0.11.3 / 5):
+Release tag / commit / version / ordinal selected for this window:
 Loaded-HA integration and payload manifest digests:
 Panel layout / per-component digests / versions, before and after:
 Installed unit and resource-limit verification:

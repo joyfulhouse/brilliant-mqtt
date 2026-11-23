@@ -719,6 +719,163 @@ def test_release_link_layout_is_detected(tmp_path: Path) -> None:
     ]
 
 
+@pytest.mark.parametrize(
+    "decoration",
+    [
+        "# Prior layout: /var/brilliant-mqtt/current/app\n",
+        "  ; Prior layout: /var/brilliant-mqtt/current/app\n",
+        "Description=Prior layout: /var/brilliant-mqtt/current/app\n",
+        "Environment=UNRELATED=/var/brilliant-mqtt/current/app\n",
+    ],
+)
+@pytest.mark.parametrize("release_unit", [False, True])
+def test_unit_code_directives_select_the_actual_tree(
+    tmp_path: Path, decoration: str, release_unit: bool
+) -> None:
+    payload = _make_payload(tmp_path)
+    panel, units, env = _make_legacy_panel(tmp_path, payload)
+    release = panel / "releases" / _RELEASE_NAME
+    shutil.copytree(payload, release)
+    (panel / "current").symlink_to(release)
+    _write(panel / "app/brilliant_mqtt/bridge.py", "different fixed code")
+    helper = _load_helper()
+    fixed_digest = helper.code_digest(panel, "bridge")
+    release_digest = helper.code_digest(release, "bridge")
+    assert fixed_digest != release_digest
+    filename = "brilliant-mqtt-release.service" if release_unit else "brilliant-mqtt.service"
+    unit = (_PAYLOAD / filename).read_text()
+    unit = unit.replace("[Service]\n", "[Service]\n" + decoration)
+    _write(units / "brilliant-mqtt.service", unit)
+
+    result = _identity_run(panel, units, env, "bridge")
+
+    assert result.returncode == 0, result.stderr
+    digest = release_digest if release_unit else fixed_digest
+    layout = "release_link" if release_unit else "legacy_fixed"
+    assert result.stdout == f"bridge\t0.11.3\tunknown\t{digest}\t{layout}\n"
+
+
+@pytest.mark.parametrize(
+    "directives",
+    [
+        "WorkingDirectory=/var/brilliant-mqtt/current/app\n"
+        "Environment=PYTHONPATH=/var/brilliant-mqtt/app:/var/brilliant-mqtt/vendor\n",
+        "Environment=PYTHONPATH=/var/brilliant-mqtt/current/app:/var/brilliant-mqtt/vendor\n",
+        "ExecStart=/usr/bin/python3 -m brilliant_mqtt\n",
+    ],
+)
+def test_unit_with_ambiguous_code_selection_fails(tmp_path: Path, directives: str) -> None:
+    payload = _make_payload(tmp_path)
+    panel, units, env = _make_legacy_panel(tmp_path, payload)
+    release = panel / "releases" / _RELEASE_NAME
+    shutil.copytree(payload, release)
+    (panel / "current").symlink_to(release)
+    _write(panel / "app/brilliant_mqtt/bridge.py", "different fixed code")
+    _write(units / "brilliant-mqtt.service", "[Service]\n" + directives)
+
+    result = _identity_run(panel, units, env, "bridge")
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert result.stderr == "bundle-manifest: ambiguous installed code selection\n"
+
+
+@pytest.mark.parametrize(
+    "directives",
+    [
+        'Environment="PYTHONPATH=/var/brilliant-mqtt/current/app:'
+        '/var/brilliant-mqtt/current/vendor"\n',
+        "Environment=UNRELATED=ignored \\\n"
+        "# Ignore this continued-line comment: /var/brilliant-mqtt/app\n"
+        ' "PYTHONPATH=/var/brilliant-mqtt/current/app:/var/brilliant-mqtt/current/vendor"\n',
+        "ExecStart=/usr/bin/python3 /var/brilliant-mqtt/current/app/main.py\n",
+    ],
+)
+def test_unit_code_selection_handles_quotes_continuations_and_execstart(
+    tmp_path: Path, directives: str
+) -> None:
+    payload = _make_payload(tmp_path)
+    panel, units, env = _make_legacy_panel(tmp_path, payload)
+    release = panel / "releases" / _RELEASE_NAME
+    shutil.copytree(payload, release)
+    (panel / "current").symlink_to(release)
+    _write(panel / "app/brilliant_mqtt/bridge.py", "different fixed code")
+    _write(units / "brilliant-mqtt.service", "[Service]\n" + directives)
+
+    result = _identity_run(panel, units, env, "bridge")
+
+    assert result.returncode == 0, result.stderr
+    digest = _load_helper().code_digest(release, "bridge")
+    assert result.stdout == f"bridge\t0.11.3\tunknown\t{digest}\trelease_link\n"
+
+
+def test_bridge_only_ignores_missing_enrolled_unselected_watchdog(tmp_path: Path) -> None:
+    payload = _make_payload(tmp_path)
+    panel, units, env = _make_legacy_panel(tmp_path, payload)
+    helper = _load_helper()
+    _enroll(helper, panel, units, env, 5)
+    shutil.rmtree(panel / "bus_watchdog")
+    before = _snapshot(tmp_path)
+
+    result = _identity_run(panel, units, env, "bridge")
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == (
+        f"bridge\t0.11.3\t5\t{helper.code_digest(panel, 'bridge')}\tlegacy_fixed\n"
+    )
+    assert _snapshot(tmp_path) == before
+
+
+def test_missing_enrolled_selected_watchdog_still_fails(tmp_path: Path) -> None:
+    payload = _make_payload(tmp_path)
+    panel, units, env = _make_legacy_panel(tmp_path, payload)
+    helper = _load_helper()
+    _enroll(helper, panel, units, env, 5)
+    shutil.rmtree(panel / "bus_watchdog")
+
+    result = _identity_run(panel, units, env, "bridge", "bus_watchdog")
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert result.stderr == "bundle-manifest: recorded installed code is missing\n"
+    with pytest.raises(helper.ManifestError, match="recorded installed code is missing"):
+        helper.installed_identities(panel, units, env)
+
+
+def test_mutating_scan_cannot_limit_its_components(tmp_path: Path) -> None:
+    helper = _load_helper()
+    with pytest.raises(helper.ManifestError, match="component selection requires persist=False"):
+        helper.installed_identities(tmp_path, components=["bridge"])
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("component", ["wifi_watchdog", "bus_watchdog"])
+def test_selected_historical_watchdog_keeps_bridge_version_fallback(
+    tmp_path: Path, component: str
+) -> None:
+    payload = _make_payload(tmp_path, version="0.10.0")
+    panel, units, env = _make_legacy_panel(tmp_path, payload)
+    (panel / component / "VERSION").unlink()
+
+    result = _identity_run(panel, units, env, component)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith(f"{component}\t0.10.0\tunknown\t")
+
+
+def test_selected_watchdog_does_not_inherit_version_from_absent_bridge(tmp_path: Path) -> None:
+    payload = _make_payload(tmp_path, version="0.10.0")
+    panel, units, env = _make_legacy_panel(tmp_path, payload)
+    (panel / "bus_watchdog/VERSION").unlink()
+    shutil.rmtree(panel / "app")
+    shutil.rmtree(panel / "vendor")
+
+    result = _identity_run(panel, units, env, "bus_watchdog")
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("bus_watchdog\tunknown\tunknown\t")
+
+
 def test_unit_root_and_env_are_forwarded_only_when_given(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -739,9 +896,9 @@ def test_unit_root_and_env_are_forwarded_only_when_given(
     assert helper.main([*base, "--env", "e"]) == 0
 
     assert calls == [
-        (tmp_path, {"persist": False}),
-        (tmp_path, {"persist": False, "unit_root": tmp_path / "units"}),
-        (tmp_path, {"persist": False, "env_path": Path("e")}),
+        (tmp_path, {"persist": False, "components": ["bridge"]}),
+        (tmp_path, {"persist": False, "components": ["bridge"], "unit_root": tmp_path / "units"}),
+        (tmp_path, {"persist": False, "components": ["bridge"], "env_path": Path("e")}),
     ]
     assert capsys.readouterr().out == "bridge\tmissing\n" * 3
 

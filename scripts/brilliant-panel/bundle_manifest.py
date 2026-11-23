@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import stat
 import sys
@@ -460,18 +461,76 @@ def private_record(
         os.close(directory_fd)
 
 
+def _unit_selects_release(unit: Path) -> bool:
+    """Require one layout in the service's code-bearing directives."""
+    directives: dict[str, list[str]] = {}
+    section = ""
+    pending = ""
+    for raw in unit.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+        line = pending + line
+        if line.endswith("\\"):
+            pending = line[:-1] + " "
+            continue
+        pending = ""
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1]
+            continue
+        key, separator, value = line.partition("=")
+        key, value = key.strip(), value.strip()
+        if section != "Service" or not separator:
+            continue
+        if key not in ("Environment", "WorkingDirectory", "ExecStart"):
+            continue
+        if not value or key == "WorkingDirectory":
+            directives[key] = []
+        if value:
+            directives.setdefault(key, []).append(value)
+    if pending:
+        raise ManifestError("ambiguous installed code selection")
+    layouts: set[bool] = set()
+    for key, values in directives.items():
+        for value in values:
+            try:
+                words = shlex.split(value)
+            except ValueError:
+                raise ManifestError("ambiguous installed code selection") from None
+            if key == "Environment":
+                words = [word.partition("=")[2] for word in words if word.startswith("PYTHONPATH=")]
+            for word in words:
+                for match in re.finditer(
+                    r"/var/brilliant-mqtt/(current/)?(?:app|vendor|wifi_watchdog|bus_watchdog)"
+                    r"(?=/|:|$)",
+                    word,
+                ):
+                    layouts.add(match.group(1) is not None)
+    if len(layouts) != 1:
+        raise ManifestError("ambiguous installed code selection")
+    return layouts.pop()
+
+
 def installed_identities(
     root: Path,
     unit_root: Path = Path("/etc/systemd/system"),
     env_path: Path = Path("/etc/brilliant-mqtt.env"),
     *,
     persist: bool = True,
+    components: list[str] | None = None,
 ) -> dict[str, dict[str, object] | None]:
     """Hash the live selection and enroll legacy installs without claiming age.
 
     ``persist=False`` is the strictly read-only view used for qualification over
     SSH: existing records are consulted but nothing is created, updated or made.
+    Only this view may limit its scan to selected components; mutating callers
+    always validate every core component.
     """
+    if components is not None and persist:
+        raise ManifestError("component selection requires persist=False")
+    selected = list(CORE_TREES) if components is None else components
+    if any(component not in CORE_TREES for component in selected):
+        raise ManifestError("unknown installed component")
     selector = _panel_release_selector(root) if os.path.lexists(root / "current") else None
     output: dict[str, dict[str, object] | None] = {}
     deployment_id = None
@@ -482,6 +541,8 @@ def installed_identities(
                 if re.fullmatch(r"[0-9A-Za-z_-]{1,128}", deployment_id) is None:
                     raise ManifestError("invalid installed deployment identity")
     for component in CORE_TREES:
+        if component not in selected:
+            continue
         service = (
             "brilliant-mqtt"
             if component == "bridge"
@@ -493,10 +554,7 @@ def installed_identities(
             unit = staged_directory / (service + ".service")
         selected_release = selector is not None
         if selector is not None and unit.exists():
-            unit_bytes = unit.read_bytes()
-            if b"/var/brilliant-mqtt/current/" not in unit_bytes:
-                # A surviving current link must not hide an already selected legacy unit.
-                selected_release = False
+            selected_release = _unit_selects_release(unit)
         active_root = selector.active_root if selector is not None and selected_release else root
         digest = code_digest(active_root, component)
         if digest is None:
@@ -514,11 +572,18 @@ def installed_identities(
         if component != "bridge" and not selected_release and not version_path.exists():
             bridge = output.get("bridge")
             bridge_version = bridge.get("version") if bridge is not None else None
+            legacy_bridge = bridge is not None and bridge.get("layout") == "legacy_fixed"
+            if (
+                "bridge" not in selected
+                and selector is None
+                and any(os.path.lexists(root / tree) for tree in CORE_TREES["bridge"])
+                and (root / "VERSION").exists()
+            ):
+                bridge_version = (root / "VERSION").read_text().strip()
+                legacy_bridge = True
             match = (
                 re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", bridge_version)
-                if bridge is not None
-                and isinstance(bridge_version, str)
-                and bridge.get("layout") == "legacy_fixed"
+                if legacy_bridge and isinstance(bridge_version, str)
                 else None
             )
             if match is not None and tuple(int(part) for part in match.groups()) < (0, 11, 0):
@@ -1057,7 +1122,7 @@ def _component_identities(
     if not os.path.isdir(root):
         raise ManifestError("installed root is unavailable")
     try:
-        identities = installed_identities(root, persist=False, **overrides)
+        identities = installed_identities(root, persist=False, components=components, **overrides)
     except (OSError, ValueError, RecursionError) as error:
         # ValueError covers undecodable files and corrupt JSON identity records.
         raise ManifestError(f"installed identity unreadable ({type(error).__name__})") from None

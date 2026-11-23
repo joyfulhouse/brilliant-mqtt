@@ -819,7 +819,12 @@ async def test_missing_watchdog_version_never_inherits_absent_or_release_bridge(
         (release / "app/main.py").write_text("bridge")
         (release / "VERSION").write_text("0.10.0")
         (root / "current").symlink_to(release)
-        (units / "brilliant-mqtt.service").write_text("/var/brilliant-mqtt/current/app/main.py")
-        (units / "brilliant-wifi-watchdog.service").write_text("legacy watchdog unit")
+        (units / "brilliant-mqtt.service").write_text(
+            "[Service]\n"
+            "Environment=PYTHONPATH=/var/brilliant-mqtt/current/app:/var/brilliant-mqtt/current/vendor\n"
+        )
+        (units / "brilliant-wifi-watchdog.service").write_text(
+            "[Service]\nEnvironment=PYTHONPATH=/var/brilliant-mqtt/wifi_watchdog\n"
+        )
     record = bundle_manifest.installed_identities(root, units, tmp_path / "env")["wifi_watchdog"]
     assert record is not None and record["version"] == "unknown"
