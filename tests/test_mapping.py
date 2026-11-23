@@ -1641,3 +1641,19 @@ def test_motion_threshold_numbers_cover_8bit_range() -> None:
     for var in ("motion_high_threshold", "motion_low_threshold"):
         assert specs[var].min_value == 0
         assert specs[var].max_value == 255  # score is 8-bit; 255 observed live
+
+
+def test_mesh_motion_native_passthrough_requires_opt_in_and_calibrated_thresholds() -> None:
+    """Native passthrough when enable_motion_score='0' requires both opt-in AND low > 20."""
+    # Uncalibrated default (motion_low_threshold == 20): still gated False even with opt-in.
+    uncalibrated = _mesh_motion("1", "0")
+    assert payload_fields(uncalibrated, native_motion_passthrough=True)["motion"] is False
+
+    # Calibrated thresholds (motion_low_threshold = 55, high = 90):
+    calibrated = _mesh_motion("1", "0")
+    calibrated.variables["motion_low_threshold"] = Variable("motion_low_threshold", "55")
+    calibrated.variables["motion_high_threshold"] = Variable("motion_high_threshold", "90")
+    # Default (opt-in False) still gates to False:
+    assert payload_fields(calibrated)["motion"] is False
+    # Opt-in True + calibrated thresholds passes hardware movement_detected through:
+    assert payload_fields(calibrated, native_motion_passthrough=True)["motion"] is True

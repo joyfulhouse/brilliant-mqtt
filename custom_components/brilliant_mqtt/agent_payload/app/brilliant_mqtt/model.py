@@ -107,6 +107,8 @@ class BrilliantDevice:
     capture_complete: bool = True
     capture_present: frozenset[str] | None = None
     capture_unknown: frozenset[str] = frozenset()
+    # Notification-wide inventory, captured before per-peripheral callback delivery.
+    capture_hardware_count: int | None = None
 
     # Deliberate asymmetry: is_on collapses an absent "on" variable to False (a load
     # without "on" is just off/uncontrollable), while motion_detected preserves None

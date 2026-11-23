@@ -736,7 +736,9 @@ async def test_cancel_during_startup_committed_clear_clears_resolved_repair(
     assert ir.async_get(hass).async_get_issue(DOMAIN, issue_id) is None
 
 
-@pytest.mark.parametrize("corruption", ("marker_present", "wrong_scene_owner"))
+@pytest.mark.parametrize(
+    "corruption", ("marker_present", "dangling_scene_owner", "pending_scene_owner")
+)
 async def test_committed_handoff_corruption_fails_closed_with_repair(
     hass: HomeAssistant,
     corruption: str,
@@ -753,13 +755,19 @@ async def test_committed_handoff_corruption_fails_closed_with_repair(
         office,
         *(
             (_panel("kitchen", "SHA256:kitchen", subentry_id="panel-kitchen"),)
-            if corruption == "wrong_scene_owner"
+            if corruption == "dangling_scene_owner"
             else ()
         ),
     )
     entry = _provisioning_entry(
         *panels,
-        scene_owner=("panel-kitchen" if corruption == "wrong_scene_owner" else "panel-office"),
+        scene_owner=(
+            "missing-panel"
+            if corruption == "dangling_scene_owner"
+            else pending_scene_owner(_TRANSACTION_ID)
+            if corruption == "pending_scene_owner"
+            else "panel-office"
+        ),
     )
     entry.add_to_hass(hass)
     journal = Mock(
@@ -1427,7 +1435,9 @@ async def test_startup_without_stored_owner_invokes_recorded_recovery_before_set
     ):
         await fleet.async_setup()
 
-    recover.assert_awaited_once_with()
+    recover.assert_awaited_once_with(
+        expected_record=_pending_record(), authorize=fleet._async_authorize_background_recovery
+    )
     journal.async_complete_commit.assert_not_awaited()
     assert set(fleet.panels) == {"panel-kitchen"}
 
@@ -1452,7 +1462,9 @@ async def test_unreachable_stale_recovery_does_not_hold_healthy_runtime_offline(
     recover_started = asyncio.Event()
     release_recovery = asyncio.Event()
 
-    async def blocked_recovery() -> None:
+    async def blocked_recovery(**kwargs: object) -> None:
+        assert kwargs["expected_record"] == _pending_record(phase=ProvisioningPhase.ACTIVATED)
+        assert kwargs["authorize"] == fleet._async_authorize_background_recovery
         recover_started.set()
         await release_recovery.wait()
         raise OSError("unreachable stale panel")
@@ -1511,7 +1523,9 @@ async def test_finished_background_recovery_is_retried_after_entry_update(
     )
     attempts = 0
 
-    async def recover() -> None:
+    async def recover(**kwargs: object) -> None:
+        assert kwargs["expected_record"] == _pending_record(phase=ProvisioningPhase.ACTIVATED)
+        assert kwargs["authorize"] == fleet._async_authorize_background_recovery
         nonlocal attempts
         attempts += 1
         if attempts == 1:
@@ -1724,7 +1738,10 @@ async def test_hard_restart_empty_fleet_schedules_orphan_recovery(
         assert fleet._recovery_task is not None  # noqa: SLF001
         await fleet._recovery_task  # noqa: SLF001
 
-    recover.assert_awaited_once_with()
+    recover.assert_awaited_once_with(
+        expected_record=_pending_record(phase=phase),
+        authorize=fleet._async_authorize_background_recovery,
+    )
     assert fleet.panels == {}
     assert fleet.fleet.scene_panel == "__unassigned__"
     with patch.object(PanelManager, "async_shutdown", _noop_shutdown):
@@ -1818,6 +1835,14 @@ async def test_active_flow_context_prevents_pre_storage_rollback(
     assert lookup.subentry_id is None
 
 
+def _successful_removed_recovery(journal: Mock) -> AsyncMock:
+    async def recover(*, expected_record: ProvisioningRecord) -> None:
+        assert journal.async_load.return_value == expected_record
+        journal.async_load.return_value = None
+
+    return AsyncMock(side_effect=recover)
+
+
 async def test_actual_ha_remove_recovers_exact_removed_sole_owner(
     hass: HomeAssistant,
 ) -> None:
@@ -1828,7 +1853,8 @@ async def test_actual_ha_remove_recovers_exact_removed_sole_owner(
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record()),
     )
-    recover = AsyncMock()
+    expected_record = journal.async_load.return_value
+    recover = _successful_removed_recovery(journal)
     issue_id = _create_provisioning_repair(hass)
 
     with (
@@ -1844,8 +1870,8 @@ async def test_actual_ha_remove_recovers_exact_removed_sole_owner(
         await hass.config_entries.async_remove(entry.entry_id)
 
     assert hass.config_entries.async_get_entry(entry.entry_id) is None
-    get_recovery.assert_called_once_with(hass)
-    recover.assert_awaited_once_with()
+    get_recovery.assert_called_once_with(hass, removed_entry=entry, expected_record=expected_record)
+    recover.assert_awaited_once_with(expected_record=expected_record)
     assert ir.async_get(hass).async_get_issue(DOMAIN, issue_id) is None
 
 
@@ -1868,7 +1894,8 @@ async def test_actual_ha_remove_recovers_exact_empty_fleet_before_subentry(
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record(phase=phase)),
     )
-    recover = AsyncMock()
+    expected_record = journal.async_load.return_value
+    recover = _successful_removed_recovery(journal)
 
     with (
         patch(
@@ -1891,7 +1918,7 @@ async def test_actual_ha_remove_recovers_exact_empty_fleet_before_subentry(
         await hass.config_entries.async_remove(entry.entry_id)
 
     assert hass.config_entries.async_get_entry(entry.entry_id) is None
-    recover.assert_awaited_once_with()
+    recover.assert_awaited_once_with(expected_record=expected_record)
 
 
 @pytest.mark.parametrize(
@@ -1925,7 +1952,8 @@ async def test_actual_ha_remove_recovers_pre_subentry_panel_from_nonempty_single
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record(phase=phase)),
     )
-    recover = AsyncMock()
+    expected_record = journal.async_load.return_value
+    recover = _successful_removed_recovery(journal)
     issue_id = _create_provisioning_repair(hass)
 
     with (
@@ -1949,7 +1977,7 @@ async def test_actual_ha_remove_recovers_pre_subentry_panel_from_nonempty_single
         await hass.config_entries.async_remove(entry.entry_id)
 
     assert hass.config_entries.async_get_entry(entry.entry_id) is None
-    recover.assert_awaited_once_with()
+    recover.assert_awaited_once_with(expected_record=expected_record)
     assert ir.async_get(hass).async_get_issue(DOMAIN, issue_id) is None
 
 
@@ -2141,7 +2169,8 @@ async def test_actual_ha_remove_aborts_owned_flow_and_settles_pending_journal(
         }
     ]
     abort = Mock()
-    recover = AsyncMock()
+    expected_record = journal.async_load.return_value
+    recover = _successful_removed_recovery(journal)
 
     with (
         patch(
@@ -2166,7 +2195,7 @@ async def test_actual_ha_remove_aborts_owned_flow_and_settles_pending_journal(
         await hass.config_entries.async_remove(entry.entry_id)
 
     abort.assert_called_once_with("owned-panel-flow")
-    recover.assert_awaited_once_with()
+    recover.assert_awaited_once_with(expected_record=expected_record)
 
 
 async def test_actual_ha_remove_does_not_abort_unrelated_active_flow(
@@ -2196,7 +2225,8 @@ async def test_actual_ha_remove_does_not_abort_unrelated_active_flow(
         },
     ]
     abort = Mock()
-    recover = AsyncMock()
+    expected_record = journal.async_load.return_value
+    recover = _successful_removed_recovery(journal)
 
     with (
         patch(
@@ -2221,7 +2251,7 @@ async def test_actual_ha_remove_does_not_abort_unrelated_active_flow(
         await hass.config_entries.async_remove(entry.entry_id)
 
     abort.assert_not_called()
-    recover.assert_awaited_once_with()
+    recover.assert_awaited_once_with(expected_record=expected_record)
 
 
 async def test_removed_empty_fleet_with_legacy_competitor_preserves_journal(
@@ -2347,7 +2377,8 @@ async def test_actual_ha_remove_drains_recovery_before_propagating_cancellation(
     release = asyncio.Event()
     finished = asyncio.Event()
 
-    async def recover() -> None:
+    async def recover(*, expected_record: ProvisioningRecord) -> None:
+        assert expected_record == _pending_record()
         entered.set()
         await release.wait()
         finished.set()

@@ -102,6 +102,7 @@ class FakeShell:
         self._identity_audits: set[str] = set()
         # Models the on-panel retained rollback baseline marker (complete.json).
         self.baseline_retained = False
+        self.virtual_sliders_restored = False
 
     def pinned_host_key(self) -> str | None:
         return self._pinned
@@ -138,6 +139,9 @@ class FakeShell:
         self._require_connected()
         if "BRILLIANT_BASELINE_RETAINED" in command:
             return RunResult(0, "1" if self.baseline_retained else "0", "")
+        if "BRILLIANT_RESTORE_VIRTUAL_SLIDERS" in command:
+            self.virtual_sliders_restored = True
+            return self.responses.get(command, _OK)
         if "BRILLIANT_BASELINE_ACTION" in command:
             return _OK
         if "BRILLIANT_RELEASE_IDENTITY_PREPARE" in command:
@@ -165,7 +169,15 @@ class FakeShell:
         self.commands.append(command)  # recorded even when it raises: proves it was attempted
         if command in self.run_errors:
             raise self.run_errors[command]
-        return self.responses.get(command, _OK)
+        default = _OK
+        if command == (
+            "systemctl show brilliant-mqtt --property=LoadState --property=ActiveState "
+            "--property=MainPID --property=ControlPID"
+        ):
+            default = RunResult(
+                0, "LoadState=loaded\nActiveState=inactive\nMainPID=0\nControlPID=0\n", ""
+            )
+        return self.responses.get(command, default)
 
     async def start(self, command: str) -> PanelProcess:
         self._require_connected()

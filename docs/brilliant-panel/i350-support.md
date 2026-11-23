@@ -18,8 +18,8 @@ compatible. Everything else listed below is unverified.
 |---|---|---|
 | Bridge agent payload (`brilliant_mqtt`, vendored `aiomqtt`/`paho-mqtt`) | None. It is pure Python with no native code. | Should load. It still depends on Brilliant's message-bus library on the panel. |
 | Brilliant message-bus library (`lib.message_bus_api`, compiled Cython `.so`) | Ships with the firmware and is built for the panel's own architecture | Unknown. Whether it imports, and whether its schema matches what the bridge maps, must be measured (gates 1 and 3). |
-| Wi-Fi watchdog last-resort reset (GPIO 2/5 + `sdhci-esdhc-imx` unbind) | i.MX6 only. It copies Brilliant's i.MX6 reset sequence. | Skipped with a logged warning when the i.MX sdhci driver is absent. The guarded reboot still runs. The soft reconnect and service-restart rungs need `connmanctl` and `systemctl`. |
-| Voice satellite payload | armv7l only (prebuilt armv7hf Python, wheels and libraries) | Refused before anything on the panel is touched. |
+| Wi-Fi watchdog last-resort reset (GPIO 2/5 + `sdhci-esdhc-imx` unbind) | i.MX6 only. It copies Brilliant's i.MX6 reset sequence. | Requires the `mmc1` alias target to be bound to the i.MX sdhci driver; otherwise skips unbind and all GPIO writes with a warning. The guarded reboot still runs. The soft reconnect and service-restart rungs need `connmanctl` and `systemctl`. |
+| Voice satellite payload | armv7l only (prebuilt armv7hf Python, wheels and libraries) | Upload, configuration, enable and restart refuse other architectures, including repair of an existing payload and wake-word updates. Inspection and removal remain available. |
 | Hue CA recovery (`brilliant_hue_ca`) | Hardcoded `python3.10` site-packages path and Hue peripheral paths | Unverified. The diagnostic reports whether each path is present. |
 
 ## Run the read-only diagnostic
@@ -57,12 +57,16 @@ followed by `key=value` lines:
 
 ## Pre-release check on the existing fleet
 
-The Wi-Fi watchdog now skips its GPIO/usdhc reset when
-`/sys/bus/platform/drivers/sdhci-esdhc-imx` is absent. Before releasing that
-change, run the diagnostic once on the designated armv7 pilot and confirm it
-reports `imx_sdhci_driver_present=1`. That confirms the guard keeps the reset
-on the existing fleet. If it reports `0`, stop: the guard would silently
-downgrade the watchdog on qualified panels.
+The Wi-Fi watchdog requires positive controller binding before its GPIO/usdhc
+reset. A registered `/sys/bus/platform/drivers/sdhci-esdhc-imx` directory alone
+is insufficient. Before releasing that change, confirm on the designated armv7
+pilot that the NUL-terminated device-tree `aliases/mmc1` path resolves to the
+expected controller (for example, `usdhc@02194000` becomes `2194000.mmc`), that
+the driver's controller symlink resolves to an existing device, and that the
+device's `driver` link resolves back to `sdhci-esdhc-imx`. The diagnostic's
+`imx_sdhci_driver_present=1` reports registration only. Missing alias or binding
+evidence downgrades the last rung to reboot-only; live pilot confirmation
+remains required.
 
 ## Qualification gates
 

@@ -1,0 +1,12 @@
+* brilliant-linux aae2bfc59cee9b3a36af252c1e90c7898f41a59f5033567f665ca807eba82ac0.0
+    Version: v26.10.21.1
+    origin refspec: brilliant-linux:linux/brilliant-imx6/brilliant-embedded-image/stable
+    GPG: Signature made Thu Oct 29 01:28:19 2026 using RSA key ID 949B1682BC2E58A4
+    GPG: Good signature from "Brilliant Deploy <deploy@brilliant.tech>"
+    GPG: Primary key ID 426FB14BC543CDF3
+  brilliant-linux 2346695584090613927922e35249a37474103ef46c3d7696fceaa7bd7662811c.0 (rollback)
+    Version: v26.09.23.1
+    origin refspec: brilliant-linux:linux/brilliant-imx6/brilliant-embedded-image/stable
+    GPG: Signature made Fri Sep 25 21:42:07 2026 using RSA key ID 949B1682BC2E58A4
+    GPG: Good signature from "Brilliant Deploy <deploy@brilliant.tech>"
+    GPG: Primary key ID 426FB14BC543CDF3

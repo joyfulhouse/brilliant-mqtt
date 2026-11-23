@@ -22,12 +22,200 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - The Wi-Fi watchdog's last-resort GPIO/usdhc Wi-Fi reset is i.MX6-specific.
-  It now runs only where the `sdhci-esdhc-imx` driver is present. Elsewhere the
+  It now requires the `mmc1` alias target to be bound to `sdhci-esdhc-imx`;
+  driver registration alone is insufficient. Without binding evidence the
   reset is skipped and logged as a warning, and the guarded reboot still runs
-  (#155).
-- Enabling the voice satellite on a panel that is not armv7l now fails with a
-  clear "armv7l-only" error before anything on the panel is changed, instead of
-  installing a payload that cannot run there (#155).
+  (#155). Production binding evidence on the armv7 pilot remains a release
+  prerequisite.
+- Voice upload, configuration, enable and restart on a panel that is not armv7l
+  now fail with a clear "armv7l-only" error before changing the panel, including
+  repair of an existing payload and wake-word updates. Inspection and removal
+  remain available (#155).
+### Fixed
+
+- Removing an unactivated onboarding baseline now checks candidate release
+  paths with `os.path.lexists`, which older panel Pythons provide. A failed
+  proof logs the stage (snapshot section, verify, check_restored kind,
+  candidate present, or command exit and redacted stderr) and shows that
+  short reason on the form.
+- A failed journal or retained save now logs the exception class, redacted
+  message, and traceback, and keeps that redacted cause on `journal_failed`.
+  Diagnostics include the same redacted `storage_error`. Passwords, host
+  addresses, SSH keys, and fingerprints are removed before logging.
+- A failed provisioning-journal save no longer leaves an armed, ownerless
+  rollback baseline. The journal payload is checked for an exact JSON
+  round-trip before that baseline is written, and a disk failure after the
+  arm removes the baseline again when the journal did not become durable.
+  Add Brilliant panel can clear an already stranded `armed` / `staged`
+  baseline that has no execution journal and no panel subentry, after the
+  panel still matches the capture and no candidate release directory exists.
+
+## [0.12.2] - 2026-11-17
+
+This is a Home Assistant integration release only. The bundled on-panel agent
+stays at 0.11.4 with release ordinal 6, so panels need no update.
+
+### Fixed
+
+- Panels added through the fleet Add panel flow can now enable Hue CA
+  recovery. They start with no per-panel feature overrides, so they had no
+  diyHue CA certificate. Turning on Hue CA recovery then failed with the generic
+  "Hue CA recovery operation failed: panel component operation failed" until an
+  operator set a per-panel certificate. The fleet now has one optional diyHue CA
+  certificate (Configure > diyHue CA certificate). It is validated as a public
+  PEM chain and inherited by every panel without its own non-blank override.
+  Rotating the fleet CA is therefore one change. Explicit per-panel overrides
+  still win. While Hue CA recovery is enabled on a panel that inherits the fleet
+  certificate, changing that certificate is refused until recovery is turned off,
+  as already happens for per-panel overrides. The per-panel Overrides guard now
+  compares the effective certificate, so clearing an override that matches the
+  fleet default is allowed. Diagnostics report the fleet certificate as redacted,
+  as they do for the broker CA.
+- Enabling Hue CA recovery with no certificate available, either per panel or
+  for the fleet, now fails before contacting the panel. The new
+  `hue_ca_cert_missing` error says where to set one.
+- The legacy-to-fleet migration now sets the fleet diyHue CA certificate when
+  every legacy panel has the same valid one. Panels added afterwards inherit it.
+  Per-panel copies are kept, and the migration never chooses between differing
+  certificates.
+- Hue CA changes and Hue CA installs no longer race. Saving the fleet diyHue CA
+  certificate now waits for any in-progress panel component operation, then
+  re-reads the fleet and every panel before deciding. Hue CA installs and the
+  post-OTA re-install take the certificate from the stored fleet and panel
+  settings while holding the same lock. They no longer read a runtime copy that
+  might not yet reflect a just-saved change. The certificate a panel receives
+  therefore always matches the stored configuration.
+- CA certificates are now checked as real X.509 certificates, not just PEM
+  framing. Every block must be strict base64 of one parseable certificate. The
+  same check covers the broker CA form and the stored broker CA, the fleet and
+  per-panel diyHue CA fields, the stored fleet diyHue CA, and migration.
+  Placeholder text, invalid base64, non-certificate or truncated data, and any
+  private key are rejected. Real certificate chains stored by earlier releases
+  still load, and a fleet without a custom broker CA is unaffected.
+- Certificate checks no longer silently drop whitespace. The input must be pure
+  ASCII, with `\n` or `\r\n` line endings, and only empty lines around
+  blocks. Non-breaking or zero-width spaces, Unicode line separators,
+  indentation, trailing spaces and lone carriage returns are rejected. Before,
+  such text was saved and uploaded, and the panel's Hue CA tool then failed on
+  every run. A diyHue CA must now be exactly one certificate, because the panel
+  tool matches a single certificate. It is saved and deployed in canonical PEM:
+  LF line endings, re-encoded 64-column base64.
+
+## [0.12.1] - 2026-11-17
+
+This is a Home Assistant integration release only. The bundled on-panel agent
+stays at 0.11.4 with release ordinal 6, so panels need no update.
+
+### Fixed
+
+- Home Assistant 2026.10+ compatibility with the single-owner device registry
+  ("device split"). HA now keeps each panel's MQTT-discovery device and the
+  management entities' device as two linked records that share the
+  `("mqtt", "brilliant_panel_<slug>")` identifier. Panel actions (`repair`,
+  `redeploy`, `uninstall`, `reboot`, `canary_rollback`, `canary_finalize`)
+  targeting a panel device, or an area holding it, now resolve the panel from
+  either record. A pre-split device ID kept in an old automation still works.
+  Before this fix, targeting the MQTT-discovery record silently did nothing, and
+  canary recovery rejected it. Each panel runs once even when several of its records
+  are targeted. Target resolution also no longer reads the deprecated
+  `DeviceEntry.config_entries_subentries`, which logged a warning on every
+  device-targeted call. HA 2026.6–2026.9 behaviour is unchanged, and CI now
+  also runs the integration suite against HA 2026.10.4.
+- A panel is selected through its MQTT-discovery identifier only when the
+  targeted device is owned solely by the MQTT integration. On HA 2026.10+ a
+  device from any other integration that reuses a panel's identifier selects
+  nothing, including through an area; before, it could run destructive actions
+  such as `uninstall` on that panel. A device naming several panels is rejected
+  instead of fanned out.
+- Targeting one of a panel's MQTT-discovery entities (for example its light)
+  now selects that panel through the entity's device, on every supported HA
+  release. Before, such a target silently did nothing, and canary recovery and
+  single-panel `redeploy` overrides rejected it.
+- `run_scene` and `set_mode` accept an entity, device, or area target that
+  resolves to exactly one panel, using the same validation. A `panel` slug
+  given together with a target must name the same panel. Without a target,
+  the slug or the configured scene panel applies as before.
+
+## [0.12.0] - 2026-11-16
+
+This release updates both the Home Assistant integration and the bundled
+on-panel agent. The agent moves to 0.11.4 with release ordinal 6 because it now
+carries the motion passthrough change below. Panels on 0.11.3 will offer an
+update through their Update entities. Install it deliberately, pilot panel
+first; installing the integration alone does not touch panels.
+
+### Added
+
+- Opt-in native BLE mesh motion passthrough on the agent
+  (`MOTION_NATIVE_PASSTHROUGH`). Switches whose motion thresholds are
+  calibrated above the factory floor publish the hardware `movement_detected`
+  value with motion scoring off. Optional `MOTION_DEFAULT_HIGH_THRESHOLD` /
+  `MOTION_DEFAULT_LOW_THRESHOLD` are applied at enforcement time and never
+  persisted. Default behaviour is unchanged.
+  ([#250](https://github.com/joyfulhouse/brilliant-mqtt/pull/250))
+- `brilliant_mqtt.migrate_to_fleet` action: consolidates legacy per-panel
+  entries into the singleton fleet entry with one panel subentry each, so a
+  legacy install can add new panels. It runs only when an operator calls it,
+  dry run is the default, and the response is secret-free. Panels are never
+  contacted. Every slug, mesh priority, entity ID, entity unique ID, and MQTT
+  device association is preserved. Conflicts block the whole plan and are
+  reported by field, code, and entry title, never silently fixed. Duplicate
+  positive mesh priorities are one example. A private journal makes the
+  migration restart-safe: before the commit point it reverses exactly; after
+  it, startup recovery finishes removing the sibling entries. The journal is
+  the single source of truth: an atomically written file whose every write is
+  re-read. Startup re-applies its target until a later startup confirms that
+  the loaded state matches, so nothing relies on Home Assistant's lazily
+  written stores or private storage APIs. A setup fence and blocked
+  reconfigure/options flows keep legacy and fleet runtimes from ever starting
+  side by side, or being edited, while a migration is unresolved. Every planned
+  panel's runtime must start before the commit. Restored legacy entries start
+  without contacting their panel until a quiet setup succeeds, even across
+  crashes and restarts, via a durable obligation file. Both the pre-2026.10
+  shared device registry and the 2026.10+ split (single-owner) device registry
+  are supported. A management device with child devices is reported as a
+  blocker. See
+  [docs/ha-integration.md](docs/ha-integration.md#legacy_fleet_migration).
+- Repair issues: `legacy_migration_available` while legacy entries remain,
+  `migration_recovery_failed` if an interrupted migration cannot be settled, and
+  `migration_reverted_not_loaded` if restored legacy entries did not start.
+
+### Fixed
+
+- A managed (canary) update journal now resolves its owner on a fleet panel
+  whose management ID is its legacy entry ID (kept so entity unique IDs never
+  change). It is accepted only when the subentry ID is exactly the one the
+  migration derived from that ID. Install handoffs still require the
+  fingerprint.
+
+## [0.11.6] - 2026-11-05
+
+This is a Home Assistant integration release only. The bundled on-panel agent
+stays at 0.11.3 with release ordinal 5, so panels already on 0.11.3 need no
+update and their Update entities stay current. Installing it does not touch
+panels or their retained rollback baselines.
+
+### Fixed
+
+- `put_dir()` directory uploads (HA-side SFTP) now use the same 120-second
+  idle/stall deadline renewed after each written chunk instead of a fixed
+  120-second total. Tests now exercise real shortened deadlines. Follow-up to
+  [#238](https://github.com/joyfulhouse/brilliant-mqtt/issues/238), [#240](https://github.com/joyfulhouse/brilliant-mqtt/pull/240),
+  [#241](https://github.com/joyfulhouse/brilliant-mqtt/pull/241), and
+  [#243](https://github.com/joyfulhouse/brilliant-mqtt/pull/243).
+
+## [0.11.5] - 2026-11-05
+
+This is a Home Assistant integration release only. The bundled on-panel agent
+stays at 0.11.3 with release ordinal 5, so panels already on 0.11.3 need no
+update and their Update entities stay current. Installing it does not touch
+panels or their retained rollback baselines.
+
+### Fixed
+
+- Voice satellite installs no longer time out on slow panels. The SFTP upload
+  deadline is now a 120-second idle/stall limit renewed after each written
+  chunk instead of a fixed 120-second total. ([#238](https://github.com/joyfulhouse/brilliant-mqtt/issues/238), [#240](https://github.com/joyfulhouse/brilliant-mqtt/pull/240))
 
 ## [0.11.4] - 2026-10-26
 
@@ -1202,7 +1390,12 @@ panel redeploy is needed.
 - JoyfulHouse OSS docs standard: LICENSE (MIT), INSTALL.md, CHANGELOG.md,
   FUNDING.yml, CODEOWNERS, and the canonical `docs/` set.
 
-[Unreleased]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.11.4...HEAD
+[Unreleased]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.12.2...HEAD
+[0.12.2]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.12.1...v0.12.2
+[0.12.1]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.12.0...v0.12.1
+[0.12.0]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.11.6...v0.12.0
+[0.11.6]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.11.5...v0.11.6
+[0.11.5]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.11.4...v0.11.5
 [0.11.4]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.11.3...v0.11.4
 [0.11.3]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.11.2...v0.11.3
 [0.11.2]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.11.1...v0.11.2

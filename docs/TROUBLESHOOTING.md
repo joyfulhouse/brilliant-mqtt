@@ -53,6 +53,16 @@ ssh -o NumberOfPasswordPrompts=1 root@<panel-ip> 'sh -s' \
 See [brilliant-panel/i350-support.md](brilliant-panel/i350-support.md) for what
 the diagnostic collects, what is architecture-bound, and the qualification gates.
 
+The Wi-Fi watchdog requires the `mmc1` alias target to be bound to
+`sdhci-esdhc-imx` before its GPIO reset. A registered driver directory (including
+`imx_sdhci_driver_present=1` in the diagnostic) is insufficient. Missing binding
+evidence produces a warning and reboot-only recovery. Production binding
+evidence on the armv7 pilot remains a release prerequisite.
+
+Voice upload, configuration, enable and restart require armv7l, including repair
+of an existing payload and wake-word updates. Inspection and removal remain
+available on other architectures.
+
 ---
 
 ## Connectivity
@@ -64,6 +74,73 @@ the diagnostic collects, what is architecture-bound, and the qualification gates
   `journalctl -u brilliant-mqtt` for the crash cause.
 - If the agent is up but entities stay unavailable, the broker may have dropped
   the retained `online` publish — restart the unit to re-reconcile.
+
+### One panel times out connecting to the broker while others connect
+
+**Symptom.** The panel journal (`journalctl -u brilliant-mqtt`) keeps repeating
+`MQTT connection failed; will reconnect after Ns`. Other panels connect normally.
+During an attempt the TCP connection is `SYN_SENT` on the panel and `SYN_RECV`
+on the broker. The broker received the SYN, but its SYN-ACK never reaches the
+panel.
+
+**The handshake is failing below MQTT.** Inspect runtime Wi-Fi configuration and
+the network path before restarting. The service makes a best-effort attempt to
+disable Wi-Fi power-save on each start (`deploy/brilliant-mqtt.service`), so a
+restart can change inbound delivery if that setting previously failed. Read the
+current power-save state first using the full qualification runbook linked below;
+do not change it during the diagnostic baseline. The agent already limits each
+connect attempt to 10 s (aiomqtt `timeout=10.0` in `src/brilliant_mqtt/mqttio.py`).
+It then retries with a backoff of 5, 10, 20 and 40 s, capped at 60 s
+(`run()` in `src/brilliant_mqtt/__main__.py`).
+
+**Known cause ([#173](https://github.com/joyfulhouse/brilliant-mqtt/issues/173)).**
+One access point stopped delivering broadcast and multicast frames to its
+wireless clients, while unicast kept working. Hosts on the panels' VLAN, such as
+the broker host and Home Assistant, learn a panel's MAC address with a broadcast
+ARP request. Those requests never reached the panels, so the hosts' neighbour
+entries stayed `INCOMPLETE` or `FAILED` and the SYN-ACK never left the host. A
+soft restart of the affected AP restored delivery. Two details can mislead you:
+
+- A capture inside the broker's network namespace can still show SYN-ACKs being
+  sent. That does not prove they left the host's physical interface: without a
+  resolved neighbour entry they are never transmitted.
+- Panels that happened to send their own traffic to the host looked healthy. The
+  panel's ARP request teaches the host its MAC, so the host never needs the
+  broadcast path. A "healthy" panel on the same AP can be affected too.
+
+**Read-only checks on the broker host.** Replace the placeholders with your
+values:
+
+```sh
+ip neigh show <panel-ip>              # INCOMPLETE / FAILED = MAC never learned
+ip route get <panel-ip>               # direct on the VLAN interface, or via a gateway?
+ss -tn state syn-recv '( sport = :1883 or sport = :8883 )'
+timeout 15 tcpdump -ni <vlan-iface> -c 200 'arp and host <panel-ip>'
+```
+
+Run the same checks against a healthy panel on the same VLAN and the same AP. If
+the host sends ARP requests for the failing panel and gets no replies, while the
+healthy panel answers, group-addressed frame delivery on the AP is one possible
+cause. Broker-only evidence cannot distinguish request loss, panel nonresponse,
+or reply loss. Correlate panel and, where needed, AP captures with the broker
+capture before attributing the fault to AP delivery or taking AP recovery action;
+follow the full qualification runbook linked below.
+
+**Rule out the other causes:**
+
+- **Firewall / conntrack:** check that no rule or full conntrack table drops the
+  broker's reply for that panel only.
+- **Asymmetric route:** `ip route get <panel-ip>` should send the reply back on
+  the same path the SYN arrived on.
+- **MTU:** an MTU problem usually breaks the connection after the handshake (for
+  example during the TLS or MQTT CONNECT exchange), not during the handshake.
+
+**Do not** flush neighbour tables, add permanent neighbour entries, or restart
+panels while you diagnose. Each can make the symptom disappear temporarily and
+hide the fault.
+
+For the full qualification procedure see
+[broadcast-arp-vs-mqtt-diagnostics.md](brilliant-panel/runbooks/broadcast-arp-vs-mqtt-diagnostics.md).
 
 ### Update fails with "could not connect to the panel"
 

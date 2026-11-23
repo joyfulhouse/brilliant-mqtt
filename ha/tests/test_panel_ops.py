@@ -59,6 +59,12 @@ from custom_components.brilliant_mqtt.setup_protocol import PreflightRequest
 from custom_components.brilliant_mqtt.shell import RunResult
 from tests.fakes import FakePanelProcess, FakeShell
 
+_SLIDER_ORIGINAL_B64 = (
+    "CAABAAAAAAsAAgAAAApodWVfYnJpZGdlCwADAAAAGTAwMTc4OEZGRkUyQ0E0ODJfZ3JvdXBfODMI"
+    "AAYAAAAADAAHDwABDAAAAAELAAEAAAAKaHVlX2JyaWRnZQsAAgAAABkwMDE3ODhGRkZFMkNBNDgy"
+    "X2dyb3VwXzgzAAAA"
+)
+
 _FULL_INSPECT = RunResult(
     0,
     "unit=1\nenv=1\nenabled=1\nactive=1\nsunit=1\nsenv=1\npayload=1\n9.9.9\n",
@@ -1452,8 +1458,11 @@ async def test_deploy_payload_raises_and_skips_version_when_swap_fails(tmp_path:
 async def test_uninstall_sequence_and_paths() -> None:
     shell = await _connected(FakeShell())
     await panel_ops.uninstall(shell)
+    assert shell.virtual_sliders_restored is True
     assert shell.commands == [
-        "systemctl disable --now brilliant-mqtt 2>/dev/null || true",
+        "systemctl disable --now brilliant-mqtt",
+        panel_ops._UNINSTALL_BRIDGE_STATE_COMMAND,
+        "if [ -e /etc/brilliant-mqtt.env ]; then cat /etc/brilliant-mqtt.env; fi",
         "rm -f /etc/systemd/system/brilliant-mqtt.service /etc/brilliant-mqtt.env",
         "rm -rf /var/brilliant-mqtt /var/brilliant-mqtt.staging /var/brilliant-mqtt.staging.tar.gz",
         "systemctl daemon-reload",
@@ -1623,6 +1632,34 @@ async def test_deploy_voice_payload_refuses_non_armv7l_before_touching_panel() -
     assert shell.uploads == []
 
 
+@pytest.mark.parametrize("operation", ["config", "enable", "restart"])
+@pytest.mark.parametrize("exit_status", [1, 127])
+async def test_voice_mutation_refuses_unsupported_architecture(
+    operation: str, exit_status: int
+) -> None:
+    shell = await _connected(
+        FakeShell(responses={_VOICE_ARCH_CHECK: RunResult(exit_status, "", "")})
+    )
+    with pytest.raises(panel_ops.PanelOpError, match="armv7l-only"):
+        if operation == "config":
+            await panel_ops.ensure_voice_config(shell, "ENVDATA")
+        elif operation == "enable":
+            await panel_ops.enable_voice(shell)
+        else:
+            await panel_ops.restart_voice(shell)
+    assert shell.commands == [_VOICE_ARCH_CHECK]
+    assert shell.uploads == []
+    assert shell.file_uploads == []
+
+
+async def test_voice_inspection_and_removal_allowed_on_unsupported_architecture() -> None:
+    shell = await _connected(FakeShell(responses={_VOICE_ARCH_CHECK: RunResult(1, "", "")}))
+    await panel_ops.inspect_voice(shell)
+    await panel_ops.uninstall_voice(shell)
+    assert _VOICE_ARCH_CHECK not in shell.commands
+    assert f"systemctl disable --now {VOICE_SERVICE_NAME} 2>/dev/null || true" in shell.commands
+
+
 async def test_deploy_voice_payload_skips_version_when_swap_fails() -> None:
     shell = await _connected(
         FakeShell(responses={_EXPECTED_VOICE_SWAP: RunResult(1, "", "mv failed\n")})
@@ -1636,9 +1673,10 @@ async def test_deploy_voice_payload_skips_version_when_swap_fails() -> None:
 async def test_ensure_voice_config_writes_unit_env_and_reloads() -> None:
     shell = await _connected(FakeShell())
     await panel_ops.ensure_voice_config(shell, env_content="ENVDATA")
+    assert shell.commands[0] == _VOICE_ARCH_CHECK
     # mkdir and cp unit commands precede the daemon-reload.
-    assert shell.commands[0] == f"mkdir -p {PANEL_VOICE_STAGED_DIR}"
-    assert shell.commands[1] == (
+    assert shell.commands[1] == f"mkdir -p {PANEL_VOICE_STAGED_DIR}"
+    assert shell.commands[2] == (
         f"cp {PANEL_VOICE_VAR_DIR}/{VOICE_SERVICE_NAME}.service {PANEL_VOICE_UNIT_FILE}"
     )
     assert shell.commands[-1] == "systemctl daemon-reload"
@@ -2629,6 +2667,48 @@ def test_toolchain_accepts_is_enabled_without_stdout() -> None:
     ) + command
 
     assert subprocess.run(["sh", "-c", script], check=False).returncode == 0
+
+
+def test_candidate_release_absent_probe_executes_for_present_and_absent(tmp_path: Path) -> None:
+    """Run the generated panel script with a real interpreter.
+
+    pathlib.Path has no lexists(); a probe that calls it exits non-zero on the
+    panel and the absence check can never succeed.
+    """
+    target = tmp_path / "0.11.6--aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    temporary = tmp_path / ".0.11.6--aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.tmp"
+
+    def run() -> subprocess.CompletedProcess[str]:
+        command = panel_ops.candidate_release_absent_command(str(target), str(temporary))
+        command = command.replace(panel_ops._PANEL_PYTHON, shlex.quote(sys.executable))
+        return subprocess.run(
+            ["/bin/sh", "-c", command],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+
+    absent = run()
+    assert absent.returncode == 0, absent.stderr
+    assert absent.stdout.strip() == "0"
+
+    target.mkdir()
+    directory = run()
+    assert directory.returncode == 0, directory.stderr
+    assert directory.stdout.strip() == "1"
+    target.rmdir()
+
+    target.write_text("candidate\n", encoding="utf-8")
+    present_file = run()
+    assert present_file.returncode == 0, present_file.stderr
+    assert present_file.stdout.strip() == "1"
+    target.unlink()
+
+    target.symlink_to(tmp_path / "missing-target")
+    dangling = run()
+    assert dangling.returncode == 0, dangling.stderr
+    assert dangling.stdout.strip() == "1"
 
 
 def test_snapshot_layout_probe_accepts_is_enabled_without_stdout(tmp_path: Path) -> None:
@@ -3869,3 +3949,553 @@ async def test_restart_candidate_verifies_link_and_restarts_only_bridge() -> Non
     joined = "\n".join(shell.commands)
     assert WIFI_WATCHDOG_SERVICE_NAME not in joined
     assert BUS_WATCHDOG_SERVICE_NAME not in joined
+
+
+@pytest.mark.parametrize("exit_status", [1, 127])
+async def test_uninstall_preserves_payload_and_backups_on_restore_failure(exit_status: int) -> None:
+    class RestoreFailureShell(FakeShell):
+        async def run(self, command: str) -> RunResult:
+            if "BRILLIANT_RESTORE_VIRTUAL_SLIDERS" in command:
+                return RunResult(exit_status, "", "restoration failed")
+            return await super().run(command)
+
+    shell = await _connected(RestoreFailureShell())
+    with pytest.raises(panel_ops.PanelOpError, match=f"exited {exit_status}"):
+        await panel_ops.uninstall(shell)
+    assert not any(command.startswith("rm ") for command in shell.commands)
+
+
+@pytest.mark.parametrize("outcome", ["success", "incomplete", "import_failure", "bus_failure"])
+async def test_uninstall_restore_script_propagates_result_and_runtime_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    # Execute the actual remote Python body with a tiny importable restoration stub.
+    var_dir = tmp_path / "panel"
+    state = var_dir / "state" / "virtual-sliders.json"
+    state.parent.mkdir(parents=True)
+    state.write_text(
+        json.dumps(
+            {
+                "same": {
+                    "original_slider_config": _SLIDER_ORIGINAL_B64,
+                    "config_device_id": "panel",
+                    "config_peripheral_id": "faceplate_peripheral",
+                    "config_var_name": "slider_config:0",
+                }
+            }
+        )
+    )
+    package = var_dir / "app" / "brilliant_mqtt"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("")
+    if outcome != "import_failure":
+        operation = (
+            "raise RuntimeError('bus startup failed')"
+            if outcome == "bus_failure"
+            else ("path.write_text('{}'); return True" if outcome == "success" else "return False")
+        )
+        (package / "virtual_sliders.py").write_text(
+            f"async def restore_all_persisted_slider_bindings(path):\n    {operation}\n"
+        )
+    monkeypatch.setattr(panel_ops, "PANEL_VAR_DIR", str(var_dir))
+
+    class ExecuteShell(FakeShell):
+        async def run(self, command: str) -> RunResult:
+            if "BRILLIANT_RESTORE_VIRTUAL_SLIDERS" not in command:
+                return RunResult(0, "", "")
+            body = command.split("\n", 1)[1].rsplit("\n", 1)[0]
+            result = await asyncio.to_thread(
+                subprocess.run,
+                [sys.executable, "-I", "-c", body],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            return RunResult(result.returncode, result.stdout, result.stderr)
+
+    shell = ExecuteShell()
+    if outcome == "success":
+        await panel_ops._restore_virtual_sliders_on_uninstall(shell)
+    else:
+        with pytest.raises(panel_ops.PanelOpError, match="exited 1"):
+            await panel_ops._restore_virtual_sliders_on_uninstall(shell)
+    assert state.exists()
+
+
+@pytest.mark.parametrize(
+    "case", ["old_malformed", "scalar", "missing", "custom", "mixed", "unretired"]
+)
+async def test_uninstall_validates_ledger_independently_and_uses_effective_layout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    var_dir = tmp_path / "panel"
+    directory = var_dir / ("alternate" if case == "custom" else "state")
+    directory.mkdir(parents=True)
+    state = directory / "virtual-sliders.json"
+    valid_row = {
+        "original_slider_config": _SLIDER_ORIGINAL_B64,
+        "config_device_id": "panel",
+        "config_peripheral_id": "faceplate_peripheral",
+        "config_var_name": "slider_config:0",
+    }
+    contents = {
+        "old_malformed": "invalid JSON",
+        "scalar": json.dumps({"A": "exact"}),
+        "missing": json.dumps({"A": {"config_var_name": "slider_config:0"}}),
+    }.get(case, json.dumps({"A": valid_row}))
+    state.write_text(contents)
+    legacy = var_dir / "app" / "brilliant_mqtt"
+    legacy.mkdir(parents=True)
+    (legacy / "__init__.py").write_text("")
+    # Models old helpers which incorrectly report success without retiring a backup.
+    (legacy / "virtual_sliders.py").write_text(
+        "async def restore_all_persisted_slider_bindings(path):\n    return True\n"
+    )
+    if case == "mixed":
+        active = var_dir / "current" / "app" / "brilliant_mqtt"
+        active.mkdir(parents=True)
+        (active / "__init__.py").write_text("")
+        (active / "virtual_sliders.py").write_text(
+            "async def restore_all_persisted_slider_bindings(path):\n"
+            "    path.write_text('{}')\n    return True\n"
+        )
+    monkeypatch.setattr(panel_ops, "PANEL_VAR_DIR", str(var_dir))
+
+    class LocalRestoreShell(FakeShell):
+        async def run(self, command: str) -> RunResult:
+            self.commands.append(command)
+            if "BRILLIANT_RESTORE_VIRTUAL_SLIDERS" not in command:
+                env = f'MOTION_DESIRED_STATE_DIR="{directory}"' if case == "custom" else ""
+                return RunResult(0, env, "")
+            body = command.split("\n", 1)[1].rsplit("\n", 1)[0]
+            result = await asyncio.to_thread(
+                subprocess.run,
+                [sys.executable, "-I", "-c", body],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            return RunResult(result.returncode, result.stdout, result.stderr)
+
+    shell = LocalRestoreShell()
+    if case == "mixed":
+        await panel_ops._restore_virtual_sliders_on_uninstall(shell)
+        assert state.read_text() == "{}"
+    else:
+        with pytest.raises(panel_ops.PanelOpError):
+            await panel_ops._restore_virtual_sliders_on_uninstall(shell)
+        assert state.read_text() == contents
+
+
+async def test_uninstall_requires_confirmed_ssh_exit_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from custom_components.brilliant_mqtt.shell import _LegacyAsyncsshShell
+
+    commands: list[str] = []
+
+    class Connection:
+        async def run(self, command: str, **kwargs: object) -> SimpleNamespace:
+            commands.append(command)
+            status = None if "BRILLIANT_RESTORE_VIRTUAL_SLIDERS" in command else 0
+            stdout = (
+                "LoadState=loaded\nActiveState=inactive\nMainPID=0\nControlPID=0\n"
+                if command == panel_ops._UNINSTALL_BRIDGE_STATE_COMMAND
+                else ""
+            )
+            return SimpleNamespace(exit_status=status, stdout=stdout, stderr="")
+
+    async def no_baseline(shell: object) -> bool:
+        return False
+
+    monkeypatch.setattr(panel_ops, "baseline_retained", no_baseline)
+    shell = _LegacyAsyncsshShell("test", "", None)
+    monkeypatch.setattr(shell, "_conn", Connection())
+    with pytest.raises(panel_ops.PanelOpError, match="exited -1"):
+        await panel_ops.uninstall(shell)
+    assert not any(command.startswith("rm ") for command in commands)
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["singlequote", "relative", "unquoted_space", "unsupported", "conflict", "truncated", "alias"],
+)
+async def test_uninstall_resolves_effective_paths_and_validates_all_originals_before_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    var_dir = tmp_path / "panel"
+    working = var_dir / "current" / "app"
+    package = working / "brilliant_mqtt"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("")
+    marker = tmp_path / "restore-called"
+    (package / "virtual_sliders.py").write_text(
+        "from pathlib import Path\n"
+        "async def restore_all_persisted_slider_bindings(path):\n"
+        f"    Path({str(marker)!r}).write_text('called')\n"
+        "    path.write_text('{}')\n    return True\n"
+    )
+    custom = (working / "relative") if case == "relative" else var_dir / "custom state"
+    custom.mkdir()
+    state = custom / "virtual-sliders.json"
+    row = {
+        "original_slider_config": _SLIDER_ORIGINAL_B64,
+        "config_device_id": "panel",
+        "config_peripheral_id": "faceplate_peripheral",
+        "config_var_name": "slider_config:0",
+    }
+    if case in ("singlequote", "relative", "unquoted_space", "unsupported"):
+        state.write_text("invalid ledger")
+    else:
+        state.write_text(json.dumps({"A": row}))
+    if case == "truncated":
+        row["original_slider_config"] = _SLIDER_ORIGINAL_B64[:-12]
+        state.write_text(json.dumps({"A": row}))
+    default = var_dir / "state"
+    if case == "alias":
+        default.symlink_to(custom, target_is_directory=True)
+    elif case == "conflict":
+        default.mkdir()
+        # Another valid Thrift original, at the same physical coordinate.
+        native = base64.b64decode(_SLIDER_ORIGINAL_B64)
+        other = base64.b64encode(native.replace(b"group_83", b"group_84")).decode()
+        (default / "virtual-sliders.json").write_text(
+            json.dumps({"B": {**row, "original_slider_config": other}})
+        )
+    if case == "singlequote":
+        value = f"'{custom}'"
+    elif case == "relative":
+        value = "relative"
+    elif case == "unquoted_space":
+        value = str(custom)
+    elif case == "unsupported":
+        value = '"ambiguous\\q"'
+    else:
+        value = f'"{custom}"'
+    monkeypatch.setattr(panel_ops, "PANEL_VAR_DIR", str(var_dir))
+
+    class ExecuteShell(FakeShell):
+        async def run(self, command: str) -> RunResult:
+            if command.startswith("systemctl show"):
+                return RunResult(0, str(working), "")
+            if "BRILLIANT_RESTORE_VIRTUAL_SLIDERS" not in command:
+                return RunResult(0, f"MOTION_DESIRED_STATE_DIR={value}\n", "")
+            body = command.split("\n", 1)[1].rsplit("\n", 1)[0]
+            result = await asyncio.to_thread(
+                subprocess.run,
+                [sys.executable, "-I", "-c", body],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            return RunResult(result.returncode, result.stdout, result.stderr)
+
+    before = state.read_text()
+    if case == "alias":
+        await panel_ops._restore_virtual_sliders_on_uninstall(ExecuteShell())
+        assert state.read_text() == "{}"
+        assert marker.exists()
+    else:
+        with pytest.raises(panel_ops.PanelOpError):
+            await panel_ops._restore_virtual_sliders_on_uninstall(ExecuteShell())
+        assert state.read_text() == before
+        assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "old_relative",
+        "old_invalid",
+        "old_absolute",
+        "multiline_single",
+        "multiline_double",
+        "null_orphan",
+        "staging",
+    ],
+)
+async def test_uninstall_accounts_for_displaced_ledgers_and_ambiguous_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    var_dir = tmp_path / "panel"
+    old = var_dir / "releases" / "old" / "app"
+    active = var_dir / "releases" / "new" / "app"
+    package = active / "brilliant_mqtt"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("")
+    (var_dir / "current").symlink_to(active.parent, target_is_directory=True)
+    marker = tmp_path / "restored-path"
+    (package / "virtual_sliders.py").write_text(
+        "from pathlib import Path\n"
+        "async def restore_all_persisted_slider_bindings(path):\n"
+        f"    Path({str(marker)!r}).write_text(str(path))\n"
+        "    path.write_text('{}')\n    return True\n"
+    )
+    if case == "staging":
+        directory = tmp_path / "staging" / "state"
+        monkeypatch.setattr(panel_ops, "_STAGING_DIR", str(tmp_path / "staging"))
+    elif case == "old_absolute":
+        directory = var_dir / "previous absolute"
+    elif case.startswith("old_"):
+        directory = old / "relative"
+    else:
+        directory = var_dir / "custom"
+    directory.mkdir(parents=True)
+    state = directory / "virtual-sliders.json"
+    row: dict[str, object] = {
+        "original_slider_config": _SLIDER_ORIGINAL_B64,
+        "config_device_id": "panel",
+        "config_peripheral_id": "faceplate_peripheral",
+        "config_var_name": "slider_config:0",
+    }
+    if case == "null_orphan":
+        row.update(orphaned=True, slider_id="A", original_slider_config=None)
+    state.write_text("invalid" if case == "old_invalid" else json.dumps({"A": row}))
+    env = (
+        "MOTION_DESIRED_STATE_DIR=relative\n"
+        if case.startswith("old_") or case == "staging"
+        else f"MOTION_DESIRED_STATE_DIR='{directory}'\n"
+    )
+    if case.startswith("multiline_"):
+        quote = "'" if case == "multiline_single" else '"'
+        env += f"OPERATOR_NOTES={quote}notes:\nMOTION_DESIRED_STATE_DIR=/unused/example\n{quote}\n"
+    monkeypatch.setattr(panel_ops, "PANEL_VAR_DIR", str(var_dir))
+
+    class ExecuteShell(FakeShell):
+        async def run(self, command: str) -> RunResult:
+            if command.startswith("systemctl show"):
+                return RunResult(0, str(var_dir / "current" / "app"), "")
+            if "BRILLIANT_RESTORE_VIRTUAL_SLIDERS" not in command:
+                return RunResult(0, env, "")
+            body = command.split("\n", 1)[1].rsplit("\n", 1)[0]
+            result = await asyncio.to_thread(
+                subprocess.run,
+                [sys.executable, "-I", "-c", body],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            return RunResult(result.returncode, result.stdout, result.stderr)
+
+    saved = state.read_text()
+    if case in ("old_relative", "old_absolute", "staging"):
+        await panel_ops._restore_virtual_sliders_on_uninstall(ExecuteShell())
+        assert state.read_text() == "{}"
+        assert marker.read_text() == str(state)
+    else:
+        with pytest.raises(panel_ops.PanelOpError):
+            await panel_ops._restore_virtual_sliders_on_uninstall(ExecuteShell())
+        assert state.read_text() == saved
+        assert not marker.exists()
+
+
+async def test_uninstall_restore_accepts_confirmed_absence_of_payload_and_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(panel_ops, "PANEL_VAR_DIR", str(tmp_path / "absent"))
+    monkeypatch.setattr(panel_ops, "_STAGING_DIR", str(tmp_path / "absent-staging"))
+
+    class ExecuteShell(FakeShell):
+        async def run(self, command: str) -> RunResult:
+            if "BRILLIANT_RESTORE_VIRTUAL_SLIDERS" not in command:
+                return RunResult(0, "", "")
+            body = command.split("\n", 1)[1].rsplit("\n", 1)[0]
+            result = await asyncio.to_thread(
+                subprocess.run,
+                [sys.executable, "-I", "-c", body],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            return RunResult(result.returncode, result.stdout, result.stderr)
+
+    await panel_ops._restore_virtual_sliders_on_uninstall(ExecuteShell())
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "stop_failed_active",
+        "stop_failed_inactive",
+        "active",
+        "failed",
+        "unknown",
+        "main_pid",
+        "control_pid",
+        "bad_load",
+        "query_failed",
+        "query_unknown_exit",
+        "stop_timeout",
+        "query_timeout",
+        "absent",
+        "absent_without_pid_properties",
+        "absent_nonzero_query",
+        "stop_unknown_exit",
+        "absent_unknown_query",
+        "absent_killed_query",
+        "absent_transport_query",
+        "absent_killed_stop",
+        "absent_transport_stop",
+        "stopped",
+    ],
+)
+async def test_uninstall_requires_positive_writer_quiescence_before_any_restore(case: str) -> None:
+    stop = f"systemctl disable --now {SERVICE_NAME}"
+    status = "LoadState=loaded\nActiveState=inactive\nMainPID=0\nControlPID=0\n"
+    if case in ("stop_failed_active", "active"):
+        status = status.replace("ActiveState=inactive", "ActiveState=active")
+    elif case == "failed":
+        status = status.replace("ActiveState=inactive", "ActiveState=failed")
+    elif case == "main_pid":
+        status = status.replace("MainPID=0", "MainPID=42")
+    elif case == "control_pid":
+        status = status.replace("ControlPID=0", "ControlPID=42")
+    elif case == "bad_load":
+        status = status.replace("LoadState=loaded", "LoadState=bad-setting")
+    elif case.startswith("absent"):
+        status = status.replace("LoadState=loaded", "LoadState=not-found")
+        if case == "absent_without_pid_properties":
+            status = "LoadState=not-found\nActiveState=inactive\n"
+    elif case == "unknown":
+        status = ""
+    abnormal = {
+        "absent_killed_query": 137,
+        "absent_transport_query": 255,
+        "absent_killed_stop": 137,
+        "absent_transport_stop": 255,
+    }
+    responses = {
+        stop: RunResult(
+            abnormal[case]
+            if case in abnormal and case.endswith("_stop")
+            else -1
+            if case == "stop_unknown_exit"
+            else (1 if case.startswith(("stop_failed", "absent")) else 0),
+            "",
+            "",
+        ),
+        panel_ops._UNINSTALL_BRIDGE_STATE_COMMAND: RunResult(
+            abnormal[case]
+            if case in abnormal and case.endswith("_query")
+            else 1
+            if case in ("query_failed", "absent_nonzero_query")
+            else (-1 if case in ("query_unknown_exit", "absent_unknown_query") else 0),
+            status,
+            "",
+        ),
+    }
+    errors: dict[str, Exception] = {}
+    if case == "stop_timeout":
+        errors[stop] = TimeoutError()
+    elif case == "query_timeout":
+        errors[panel_ops._UNINSTALL_BRIDGE_STATE_COMMAND] = TimeoutError()
+    shell = await _connected(FakeShell(responses=responses, run_errors=errors))
+    if case in ("absent", "absent_without_pid_properties", "absent_nonzero_query", "stopped"):
+        await panel_ops.uninstall(shell)
+        assert shell.virtual_sliders_restored
+        assert any(command.startswith("rm -rf") for command in shell.commands)
+    else:
+        with pytest.raises((panel_ops.PanelOpError, TimeoutError)):
+            await panel_ops.uninstall(shell)
+        assert not shell.virtual_sliders_restored
+        assert not any(command.startswith("rm ") for command in shell.commands)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "file_external",
+        "default_external",
+        "root_external",
+        "staging_external",
+        "dangling",
+        "file_internal",
+        "configured_external",
+        "configured_external_alias",
+    ],
+)
+async def test_uninstall_confines_inferred_recovery_files_to_owned_removal_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    var_dir = tmp_path / "panel"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    root = outside / "payload" if case == "root_external" else var_dir
+    package = root / "app" / "brilliant_mqtt"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("")
+    if case == "root_external":
+        var_dir.symlink_to(root, target_is_directory=True)
+    staging = tmp_path / "staging"
+    if case == "staging_external":
+        other_root = outside / "stage"
+        other_root.mkdir()
+        staging.symlink_to(other_root, target_is_directory=True)
+    marker = tmp_path / "helper-called"
+    (package / "virtual_sliders.py").write_text(
+        "from pathlib import Path\n"
+        "async def restore_all_persisted_slider_bindings(path):\n"
+        f"    Path({str(marker)!r}).write_text(str(path))\n"
+        "    path.write_text('{}')\n    return True\n"
+    )
+    ledger = (
+        root / "state"
+        if case in ("file_internal", "root_external", "staging_external")
+        else outside
+    ) / "virtual-sliders.json"
+    ledger.parent.mkdir(exist_ok=True)
+    ledger.write_text(
+        json.dumps(
+            {
+                "A": {
+                    "original_slider_config": _SLIDER_ORIGINAL_B64,
+                    "config_device_id": "panel",
+                    "config_peripheral_id": "faceplate_peripheral",
+                    "config_var_name": "slider_config:0",
+                }
+            }
+        )
+    )
+    if case in (
+        "file_internal",
+        "file_external",
+        "dangling",
+        "default_external",
+        "configured_external_alias",
+    ):
+        parent = root / ("state" if case == "default_external" else "incidental")
+        parent.mkdir(exist_ok=True)
+        target = outside / "absent.json" if case == "dangling" else ledger
+        (parent / "virtual-sliders.json").symlink_to(target)
+    environment = (
+        f"MOTION_DESIRED_STATE_DIR='{outside}'\n" if case.startswith("configured_external") else ""
+    )
+    monkeypatch.setattr(panel_ops, "PANEL_VAR_DIR", str(var_dir))
+    monkeypatch.setattr(panel_ops, "_STAGING_DIR", str(staging))
+
+    class ExecuteShell(FakeShell):
+        async def run(self, command: str) -> RunResult:
+            if "BRILLIANT_RESTORE_VIRTUAL_SLIDERS" not in command:
+                return RunResult(0, environment, "")
+            body = command.split("\n", 1)[1].rsplit("\n", 1)[0]
+            result = await asyncio.to_thread(
+                subprocess.run,
+                [sys.executable, "-I", "-c", body],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            return RunResult(result.returncode, result.stdout, result.stderr)
+
+    original = ledger.read_text()
+    if case in ("file_internal", "configured_external", "configured_external_alias"):
+        await panel_ops._restore_virtual_sliders_on_uninstall(ExecuteShell())
+        assert ledger.read_text() == "{}"
+        assert marker.read_text() == str(ledger)
+    else:
+        with pytest.raises(panel_ops.PanelOpError):
+            await panel_ops._restore_virtual_sliders_on_uninstall(ExecuteShell())
+        assert ledger.read_text() == original
+        assert not marker.exists()

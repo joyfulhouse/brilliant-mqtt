@@ -9,12 +9,14 @@ No panel imports, no MQTT library imports: pure stdlib only.
 
 from __future__ import annotations
 
+import math
 import os
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 
 from brilliant_mqtt.ha_control_protocol import is_panel_slug
+from brilliant_mqtt.virtual_sliders import parse_virtual_slider_specs
 
 # Recognized spellings for boolean env vars. Anything else raises ValueError at
 # startup — an operator writing "false" must never silently get "enabled".
@@ -113,9 +115,20 @@ class Settings:
     # rollout validation is complete; its replay/outbox state must persist.
     scene_bridge_enabled: bool = False
     scene_watermark_file: str = "/data/brilliant-mqtt/scene-watermarks.json"
+    # Opt-in native BLE mesh motion passthrough: when True, switches with
+    # calibrated NVM thresholds (motion_low_threshold > 20) report native
+    # edge-triggered movement_detected transitions with enable_motion_score="0".
+    motion_native_passthrough: bool = False
+    motion_default_high_threshold: int | None = None
+    motion_default_low_threshold: int | None = None
 
     # Exit the process after this many consecutive unresolved-close fences.
     bus_fenced_start_limit: int = 3
+    # JSON list of VirtualSliderSpec definitions (empty disables virtual sliders).
+    virtual_sliders_json: str = ""
+    # Enable panel camera snapshot & TV Ambilight entities on this panel.
+    ambilight_enabled: bool = False
+    ambilight_interval_s: float = 1.0
 
     def __post_init__(self) -> None:
         if (
@@ -231,6 +244,42 @@ class Settings:
         scene_watermark_file = env.get(
             "SCENE_WATERMARK_FILE", "/data/brilliant-mqtt/scene-watermarks.json"
         )
+        motion_native_passthrough = _env_bool(env, "MOTION_NATIVE_PASSTHROUGH", "0")
+        raw_high_thresh = env.get("MOTION_DEFAULT_HIGH_THRESHOLD", "").strip()
+        motion_default_high_threshold: int | None = None
+        if raw_high_thresh:
+            motion_default_high_threshold = int(raw_high_thresh)
+            if not 0 <= motion_default_high_threshold <= 255:
+                raise ValueError("MOTION_DEFAULT_HIGH_THRESHOLD must be in 0..255")
+        raw_low_thresh = env.get("MOTION_DEFAULT_LOW_THRESHOLD", "").strip()
+        motion_default_low_threshold: int | None = None
+        if raw_low_thresh:
+            motion_default_low_threshold = int(raw_low_thresh)
+            if not 0 <= motion_default_low_threshold <= 255:
+                raise ValueError("MOTION_DEFAULT_LOW_THRESHOLD must be in 0..255")
+            if motion_native_passthrough and motion_default_low_threshold <= 20:
+                raise ValueError(
+                    "MOTION_DEFAULT_LOW_THRESHOLD must be > 20 "
+                    "when MOTION_NATIVE_PASSTHROUGH is enabled"
+                )
+        if (
+            motion_default_low_threshold is not None
+            and motion_default_high_threshold is not None
+            and motion_default_low_threshold > motion_default_high_threshold
+        ):
+            raise ValueError(
+                "MOTION_DEFAULT_LOW_THRESHOLD must be <= MOTION_DEFAULT_HIGH_THRESHOLD"
+            )
+        virtual_sliders_json = env.get("VIRTUAL_SLIDERS_JSON", "")
+        if virtual_sliders_json.strip():
+            try:
+                parse_virtual_slider_specs(virtual_sliders_json)
+            except Exception as error:
+                raise ValueError(f"Invalid VIRTUAL_SLIDERS_JSON: {error}") from error
+        ambilight_enabled = _env_bool(env, "AMBILIGHT_ENABLED", "0")
+        ambilight_interval_s = float(env.get("AMBILIGHT_INTERVAL_S", "1.0"))
+        if not math.isfinite(ambilight_interval_s) or not 0.25 <= ambilight_interval_s <= 10:
+            raise ValueError("AMBILIGHT_INTERVAL_S must be finite and in 0.25..10 seconds")
 
         return cls(
             panel=panel,
@@ -262,4 +311,10 @@ class Settings:
             bus_phase_file=bus_phase_file,
             scene_bridge_enabled=scene_bridge_enabled,
             scene_watermark_file=scene_watermark_file,
+            motion_native_passthrough=motion_native_passthrough,
+            motion_default_high_threshold=motion_default_high_threshold,
+            motion_default_low_threshold=motion_default_low_threshold,
+            virtual_sliders_json=virtual_sliders_json,
+            ambilight_enabled=ambilight_enabled,
+            ambilight_interval_s=ambilight_interval_s,
         )

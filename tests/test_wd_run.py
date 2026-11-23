@@ -145,7 +145,9 @@ def test_reboot_escalation_log_names_imx6_only_reset(caplog: pytest.LogCaptureFi
             reboot_eligible=True,
         )
     messages = [r.getMessage() for r in caplog.records]
-    assert "gateway down ~360s: Wi-Fi reset (i.MX6 only) + reboot" in messages
+    assert (
+        "gateway down ~360s: Wi-Fi reset (i.MX6 only; mmc1 binding required) + reboot" in messages
+    )
     assert not any("GPIO/SDIO reset + reboot" in m for m in messages)
 
 

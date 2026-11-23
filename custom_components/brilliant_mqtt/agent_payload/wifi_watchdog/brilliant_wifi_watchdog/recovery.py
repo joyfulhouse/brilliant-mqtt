@@ -52,8 +52,17 @@ def _read_alias() -> str | None:
 
 
 def imx_wifi_reset_supported() -> bool:
-    """True only where Brilliant's i.MX6 usdhc driver is registered (the reset's target)."""
-    return os.path.isdir(_IMX_SDHCI_DRIVER_DIR)
+    """Require the mmc1 controller to be bound to the i.MX usdhc driver."""
+    controller = _read_alias()
+    if not controller:
+        return False
+    device = os.path.join(_IMX_SDHCI_DRIVER_DIR, controller)
+    return (
+        os.path.islink(device)
+        and os.path.isdir(device)
+        and os.path.realpath(os.path.join(device, "driver"))
+        == os.path.realpath(_IMX_SDHCI_DRIVER_DIR)
+    )
 
 
 def soft_reconnect(run: Callable[[list[str]], int] = _run) -> None:
@@ -79,15 +88,14 @@ def gpio_reset_and_reboot(
     sleep: Callable[[float], None] = time.sleep,
     reset_supported: Callable[[], bool] = imx_wifi_reset_supported,
 ) -> int:
-    if reset_supported():
-        controller = read_alias()
-        if controller:
-            write(f"{_IMX_SDHCI_DRIVER_DIR}/unbind", controller)
+    controller = read_alias() if reset_supported() else None
+    if controller:
+        write(f"{_IMX_SDHCI_DRIVER_DIR}/unbind", controller)
         _pull_down_gpio(WL_REG_ON_GPIO, write)
         _pull_down_gpio(BT_REG_ON_GPIO, write)
         sleep(1)
         write("/sys/class/gpio/unexport", str(WL_REG_ON_GPIO))
         write("/sys/class/gpio/unexport", str(BT_REG_ON_GPIO))
     else:
-        _LOG.warning("i.MX sdhci driver absent; skipping GPIO/usdhc reset")
+        _LOG.warning("i.MX mmc1 controller binding unverified; skipping GPIO/usdhc reset")
     return run(["systemctl", "reboot"])

@@ -656,7 +656,7 @@ class _ShellOperations:
             timeout=_OPERATION_TIMEOUT,
         )
         return RunResult(
-            exit_status=result.exit_status or 0,
+            exit_status=result.exit_status if result.exit_status is not None else -1,
             stdout=str(result.stdout or ""),
             stderr=str(result.stderr or ""),
         )
@@ -705,7 +705,12 @@ class _ShellOperations:
                     await f.write(data)
 
     async def _async_upload_file(
-        self, sftp: asyncssh.SFTPClient, entry: _LocalUpload, remote_path: str, mode: int
+        self,
+        sftp: asyncssh.SFTPClient,
+        entry: _LocalUpload,
+        remote_path: str,
+        mode: int,
+        idle_timeout: asyncio.Timeout | None = None,
     ) -> None:
         async with await sftp.open(remote_path, "wb", attrs=SFTPAttrs(permissions=mode)) as remote:
             await remote.chmod(mode)
@@ -714,10 +719,12 @@ class _ShellOperations:
                 data = await _async_local_io(partial(_read_local_chunk, entry, offset))
                 await remote.write(data)
                 offset += len(data)
+                if idle_timeout is not None:
+                    idle_timeout.reschedule(asyncio.get_running_loop().time() + _OPERATION_TIMEOUT)
 
     async def put_dir(self, local_dir: str, remote_dir: str) -> None:
         conn = self._require_conn()
-        async with asyncio.timeout(_OPERATION_TIMEOUT):
+        async with asyncio.timeout(_OPERATION_TIMEOUT) as idle_timeout:
             entries = await _async_local_io(partial(_list_local_tree, local_dir))
             async with await conn.start_sftp_client() as sftp:
                 destination = (
@@ -735,7 +742,9 @@ class _ShellOperations:
                         if not await sftp.isdir(target):
                             await sftp.mkdir(target, attrs=SFTPAttrs(permissions=0o700))
                     else:
-                        await self._async_upload_file(sftp, entry, target, entry.mode)
+                        await self._async_upload_file(
+                            sftp, entry, target, entry.mode, idle_timeout=idle_timeout
+                        )
                 # Apply directory permissions after children, including read-only trees.
                 for entry in reversed(entries):
                     if entry.directory:
@@ -748,7 +757,7 @@ class _ShellOperations:
 
     async def put_file(self, local_path: str, remote_path: str, mode: int) -> None:
         conn = self._require_conn()
-        async with asyncio.timeout(_OPERATION_TIMEOUT):
+        async with asyncio.timeout(_OPERATION_TIMEOUT) as idle_timeout:
             entry = await _async_local_io(partial(_local_upload, local_path, ""))
             if entry.directory or entry.size > _MAX_UPLOAD_BYTES:
                 raise ValueError("upload_source_not_regular")
@@ -758,7 +767,9 @@ class _ShellOperations:
                     if await sftp.isdir(remote_path)
                     else remote_path
                 )
-                await self._async_upload_file(sftp, entry, destination, mode)
+                await self._async_upload_file(
+                    sftp, entry, destination, mode, idle_timeout=idle_timeout
+                )
 
 
 class AsyncsshShell(_ShellOperations):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
@@ -64,6 +65,7 @@ from .panel_ops import (
 )
 from .provisioning_journal import (
     PROVISIONING_ERROR_CODES,
+    ProvisioningJournalError,
     ProvisioningOperation,
     ProvisioningPhase,
     ProvisioningRecord,
@@ -75,9 +77,89 @@ from .provisioning_journal import (
     StoredPanelRequest,
     StoredPanelSnapshot,
     StoredServiceSnapshot,
+    _redact_text,
     ownerless_journal_recovery_allowed,
 )
 from .shell import HostIdentity, PanelProcess, PanelShell, recovery_connect_failure_code
+
+_LOGGER = logging.getLogger(__name__)
+_PROOF_REASON_LIMIT = 180
+_BASELINE_KIND = re.compile(r"baseline_[a-z0-9_]+")
+
+
+def _proof_reason(text: str) -> str:
+    cleaned = "".join(char if char.isprintable() else " " for char in text)
+    cleaned = " ".join(cleaned.split())
+    return cleaned[:_PROOF_REASON_LIMIT] or "unactivated baseline not proven"
+
+
+def _proof_secrets(record: ProvisioningRecord) -> tuple[str, ...]:
+    request = record.panel_request
+    return tuple(
+        item
+        for item in (
+            request.root_password,
+            request.host,
+            request.public_key,
+            request.fingerprint,
+            record.fleet_profile.host,
+        )
+        if item
+    )
+
+
+def _snapshot_differences(
+    observed: StoredPanelSnapshot,
+    expected: StoredPanelSnapshot,
+) -> tuple[str, ...]:
+    """Name differing sections without copying file bytes or credentials."""
+    names: list[str] = []
+    if observed.layout != expected.layout:
+        names.append("layout")
+    if observed.active_release_target != expected.active_release_target:
+        names.append("active_release_target")
+    if observed.selected_components != expected.selected_components:
+        names.append("selected_components")
+    for field_name in ("environment_file", "version_file"):
+        left = getattr(observed, field_name)
+        right = getattr(expected, field_name)
+        if left.content != right.content:
+            names.append(f"{field_name}.content")
+        if left.mode != right.mode:
+            names.append(f"{field_name}.mode")
+    for field_name in ("bridge_service", "wifi_watchdog_service", "bus_watchdog_service"):
+        left = getattr(observed, field_name)
+        right = getattr(expected, field_name)
+        if left.unit_file.content != right.unit_file.content:
+            names.append(f"{field_name}.unit")
+        if left.unit_file.mode != right.unit_file.mode:
+            names.append(f"{field_name}.mode")
+        if left.enabled != right.enabled or left.active != right.active:
+            names.append(f"{field_name}.state")
+    if not names:
+        names.append("unknown")
+    return tuple(names)
+
+
+def _probe_failure_reason(error: PanelOpError, secrets: tuple[str, ...]) -> str:
+    code = str(error).split(":", 1)[0]
+    stderr = _redact_text(error.stderr, secrets)
+    matched = _BASELINE_KIND.search(stderr)
+    kind = matched.group(0) if matched is not None else ""
+    if code == "baseline_verify_failed":
+        text = "verify_baseline failed" + (f": {kind}" if kind and kind != code else "")
+    elif code == "baseline_check_restored_failed":
+        text = "check_restored failed: " + (kind or code)
+    elif code == "baseline_candidate_present":
+        text = "candidate release directory present"
+    elif code == "baseline_read_failed":
+        status = "unknown" if error.exit_status is None else str(error.exit_status)
+        detail = _proof_reason(stderr) if stderr.strip() else "no stderr"
+        text = f"panel command failed: exit {status}: {detail}"
+    else:
+        text = f"panel proof failed: {code}"
+    return _proof_reason(_redact_text(text, secrets))
+
 
 type JsonScalar = None | bool | int | float | str
 type JsonValue = JsonScalar | list["JsonValue"] | Mapping[str, "JsonValue"]
@@ -179,7 +261,14 @@ class ProvisioningFailureDetail:
 class PanelProvisioningError(RuntimeError):
     """One allowlisted orchestration failure without raw dependency context."""
 
-    __slots__ = ("capability", "cleanup_code", "code", "detail", "release_override")
+    __slots__ = (
+        "capability",
+        "cleanup_code",
+        "code",
+        "detail",
+        "release_override",
+        "storage_reason",
+    )
 
     def __init__(
         self,
@@ -189,6 +278,7 @@ class PanelProvisioningError(RuntimeError):
         cleanup_code: str | None = None,
         capability: str | None = None,
         release_override: Mapping[str, object] | None = None,
+        storage_reason: str | None = None,
     ) -> None:
         valid_toolchain_capability = (
             isinstance(capability, str) and capability in PANEL_TOOLCHAIN_CAPABILITIES
@@ -212,6 +302,7 @@ class PanelProvisioningError(RuntimeError):
         self.detail = detail
         self.cleanup_code = cleanup_code
         self.capability = capability
+        self.storage_reason = storage_reason if isinstance(storage_reason, str) else None
         super().__init__(code)
         self.__suppress_context__ = True
 
@@ -221,6 +312,8 @@ class PanelProvisioningError(RuntimeError):
             fields.append(f"capability={self.capability!r}")
         if self.cleanup_code is not None:
             fields.append(f"cleanup_code={self.cleanup_code!r}")
+        if self.storage_reason is not None:
+            fields.append(f"storage_reason={self.storage_reason!r}")
         return f"PanelProvisioningError({', '.join(fields)})"
 
 
@@ -593,6 +686,10 @@ class _Journal(Protocol):
     async def async_begin_ownerless_finalize(
         self, expected: RetainedRollback
     ) -> RetainedRollback: ...
+
+    async def async_begin_ownerless_unactivated_discard(
+        self, expected: RetainedRollback
+    ) -> RetainedRollback: ...
     async def async_retained_records(self) -> tuple[RetainedRollback, ...]: ...
     async def async_retained(self, transaction_id: UUID) -> RetainedRollback | None: ...
     async def async_retained_state(
@@ -671,6 +768,14 @@ class PanelOperations(Protocol):
     ) -> PanelSnapshot: ...
     async def verify_baseline(self, shell: PanelShell, snapshot: PanelSnapshot) -> None: ...
     async def finalize_baseline(self, shell: PanelShell, snapshot: PanelSnapshot) -> None: ...
+    async def prove_unactivated_capture(
+        self,
+        shell: PanelShell,
+        snapshot: PanelSnapshot,
+        *,
+        version: str,
+        transaction_id: UUID,
+    ) -> None: ...
     async def restart_restored(
         self,
         shell: PanelShell,
@@ -813,6 +918,7 @@ class PanelProvisioner:
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         health_timeout: float = 90.0,
         credential_resolver: Callable[[StoredPanelRequest], Awaitable[str | None]] | None = None,
+        recovery_authorizer: Callable[[ProvisioningRecord], Awaitable[None]] | None = None,
         retained_owner_exists: Callable[[RetainedRollback], Awaitable[bool]] | None = None,
     ) -> None:
         self._lock = operation_lock
@@ -834,6 +940,7 @@ class PanelProvisioner:
         self._id_factory = id_factory
         self._clock = clock
         self._credential_resolver = credential_resolver
+        self._recovery_authorizer = recovery_authorizer
         self._retained_owner_exists = retained_owner_exists
         if (
             not isinstance(operation_lock, asyncio.Lock)
@@ -1127,6 +1234,14 @@ class PanelProvisioner:
             raise PanelProvisioningError("inspection_failed")
         if await self._duplicate_fingerprint(identity.fingerprint):
             raise PanelProvisioningError("duplicate_panel")
+        # A retry must discover the first capture before publishing another one.
+        state.failure_code = "journal_failed"
+        state.failure_stage = "journal"
+        if any(
+            item.record.panel_request.fingerprint == identity.fingerprint
+            for item in await self._journal.async_retained_records()
+        ):
+            raise PanelProvisioningError("baseline_retained_finalize_first")
 
         state.transaction_id = self._next_id()
         state.setup_id = self._next_id()
@@ -1248,7 +1363,20 @@ class PanelProvisioner:
         if create_outcome.error is not None:
             if create_outcome.cancellation is not None:
                 raise create_outcome.cancellation from None
-            raise PanelProvisioningError("journal_failed")
+            reason = (
+                create_outcome.error.reason
+                if isinstance(create_outcome.error, ProvisioningJournalError)
+                else None
+            )
+            cause = (
+                create_outcome.error.__cause__
+                if isinstance(create_outcome.error, ProvisioningJournalError)
+                else None
+            )
+            failure = PanelProvisioningError("journal_failed", storage_reason=reason)
+            if isinstance(cause, BaseException):
+                raise failure from cause
+            raise failure
         state.journal_phase = ProvisioningPhase.STAGED
         if create_outcome.cancellation is not None:
             raise create_outcome.cancellation from None
@@ -1572,10 +1700,17 @@ class PanelProvisioner:
     async def async_recover(
         self,
         progress: ProgressReporter = _noop_progress,
+        *,
+        expected_record: ProvisioningRecord | None = None,
+        authorize: Callable[[ProvisioningRecord], Awaitable[None]] | None = None,
     ) -> None:
         """Settle the one durable transaction before accepting new work."""
         async with self._lock:
-            outcome = await _settle(self._async_recover_bounded(progress))
+            outcome = await _settle(
+                self._async_recover_bounded(
+                    progress, expected_record=expected_record, authorize=authorize
+                )
+            )
             if outcome.cancellation is not None:
                 raise outcome.cancellation from None
             if outcome.error is not None:
@@ -1583,22 +1718,59 @@ class PanelProvisioner:
                     raise PanelProvisioningError(outcome.error.code)
                 raise PanelProvisioningError("recovery_failed")
 
-    async def _async_recover_bounded(self, progress: ProgressReporter) -> None:
+    async def _async_recover_bounded(
+        self,
+        progress: ProgressReporter,
+        *,
+        expected_record: ProvisioningRecord | None = None,
+        authorize: Callable[[ProvisioningRecord], Awaitable[None]] | None = None,
+    ) -> None:
         try:
             async with asyncio.timeout(RECOVERY_TIMEOUT_SECONDS):
-                await self._async_recover_current(progress)
+                if expected_record is None:
+                    await self._async_recover_current(progress)
+                else:
+                    await self._async_recover_expected(expected_record, progress, authorize)
         except TimeoutError:
             raise PanelProvisioningError("rollback_deadline_exceeded") from None
+
+    async def _async_recover_expected(
+        self,
+        expected: ProvisioningRecord,
+        progress: ProgressReporter,
+        authorize: Callable[[ProvisioningRecord], Awaitable[None]] | None,
+    ) -> None:
+        """Revalidate a queued worker's exact transaction under the operation lock."""
+        current = await self._journal.async_load()
+        if current is not None:
+            if current != expected:
+                return
+            if authorize is not None:
+                await authorize(current)
+            await self._async_recover_record(current, progress)
+            return
+        retained = await self._journal.async_retained(expected.transaction_id)
+        if retained is None or retained.record != expected or retained.state != "finalizing":
+            return
+        if retained.finalization_origin is not None:
+            raise PanelProvisioningError("ownerless_finalize_reauthentication_required")
+        # Retained rows omit the password; finalization resolves fresh credentials
+        # from their current pinned owner instead of using active-journal authority.
+        await self._async_finalize(retained)
 
     async def _async_recover_current(
         self,
         progress: ProgressReporter,
     ) -> None:
         await _report(progress, ProvisioningProgressStage.RECOVERING)
+        ownerless_pending = False
         for retained in await self._journal.async_retained_records():
             if retained.state == "finalizing":
-                if retained.finalization_origin == "ownerless_restored":
-                    raise PanelProvisioningError("ownerless_finalize_reauthentication_required")
+                if retained.finalization_origin in {"ownerless_restored", "ownerless_unactivated"}:
+                    # These markers need fresh flow authority. They must not
+                    # consume credentials or obstruct another panel's journal.
+                    ownerless_pending = True
+                    continue
                 await self._async_finalize(retained)
             elif retained.state == "restore_requested":
                 password = retained.compensation_password(await self._journal.async_load())
@@ -1608,6 +1780,8 @@ class PanelProvisioner:
         record = await self._journal.async_load()
         if record is not None:
             await self._async_recover_record(record, progress)
+        elif ownerless_pending:
+            raise PanelProvisioningError("ownerless_finalize_reauthentication_required")
 
     async def _async_recover_record(
         self,
@@ -1619,6 +1793,10 @@ class PanelProvisioner:
     ) -> None:
         if not isinstance(record, ProvisioningRecord):
             raise PanelProvisioningError("recovery_failed")
+        if host is None and password is None:
+            if self._recovery_authorizer is None:
+                raise PanelProvisioningError("provisioning_recovery_required")
+            await self._recovery_authorizer(record)
         if record.phase is ProvisioningPhase.ROLLED_BACK:
             retained = await self._journal.async_retained(record.transaction_id)
             verified = (
@@ -2092,6 +2270,112 @@ class PanelProvisioner:
             or await self._retained_owner_exists(expected)
         ):
             raise PanelProvisioningError("ownerless_recovery_unavailable")
+
+    async def _async_assert_unactivated_ownerless(self, expected: RetainedRollback) -> None:
+        current = await self._journal.async_retained(expected.record.transaction_id)
+        if (
+            await self._journal.async_load() is not None
+            or current != expected
+            or not expected.ownerless_unactivated_discard_allowed
+            or self._retained_owner_exists is None
+            or await self._retained_owner_exists(expected)
+        ):
+            raise PanelProvisioningError("ownerless_recovery_unavailable")
+
+    async def _async_prove_unactivated_panel(
+        self,
+        shell: PanelShell,
+        retained: RetainedRollback,
+        *,
+        password: str,
+    ) -> None:
+        record = retained.record
+        secrets = _proof_secrets(record) + (password,)
+        try:
+            live = await self._operations.snapshot_panel(shell)
+            observed = replace(self._snapshot_to_stored(live), baseline=None)
+            expected = replace(record.prior_snapshot, baseline=None)
+            if observed != expected:
+                reason = _proof_reason(
+                    "snapshot mismatch: " + (", ".join(_snapshot_differences(observed, expected)))
+                )
+                _LOGGER.warning("Unactivated baseline proof failed: %s", reason)
+                raise PanelProvisioningError(
+                    "unactivated_baseline_not_proven", storage_reason=reason
+                )
+            await self._operations.prove_unactivated_capture(
+                shell,
+                self._snapshot_from_stored(record.prior_snapshot),
+                version=record.staged_version,
+                transaction_id=record.transaction_id,
+            )
+        except PanelProvisioningError:
+            raise
+        except PanelOpError as error:
+            reason = _probe_failure_reason(error, secrets)
+            _LOGGER.warning("Unactivated baseline proof failed: %s", reason)
+            raise PanelProvisioningError(
+                "unactivated_baseline_not_proven", storage_reason=reason
+            ) from None
+        except (ValueError, TypeError) as error:
+            reason = _proof_reason(f"snapshot unreadable: {type(error).__name__}")
+            _LOGGER.warning("Unactivated baseline proof failed: %s", reason)
+            raise PanelProvisioningError(
+                "unactivated_baseline_not_proven", storage_reason=reason
+            ) from None
+
+    async def async_discard_unactivated_ownerless_baseline(
+        self,
+        expected: RetainedRollback,
+        host: str,
+        password: str,
+        identity: HostIdentity,
+    ) -> None:
+        """Remove one armed pre-activation baseline after the panel proves it is unchanged.
+
+        Onboarding armed this baseline and then failed before the execution journal
+        existed, so no candidate was staged. Cleanup is allowed only when a fresh
+        read still matches that capture and the transaction's release directory is
+        absent. A retry after the discard marker is durable skips the proof: the
+        archive removal is idempotent.
+        """
+        async with self._async_install_lock():
+            await self._async_assert_unactivated_ownerless(expected)
+            request = expected.record.panel_request
+            proven = await self._identity_fetcher(host)
+            if (
+                identity.public_key != request.public_key
+                or identity.fingerprint != request.fingerprint
+                or proven != identity
+            ):
+                raise PanelProvisioningError("panel_identity_mismatch")
+            shell = self._shell_factory(host, password, request.public_key)
+            try:
+                if shell.pinned_host_key() != request.public_key:
+                    raise PanelProvisioningError("panel_identity_mismatch")
+                await shell.connect()
+                await self._async_assert_unactivated_ownerless(expected)
+                current = await self._journal.async_retained(expected.record.transaction_id)
+                if current is None:
+                    raise PanelProvisioningError("ownerless_recovery_unavailable")
+                if current.state == "armed":
+                    await self._async_prove_unactivated_panel(shell, current, password=password)
+                    current = await self._journal.async_begin_ownerless_unactivated_discard(
+                        expected
+                    )
+                elif current.finalization_origin != "ownerless_unactivated":
+                    raise PanelProvisioningError("ownerless_recovery_unavailable")
+                await self._operations.finalize_baseline(
+                    shell, self._snapshot_from_stored(current.record.prior_snapshot)
+                )
+                await self._journal.async_remove_retained(current.record.transaction_id)
+                await self._repair_reporter.async_clear_rollback_failure(
+                    current.record.transaction_id
+                )
+            finally:
+                closed = await _settle_close(shell.close)
+                if closed.cancellation is not None:
+                    raise closed.cancellation from None
 
     async def async_finalize_ownerless_restored(
         self,

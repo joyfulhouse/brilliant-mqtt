@@ -26,7 +26,6 @@ from ..const import (
     CONF_FEATURE_OVERRIDES,
     CONF_HOST,
     CONF_HOT_POLL_SECONDS,
-    CONF_HUE_CA_CERT,
     CONF_MESH_PRIORITY,
     CONF_PANEL,
     CONF_RESYNC_SECONDS,
@@ -36,7 +35,8 @@ from ..const import (
     DEFAULT_VOICE_WAKE_WORD,
     SUBENTRY_TYPE_PANEL,
 )
-from ..entry_data import EntryDataError, FleetConfig, PanelConfig
+from ..entry_data import EntryDataError, FleetConfig, PanelConfig, effective_hue_ca_cert
+from ..migration_coordinator import migration_blocks_entry_writes
 from ..panel_inspection import PanelCompatibilityError, PanelFacts
 from ..panel_provisioner import PanelProvisioningError, ProvisionedPanel
 from ..shell import HostIdentity, PanelIdentityError
@@ -167,6 +167,8 @@ class PanelSubentryFlow(ConfigSubentryFlow, _PanelOnboardingMixin):
         user_input: dict[str, Any] | None = None,
     ) -> SubentryFlowResult:
         """Collect only panel address/password for an exact fleet parent."""
+        if migration_blocks_entry_writes(self.hass):
+            return self.async_abort(reason="migration_in_progress")
         if self._onboarding_parent_entry() is None:
             return self.async_abort(reason="invalid_parent")
         return cast(
@@ -180,6 +182,8 @@ class PanelSubentryFlow(ConfigSubentryFlow, _PanelOnboardingMixin):
     ) -> SubentryFlowResult:
         """Expose focused day-two actions for one exact panel subentry."""
         del user_input
+        if migration_blocks_entry_writes(self.hass):
+            return self.async_abort(reason="migration_in_progress")
         if self._reconfigure_target() is None:
             return self.async_abort(reason="invalid_parent")
         return self.async_show_menu(
@@ -442,15 +446,25 @@ class PanelSubentryFlow(ConfigSubentryFlow, _PanelOnboardingMixin):
                         CONF_VOICE_HA_HOST,
                         "",
                     )
-                    current_hue_ca = latest.feature_overrides.get(
-                        CONF_HUE_CA_CERT,
-                        "",
+                    # Compare the EFFECTIVE CA (override, else fleet default): an
+                    # override cleared to inherit an identical fleet CA changes nothing
+                    # on the panel, while a blank override on an inheriting panel
+                    # replacing the fleet CA does.
+                    try:
+                        fleet_hue_ca = FleetConfig.from_entry(entry).hue_ca_cert
+                    except EntryDataError:
+                        return self.async_abort(reason="invalid_parent")
+                    current_hue_ca = effective_hue_ca_cert(
+                        latest.feature_overrides,
+                        fleet_hue_ca,
                     )
                     voice_changed = (
                         normalized[CONF_VOICE_WAKE_WORD] != current_wake_word
                         or normalized[CONF_VOICE_HA_HOST] != current_ha_host
                     )
-                    hue_ca_changed = normalized[CONF_HUE_CA_CERT] != current_hue_ca
+                    hue_ca_changed = (
+                        effective_hue_ca_cert(normalized, fleet_hue_ca) != current_hue_ca
+                    )
                     if (latest.components.get(COMPONENT_VOICE) is True and voice_changed) or (
                         latest.components.get(COMPONENT_HUE_CA) is True and hue_ca_changed
                     ):
