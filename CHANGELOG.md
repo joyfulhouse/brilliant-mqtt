@@ -26,6 +26,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A bridge that recovers its local bus but cannot record that success in the
+  phase marker no longer leaves a stale failed-attempt record behind. If
+  atomic replacement, in-place rewrite and unlink all fail, the bridge empties
+  the marker through its exclusive lease before releasing it, so the bus
+  watchdog cannot later mistake a recovered-then-dead bridge for a native crash
+  loop, even after a watchdog restart. A failed bus attempt never empties the
+  marker, so genuine crash-loop recovery (#133) is unchanged. The lease stream
+  is now unbuffered so no stale bytes can be written back after the truncate.
+  This closes [#143](https://github.com/joyfulhouse/brilliant-mqtt/issues/143)
+  except when the kernel refuses the truncate or the bridge dies in the few
+  system calls between the successful read and the truncate; see
+  `docs/issue-143-lease-revocation.md`.
+- The bus watchdog no longer counts a dead bridge's stale bus attempt as
+  crash-loop evidence when the marker's filesystem is read-only, or when its
+  writability cannot be determined. A live bridge that holds its lease still
+  counts. This matters only for non-default setups: the marker defaults to
+  tmpfs under `/run`, which no shipped unit makes read-only.
+  ([#143](https://github.com/joyfulhouse/brilliant-mqtt/issues/143))
 - The Wi-Fi watchdog's last-resort GPIO/usdhc Wi-Fi reset is i.MX6-specific.
   It now requires the `mmc1` alias target to be bound to `sdhci-esdhc-imx`;
   driver registration alone is insufficient. Without binding evidence the
