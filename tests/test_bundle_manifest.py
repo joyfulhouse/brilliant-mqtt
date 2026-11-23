@@ -809,6 +809,226 @@ def test_unit_code_selection_handles_quotes_continuations_and_execstart(
     assert result.stdout == f"bridge\t0.11.3\tunknown\t{digest}\trelease_link\n"
 
 
+def _installed_or_staged_unit(panel: Path, units: Path, component: str, staged: bool) -> Path:
+    service = (
+        "brilliant-mqtt" if component == "bridge" else "brilliant-" + component.replace("_", "-")
+    )
+    directory = panel / ("system" if component == "bridge" else component) if staged else units
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory / (service + ".service")
+
+
+@pytest.mark.parametrize("component", _COMPONENTS)
+@pytest.mark.parametrize("staged", [False, True])
+def test_present_release_unit_requires_selector(
+    tmp_path: Path, component: str, staged: bool
+) -> None:
+    payload = _make_payload(tmp_path)
+    panel, units, env = _make_legacy_panel(tmp_path, payload)
+    helper = _load_helper()
+    _enroll(helper, panel, units, env, 5)
+    unit = _installed_or_staged_unit(panel, units, component, staged)
+    shutil.copyfile(_PAYLOAD / unit.name.replace(".service", "-release.service"), unit)
+    assert not os.path.lexists(panel / "current")
+    before = _snapshot(tmp_path)
+
+    result = _identity_run(panel, units, env, component)
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert result.stderr == "bundle-manifest: installed release selector is missing\n"
+    assert _snapshot(tmp_path) == before
+    with pytest.raises(helper.ManifestError, match="installed release selector is missing"):
+        helper.installed_identities(panel, units, env)
+
+
+@pytest.mark.parametrize("component", _COMPONENTS)
+@pytest.mark.parametrize(
+    ("staged", "installed_dropin"), [(False, True), (True, False), (True, True)]
+)
+@pytest.mark.parametrize("current", [False, True])
+def test_unit_dropins_cannot_verify_base_selection(
+    tmp_path: Path, component: str, staged: bool, installed_dropin: bool, current: bool
+) -> None:
+    payload = _make_payload(tmp_path)
+    panel, units, env = _make_legacy_panel(tmp_path, payload)
+    helper = _load_helper()
+    _enroll(helper, panel, units, env, 5)
+    if current:
+        release = panel / "releases" / _RELEASE_NAME
+        shutil.copytree(payload, release)
+        for tree in (
+            "app/brilliant_mqtt",
+            "wifi_watchdog/brilliant_wifi_watchdog",
+            "bus_watchdog/brilliant_bus_watchdog",
+        ):
+            _write(release / tree / "alternate.py", "different selected code")
+        (panel / "current").symlink_to(release)
+        assert helper.code_digest(panel, component) != helper.code_digest(release, component)
+    unit = _installed_or_staged_unit(panel, units, component, staged)
+    shutil.copyfile(_PAYLOAD / unit.name, unit)
+    dropin_unit = units / unit.name if installed_dropin else unit
+    tree = "app" if component == "bridge" else component
+    _write(
+        dropin_unit.parent / (dropin_unit.name + ".d") / "override.conf",
+        f"[Service]\nWorkingDirectory=/var/brilliant-mqtt/current/{tree}\n"
+        f"Environment=PYTHONPATH=/var/brilliant-mqtt/current/{tree}\n",
+    )
+    before = _snapshot(tmp_path)
+
+    result = _identity_run(panel, units, env, component)
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert result.stderr == "bundle-manifest: unhandled installed unit drop-ins\n"
+    assert _snapshot(tmp_path) == before
+    with pytest.raises(helper.ManifestError, match="unhandled installed unit drop-ins"):
+        helper.installed_identities(panel, units, env)
+
+
+@pytest.mark.parametrize("staged", [False, True])
+@pytest.mark.parametrize(
+    "directives",
+    [
+        "WorkingDirectory=/var/brilliant-mqtt/current/app\n"
+        "Environment=PYTHONPATH=/var/brilliant-mqtt/app:/var/brilliant-mqtt/vendor\n",
+        "Environment=PYTHONPATH=/var/brilliant-mqtt/current/app:/var/brilliant-mqtt/vendor\n",
+        "Environment=PYTHONPATH=/var/brilliant-mqtt/app\n"
+        "ExecStart=/usr/bin/python3 /var/brilliant-mqtt/current/app/main.py\n",
+        "ExecStart=/usr/bin/python3 -m brilliant_mqtt\n",
+        'Environment="PYTHONPATH=/var/brilliant-mqtt/app\n',
+        "Environment=PYTHONPATH=/var/brilliant-mqtt/app \\\n",
+    ],
+)
+def test_present_ambiguous_unit_fails_without_selector(
+    tmp_path: Path, staged: bool, directives: str
+) -> None:
+    payload = _make_payload(tmp_path)
+    panel, units, env = _make_legacy_panel(tmp_path, payload)
+    helper = _load_helper()
+    _enroll(helper, panel, units, env, 5)
+    unit = _installed_or_staged_unit(panel, units, "bridge", staged)
+    _write(unit, "[Service]\n" + directives)
+
+    result = _identity_run(panel, units, env, "bridge")
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert result.stderr == "bundle-manifest: ambiguous installed code selection\n"
+    with pytest.raises(helper.ManifestError, match="ambiguous installed code selection"):
+        helper.installed_identities(panel, units, env)
+
+
+@pytest.mark.parametrize(
+    ("staged", "installed_dropin"), [(False, True), (True, False), (True, True)]
+)
+@pytest.mark.parametrize(
+    "kind",
+    ["empty_conf", "non_selection_conf", "symlink_conf", "directory_conf", "symlink_dir", "file"],
+)
+def test_unhandled_unit_dropin_entries_are_rejected(
+    tmp_path: Path, staged: bool, installed_dropin: bool, kind: str
+) -> None:
+    payload = _make_payload(tmp_path)
+    panel, units, env = _make_legacy_panel(tmp_path, payload)
+    unit = _installed_or_staged_unit(panel, units, "bridge", staged)
+    shutil.copyfile(_PAYLOAD / unit.name, unit)
+    dropin_unit = units / unit.name if installed_dropin else unit
+    directory = dropin_unit.parent / (dropin_unit.name + ".d")
+    if kind == "file":
+        _write(directory, "not a directory")
+    elif kind == "symlink_dir":
+        directory.symlink_to(tmp_path / "absent")
+    else:
+        directory.mkdir()
+        entry = directory / "override.conf"
+        if kind == "symlink_conf":
+            entry.symlink_to(tmp_path / "absent")
+        elif kind == "directory_conf":
+            entry.mkdir()
+        else:
+            _write(entry, "[Service]\nNice=10\n" if kind == "non_selection_conf" else "")
+
+    result = _identity_run(panel, units, env, "bridge")
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert result.stderr == "bundle-manifest: unhandled installed unit drop-ins\n"
+
+
+@pytest.mark.parametrize("staged", [False, True])
+@pytest.mark.parametrize(
+    "directory", ["service.d", "brilliant-.service.d", "brilliant-wifi-.service.d"]
+)
+def test_shared_unit_dropins_are_also_unhandled(
+    tmp_path: Path, staged: bool, directory: str
+) -> None:
+    payload = _make_payload(tmp_path)
+    panel, units, env = _make_legacy_panel(tmp_path, payload)
+    unit = _installed_or_staged_unit(panel, units, "wifi_watchdog", staged)
+    shutil.copyfile(_PAYLOAD / unit.name, unit)
+    _write(units / directory / "override.conf", "[Service]\nEnvironment=PYTHONPATH=/alternate\n")
+
+    result = _identity_run(panel, units, env, "wifi_watchdog")
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert result.stderr == "bundle-manifest: unhandled installed unit drop-ins\n"
+
+
+@pytest.mark.parametrize("component", _COMPONENTS)
+@pytest.mark.parametrize("staged", [False, True])
+def test_present_fixed_unit_without_selector_still_matches(
+    tmp_path: Path, component: str, staged: bool
+) -> None:
+    payload = _make_payload(tmp_path)
+    panel, units, env = _make_legacy_panel(tmp_path, payload)
+    helper = _load_helper()
+    _enroll(helper, panel, units, env, 5)
+    unit = _installed_or_staged_unit(panel, units, component, staged)
+    shutil.copyfile(_PAYLOAD / unit.name, unit)
+    # Empty directories and files without the systemd .conf suffix have no effect.
+    (unit.parent / (unit.name + ".d")).mkdir()
+    _write(units / (unit.name + ".d") / "override.conf.disabled", "ignored")
+
+    result = _identity_run(panel, units, env, component)
+
+    assert result.returncode == 0, result.stderr
+    digest = helper.code_digest(panel, component)
+    assert result.stdout == f"{component}\t0.11.3\t5\t{digest}\tlegacy_fixed\n"
+
+
+def test_dangling_installed_unit_cannot_fall_back_to_staged_unit(tmp_path: Path) -> None:
+    payload = _make_payload(tmp_path)
+    panel, units, env = _make_legacy_panel(tmp_path, payload)
+    helper = _load_helper()
+    _enroll(helper, panel, units, env, 5)
+    staged = _installed_or_staged_unit(panel, units, "bridge", True)
+    shutil.copyfile(_PAYLOAD / staged.name, staged)
+    (units / staged.name).symlink_to(tmp_path / "absent")
+
+    result = _identity_run(panel, units, env, "bridge")
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert result.stderr == "bundle-manifest: installed identity unreadable (FileNotFoundError)\n"
+
+
+def test_bridge_only_does_not_inspect_unselected_watchdog_dropins(tmp_path: Path) -> None:
+    payload = _make_payload(tmp_path)
+    panel, units, env = _make_legacy_panel(tmp_path, payload)
+    helper = _load_helper()
+    _enroll(helper, panel, units, env, 5)
+    _write(units / "brilliant-bus-watchdog.service.d/override.conf", "[Service]\nNice=10\n")
+
+    result = _identity_run(panel, units, env, "bridge")
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("bridge\t0.11.3\t5\t")
+    with pytest.raises(helper.ManifestError, match="unhandled installed unit drop-ins"):
+        helper.installed_identities(panel, units, env)
+
+
 def test_bridge_only_ignores_missing_enrolled_unselected_watchdog(tmp_path: Path) -> None:
     payload = _make_payload(tmp_path)
     panel, units, env = _make_legacy_panel(tmp_path, payload)

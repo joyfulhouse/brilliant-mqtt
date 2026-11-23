@@ -461,6 +461,26 @@ def private_record(
         os.close(directory_fd)
 
 
+def _reject_unit_dropins(unit: Path) -> None:
+    """Do not claim effective selection without evaluating systemd overrides."""
+    names = [unit.name + ".d", "service.d"]
+    # systemd also applies type-wide and dash-prefix overrides to these services.
+    names.extend(
+        unit.stem[: index + 1] + ".service.d"
+        for index, character in enumerate(unit.stem)
+        if character == "-"
+    )
+    for name in names:
+        directory = unit.parent / name
+        if not os.path.lexists(directory):
+            continue
+        if directory.is_symlink() or not directory.is_dir():
+            raise ManifestError("unhandled installed unit drop-ins")
+        with os.scandir(directory) as entries:
+            if any(entry.name.endswith(".conf") for entry in entries):
+                raise ManifestError("unhandled installed unit drop-ins")
+
+
 def _unit_selects_release(unit: Path) -> bool:
     """Require one layout in the service's code-bearing directives."""
     directives: dict[str, list[str]] = {}
@@ -549,12 +569,17 @@ def installed_identities(
             else "brilliant-" + component.replace("_", "-")
         )
         unit = unit_root / (service + ".service")
-        if not unit.exists():
+        # Installed drop-ins still apply when the base unit needs its staged fallback.
+        _reject_unit_dropins(unit)
+        if not os.path.lexists(unit):
             staged_directory = root / ("system" if component == "bridge" else component)
             unit = staged_directory / (service + ".service")
+            _reject_unit_dropins(unit)
         selected_release = selector is not None
-        if selector is not None and unit.exists():
+        if os.path.lexists(unit):
             selected_release = _unit_selects_release(unit)
+            if selected_release and selector is None:
+                raise ManifestError("installed release selector is missing")
         active_root = selector.active_root if selector is not None and selected_release else root
         digest = code_digest(active_root, component)
         if digest is None:
