@@ -707,7 +707,7 @@ def test_writer_dying_after_unleased_read_cannot_prove_live_release(
 
     def read_then_die(
         path: str,
-    ) -> tuple[PhaseRecord | None, bool, tuple[int, int] | None]:
+    ) -> tuple[PhaseRecord | None, bool, tuple[int, int] | None, bool]:
         sample = real_read(path)
         monkeypatch.setattr(health_mod, "process_generation", lambda pid: None)
         monkeypatch.setattr(health_mod, "process_is_absent", lambda pid: True)
@@ -763,14 +763,22 @@ def test_exiting_writer_generation_is_not_live_release_evidence(
 
 
 def _report_marker_storage_read_only(monkeypatch: pytest.MonkeyPatch) -> None:
-    real_statvfs = os.statvfs
+    real_fstatvfs = os.fstatvfs
 
-    def _read_only_statvfs(path: str) -> os.statvfs_result:
-        fields = list(real_statvfs(path))
+    def _read_only_fstatvfs(fd: int) -> os.statvfs_result:
+        fields = list(real_fstatvfs(fd))
         fields[8] |= os.ST_RDONLY
         return os.statvfs_result(fields)
 
-    monkeypatch.setattr("brilliant_bus_watchdog.health.os.statvfs", _read_only_statvfs)
+    monkeypatch.setattr(os, "fstatvfs", _read_only_fstatvfs)
+
+
+def _report_marker_storage_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _failing_fstatvfs(fd: int) -> os.statvfs_result:
+        os.fstat(fd)  # The storage query must use an open descriptor.
+        raise OSError(5, "Input/output error")
+
+    monkeypatch.setattr(os, "fstatvfs", _failing_fstatvfs)
 
 
 @_requires_linux_proc
@@ -796,20 +804,152 @@ def test_unknown_marker_storage_writability_rejects_dead_writer_evidence(
     _write_phase_in_short_lived_process(phase, "bus", 100.0)
     assert bus_failure_age(str(phase), now=150.0) == 50.0
 
-    def _failing_statvfs(path: str) -> os.statvfs_result:
-        raise OSError(5, "Input/output error", path)
-
-    monkeypatch.setattr("brilliant_bus_watchdog.health.os.statvfs", _failing_statvfs)
+    _report_marker_storage_unknown(monkeypatch)
 
     assert bus_failure_age(str(phase), now=150.0) is None
 
 
-def test_live_leased_writer_on_read_only_marker_storage_still_counts(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize("storage", ["read-only", "unknown"])
+def test_live_leased_writer_on_unwritable_marker_storage_still_counts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, storage: str
 ) -> None:
     phase = tmp_path / "bus-phase"
     write_phase(str(phase), "bus", monotonic_clock=lambda: 100.0)
-    _report_marker_storage_read_only(monkeypatch)
+    if storage == "read-only":
+        _report_marker_storage_read_only(monkeypatch)
+    else:
+        _report_marker_storage_unknown(monkeypatch)
 
     assert bus_failure_age(str(phase), now=150.0) == 50.0
     assert bus_failure_age(str(phase), now=150.0, observer=health_mod.BusFailureObserver()) == 50.0
+
+
+@pytest.mark.parametrize("swap", ["path", "symlink"])
+def test_storage_sample_follows_record_descriptor_despite_swap_before_pid_check(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, swap: str
+) -> None:
+    original = tmp_path / "original"
+    replacement = tmp_path / "replacement"
+    phase = tmp_path / "bus-phase"
+    boot_id = heartbeat.current_boot_id()
+    assert boot_id is not None
+    original.write_text(f"v2 bus {2**31 - 1} 1 {boot_id} 100.0 1910.0 attempt")
+    replacement.write_text("not a phase marker")
+    if swap == "symlink":
+        phase.symlink_to(original)
+    else:
+        original.replace(phase)
+    original_stat = phase.stat()
+    real_fstatvfs = os.fstatvfs
+
+    def storage_flags(fd: int) -> os.statvfs_result:
+        stat = os.fstat(fd)
+        fields = list(real_fstatvfs(fd))
+        if (stat.st_dev, stat.st_ino) == (original_stat.st_dev, original_stat.st_ino):
+            fields[8] |= os.ST_RDONLY
+        return os.statvfs_result(fields)
+
+    def swap_before_pid_check(pid: int) -> str | None:
+        assert pid == 2**31 - 1
+        if swap == "symlink":
+            phase.unlink()
+            phase.symlink_to(replacement)
+        else:
+            replacement.replace(phase)
+        return None
+
+    monkeypatch.setattr(os, "fstatvfs", storage_flags)
+    monkeypatch.setattr(health_mod, "process_generation", swap_before_pid_check)
+    age = bus_failure_age(
+        str(phase), now=1911.0, service_started_at=500.0, observer=health_mod.BusFailureObserver()
+    )
+    assert phase.read_text() == "not a phase marker"
+    assert age is None
+    assert not should_reboot(
+        age=1900.0, bridge_active=True, gateway_up=True, bus_failure_age=age, stale_after=1800.0
+    )
+
+
+@pytest.mark.parametrize("storage", ["read-only", "unknown"])
+@pytest.mark.parametrize("intermediate", ["unchanged", "missing", "malformed", "copied", "changed"])
+def test_disqualified_dead_record_stays_rejected_after_storage_becomes_writable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, storage: str, intermediate: str
+) -> None:
+    phase = tmp_path / "bus-phase"
+    boot_id = heartbeat.current_boot_id()
+    assert boot_id is not None
+    original = f"v2 bus {2**31 - 1} 1 {boot_id} 100.0 1910.0 attempt"
+    phase.write_text(original)
+    observer = health_mod.BusFailureObserver()
+    assert bus_failure_age(str(phase), now=1911.0, observer=observer) == 1811.0
+    with monkeypatch.context() as storage_patch:
+        if storage == "read-only":
+            _report_marker_storage_read_only(storage_patch)
+        else:
+            _report_marker_storage_unknown(storage_patch)
+        assert bus_failure_age(str(phase), now=1911.0, observer=observer) is None
+
+    if intermediate == "missing":
+        phase.unlink()
+    elif intermediate == "malformed":
+        phase.write_text("broken")
+    elif intermediate == "copied":
+        replacement = tmp_path / "replacement"
+        replacement.write_text(original)
+        replacement.replace(phase)
+    elif intermediate == "changed":
+        original = original.replace("1910.0", "1912.0")
+        phase.write_text(original)
+    if intermediate in ("missing", "malformed"):
+        assert bus_failure_age(str(phase), now=1912.0, observer=observer) is None
+        phase.write_text(original)
+
+    age = bus_failure_age(str(phase), now=1913.0, observer=observer)
+    assert age is None
+    assert not should_reboot(
+        age=1900.0, bridge_active=True, gateway_up=True, bus_failure_age=age, stale_after=1800.0
+    )
+
+
+@_requires_linux_proc
+@pytest.mark.parametrize("storage", ["read-only", "unknown"])
+def test_fresh_rw_crash_evidence_survives_prior_storage_disqualification(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, storage: str
+) -> None:
+    phase = tmp_path / "bus-phase"
+    observer = health_mod.BusFailureObserver()
+    _write_phase_in_short_lived_process(phase, "bus", 100.0)
+    with monkeypatch.context() as storage_patch:
+        if storage == "read-only":
+            _report_marker_storage_read_only(storage_patch)
+        else:
+            _report_marker_storage_unknown(storage_patch)
+        assert bus_failure_age(str(phase), now=150.0, observer=observer) is None
+
+    _write_phase_in_short_lived_process(phase, "bus", 200.0)
+    assert bus_failure_age(str(phase), now=250.0, observer=observer) == 150.0
+
+
+@pytest.mark.parametrize("storage", ["read-only", "unknown"])
+def test_fresh_live_lease_rearms_storage_disqualified_generation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, storage: str
+) -> None:
+    phase = tmp_path / "bus-phase"
+    observer = health_mod.BusFailureObserver()
+    write_phase(str(phase), "bus", monotonic_clock=lambda: 100.0)
+    heartbeat._release_phase_lease(str(phase))
+    with monkeypatch.context() as dead_patch:
+        dead_patch.setattr(health_mod, "process_generation", lambda pid: None)
+        dead_patch.setattr(health_mod, "process_is_absent", lambda pid: True)
+        if storage == "read-only":
+            _report_marker_storage_read_only(dead_patch)
+        else:
+            _report_marker_storage_unknown(dead_patch)
+        assert bus_failure_age(str(phase), now=150.0, observer=observer) is None
+
+    write_phase(str(phase), "bus", monotonic_clock=lambda: 200.0)
+    assert bus_failure_age(str(phase), now=210.0, observer=observer) == 110.0
+    heartbeat._release_phase_lease(str(phase))
+    monkeypatch.setattr(health_mod, "process_generation", lambda pid: None)
+    monkeypatch.setattr(health_mod, "process_is_absent", lambda pid: True)
+    assert bus_failure_age(str(phase), now=250.0, observer=observer) == 150.0

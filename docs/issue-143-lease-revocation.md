@@ -31,7 +31,7 @@ marker retries are rate limited. Attribution remains best effort and never
 prevents the bridge from operating.
 
 The watchdog keeps one in-memory observer for its phase path. It revokes stale
-attribution only after these ordered observations:
+attribution after these ordered observations:
 
 1. A valid bus record has a contended lease and its exact boot, PID, and
    process start tick are confirmed live.
@@ -60,16 +60,27 @@ journal/admission gates remain in force.
 ## Read-only marker storage gate
 
 A writer on read-only marker storage cannot record a recovered bus, so a dead
-writer's stale attempt there is not crash-loop evidence. `bus_failure_age`
-checks `os.statvfs` for `ST_RDONLY` on the marker path. Read-only storage, or a
-`statvfs` failure (writability unknown), rejects dead-writer evidence. Unknown
-is deliberately treated as read-only, which fails safe toward no reboot.
+writer's stale attempt there is not crash-loop evidence. The reader samples
+`os.fstatvfs` for `ST_RDONLY` through the same open descriptor used for the
+record, inode identity, and lease. It retains a successful shared lock through
+this sample. A pathname replacement or symlink swap before the later PID check
+cannot substitute another mount's flags. Read-only storage, or an `fstatvfs`
+failure (writability unknown), rejects dead-writer evidence. Unknown is
+deliberately treated as read-only, which fails safe toward no reboot.
 
-The check is the last operand of the dead-writer rejection chain. In that
-position it only adds rejections, and `statvfs` runs only after the marker was
-opened and parsed. A live writer that still holds its lease is still accepted
-on read-only storage: its lease is independent evidence that the attempt is
-current.
+When an otherwise qualifying dead attempt is rejected for storage, the
+observer remembers its writer generation in the existing single revocation
+slot. A later writable remount does not rearm it. Missing or malformed samples,
+copies on replacement inodes, and changed records first seen after that
+generation's death do not erase this disqualification. A changed record leased
+by the same generation confirmed live can rearm it, and a fresh writer
+generation's genuine writable-storage crash evidence still qualifies under
+the existing gates. State remains bounded to one revoked generation and one
+leased sample per observer, and lasts only for that watchdog lifetime.
+
+The storage gate only adds rejections to dead-writer evidence. A live writer
+that still holds its lease is still accepted on read-only or unknown storage:
+its lease is independent evidence that the attempt is current.
 
 ## Revocation through the lease descriptor
 
@@ -158,10 +169,12 @@ observer and a newly started one reject it after exit. With a refused
 truncate, the recovered variant keeps identical old marker bytes: the existing
 observer keeps it revoked after process exit, while a new observer
 demonstrates the remaining restart ambiguity. The failed-attempt variant keeps
-its evidence in both. Other watchdog tests cover the read-only and unknown
-storage gate, a live leased writer on read-only storage, replacement-inode and
-first-unleased samples, fresh leased rearming, and the unsampled native-crash
-ambiguity.
+its evidence in both. Other watchdog tests cover the descriptor-based read-only
+and unknown storage gate, pathname and symlink swaps before PID checks,
+read-only/unknown-to-writable remounts with intervening gaps and record copies,
+live leased writers on read-only or unknown storage, replacement-inode and
+first-unleased samples, fresh leased rearming, fresh writable-storage crashes,
+and the unsampled native-crash ambiguity.
 
 `tests/test_heartbeat.py` covers unrecordable recovery and `pre_bus`
 transitions (not dead-writer evidence), retained failed-attempt evidence, a

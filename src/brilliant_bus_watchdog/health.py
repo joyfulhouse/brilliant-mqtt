@@ -18,7 +18,7 @@ from .phase_record import (
 
 @dataclass
 class BusFailureObserver:
-    """One watchdog's evidence of a live writer releasing its marker lease."""
+    """One watchdog's bounded evidence of revoked writer attribution."""
 
     _revoked: PhaseRecord | None = None
     _leased: tuple[PhaseRecord, tuple[int, int]] | None = None
@@ -26,7 +26,7 @@ class BusFailureObserver:
 
 def _read_phase_record_and_lease(
     path: str,
-) -> tuple[PhaseRecord | None, bool, tuple[int, int] | None]:
+) -> tuple[PhaseRecord | None, bool, tuple[int, int] | None, bool]:
     try:
         with open(path, encoding="utf-8") as stream:
             try:
@@ -38,20 +38,22 @@ def _read_phase_record_and_lease(
             # Keep a successful shared lock through the read: an unleased
             # observation must describe the inode whose record we parsed.
             stat = os.fstat(stream.fileno())
-            return PhaseRecord.parse(stream.read()), leased, (stat.st_dev, stat.st_ino)
+            record = PhaseRecord.parse(stream.read())
+            writable = _marker_storage_writable(stream.fileno())
+            return record, leased, (stat.st_dev, stat.st_ino), writable
     except (OSError, UnicodeError):
-        return None, False, None
+        return None, False, None, False
 
 
-def _marker_storage_writable(path: str) -> bool:
-    """Whether the filesystem holding *path* currently accepts writes.
+def _marker_storage_writable(fd: int) -> bool:
+    """Whether the filesystem holding the open marker accepts writes.
 
     A writer on read-only marker storage cannot record a recovered bus, so its
     stale attempt is not dead-writer evidence. False also covers "unknown"
-    (``statvfs`` failed): that is a deliberate fail-safe toward no reboot.
+    (``fstatvfs`` failed): that is a deliberate fail-safe toward no reboot.
     """
     try:
-        flags = os.statvfs(path).f_flag
+        flags = os.fstatvfs(fd).f_flag
     except OSError:
         return False
     return not flags & os.ST_RDONLY
@@ -66,7 +68,7 @@ def bus_failure_age(
 ) -> float | None:
     """Age of attributable local-bus failure, including bounded crash evidence."""
     sampled_at = time.monotonic() if now is None else now
-    record, leased, inode = _read_phase_record_and_lease(path)
+    record, leased, inode, writable = _read_phase_record_and_lease(path)
     if (
         record is None
         or record.phase != "bus"
@@ -107,10 +109,13 @@ def bus_failure_age(
         leased
         or record.bus_read_succeeded
         or sampled_at > record.bus_updated_at + DEAD_WRITER_RETENTION_S
-        # Last on purpose: it only adds rejections, and statvfs runs only
-        # after the marker was opened and parsed.
-        or not _marker_storage_writable(path)
     ):
+        return None
+    elif not writable:
+        if observer is not None:
+            # A remount cannot make this writer's stale attempt fresh evidence.
+            # Reuse the bounded generation revocation and live-lease rearming.
+            observer._revoked = record
         return None
     return sampled_at - record.failure_started_at
 
