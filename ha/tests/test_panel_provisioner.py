@@ -933,8 +933,10 @@ class _Harness:
         self,
         shell: PanelShell,
         identity: HostIdentity,
+        *,
+        allow_aarch64: bool = False,
     ) -> PanelFacts:
-        del shell
+        del shell, allow_aarch64
         assert identity.fingerprint == _FINGERPRINT
         self.events.append(("inspect",))
         if self.inspection_error is not None:

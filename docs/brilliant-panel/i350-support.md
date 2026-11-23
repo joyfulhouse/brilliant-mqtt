@@ -1,11 +1,12 @@
 # Brilliant i350 / aarch64 panels
 
-**Status: not supported.** brilliant-mqtt is qualified only on the original
-armv7l (NXP i.MX6) Brilliant Control. The Home Assistant integration refuses
-any other architecture with `unsupported_architecture` ("This panel
-architecture is not supported."). The gate is deliberate. Removing it would
-not show that the bridge works on an i350. It would only stop the integration
-from checking. Tracking issue:
+**Status: experimental, explicit per-panel opt-in.** brilliant-mqtt is
+qualified only on the original armv7l (NXP i.MX6) Brilliant Control. Add panel
+offers a default-off consent step for aarch64 panels; without that consent it
+still refuses them with `unsupported_architecture`. Other architectures remain
+refused. Consent is saved for that physical panel and reused for same-identity
+address and credential repair; replacing the panel clears the old consent.
+Experimental admission does not establish full i350 qualification. Tracking issue:
 [#155](https://github.com/joyfulhouse/brilliant-mqtt/issues/155).
 
 The newer i350 panels report `aarch64` from `uname -m` and run a MediaTek
@@ -77,8 +78,9 @@ remains required.
 
 ## Qualification gates
 
-aarch64 is added to the supported set only after all five gates pass, in
-order, on a designated i350 pilot panel:
+Official aarch64 qualification requires all five gates on a designated i350
+pilot. The experimental opt-in allows evidence collection before every gate
+is complete; it does not waive the remaining gates:
 
 1. **Diagnostic passes.** The diagnostic reports `bus_library_import=ok`, an
    AArch64 bus library, a present bus socket, an enabled and active
@@ -100,5 +102,5 @@ order, on a designated i350 pilot panel:
    [INSTALL.md → Uninstall / rollback](../../INSTALL.md#uninstall--rollback),
    [deployment → Rollback](../reference/deployment.md#rollback) and
    [canary rollback](../canary-rollback.md).
-5. **Only then add `aarch64`** to `_SUPPORTED_ARCHITECTURES`, with tests and a
+5. **Only then qualify `aarch64`** in `_QUALIFIED_ARCHITECTURES`, with tests and a
    CHANGELOG entry that names the qualified hardware and firmware.

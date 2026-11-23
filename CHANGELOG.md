@@ -9,14 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Experimental, per-panel opt-in for aarch64 / i350 panels during Add panel.
+  Official support remains armv7l only; the architecture gate is unchanged
+  unless that panel's opt-in is checked (default off). Voice is refused on
+  aarch64. The i.MX6 Wi-Fi last-resort reset requires a positively bound
+  `mmc1` controller (same guard as #230).
+
 - A read-only panel diagnostic,
   `scripts/brilliant-panel/panel_diagnostics.sh`, reports the architecture,
   firmware, Python, message-bus library (import and ELF machine), storage,
   Wi-Fi hardware and Hue CA path facts that are needed before another panel
   architecture can be qualified. It writes nothing, never connects to the bus
-  and reads no secrets. Brilliant i350 (aarch64) panels are still **not
-  supported**: the integration keeps refusing them with
-  `unsupported_architecture`. See `docs/brilliant-panel/i350-support.md` for the
+  and reads no secrets. Brilliant i350 (aarch64) panels remain experimental and require
+  explicit per-panel opt-in. See `docs/brilliant-panel/i350-support.md` for the
   qualification gates (#155).
 
 ### Fixed

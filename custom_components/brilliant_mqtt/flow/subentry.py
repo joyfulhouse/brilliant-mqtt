@@ -260,6 +260,7 @@ class PanelSubentryFlow(ConfigSubentryFlow, _PanelOnboardingMixin):
                 host,
                 root_password,
                 identity,
+                allow_aarch64=current.allow_aarch64,
             )
         except asyncio.CancelledError:
             raise
