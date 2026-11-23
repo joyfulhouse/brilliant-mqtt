@@ -40,6 +40,7 @@ from brilliant_mqtt.protocols import (
 )
 from brilliant_mqtt.write_admission import (
     AdmissionTicket,
+    SettleOutcome,
     Superseded,
     TicketAdoptionError,
     WriteCancelled,
@@ -672,9 +673,13 @@ class RpcBusAdapter:
         if previous is None or boundary.sequence > previous.sequence:
             self._privacy_revocation = boundary
 
-    def _next_capture_provenance(self) -> CaptureProvenance:
+    def _next_capture_provenance(self, captured_at: float | None = None) -> CaptureProvenance:
         self._capture_sequence += 1
-        return CaptureProvenance(self._capture_generation, self._capture_sequence)
+        return CaptureProvenance(
+            self._capture_generation,
+            self._capture_sequence,
+            captured_at=self._clock() if captured_at is None else captured_at,
+        )
 
     def _field_capture(
         self,
@@ -1367,6 +1372,19 @@ class RpcBusAdapter:
         if self._write_serving.get(admission.device_id) is admission:
             del self._write_serving[admission.device_id]
         self._serve_next(admission.device_id)
+        # Success was reported synchronously at native return. This idempotent
+        # fallback also settles failures and never-issued/cancelled work.
+        outcome: SettleOutcome
+        if task.cancelled():
+            outcome = WriteCancelled()
+        elif (task_error := task.exception()) is not None:
+            outcome = task_error
+        else:
+            outcome = task.result()
+        try:
+            admission.ticket.mark_settled(outcome)
+        except Exception as error:
+            logger.warning("WRITE_SETTLE_CALLBACK_FAILED %s", type(error).__name__)
 
     async def _run_write(self, obs: Any, admission: _WriteAdmission) -> str:
         """Keep native task ownership independent of waiter/ticket membership."""
@@ -1395,7 +1413,7 @@ class RpcBusAdapter:
                     for name in admission.values:
                         key = (admission.device_id, admission.peripheral_id, name)
                         self._field_eras[key] = self._field_eras.get(key, 0) + 1
-                    boundary = self._next_capture_provenance()
+                    boundary = self._next_capture_provenance(record.started_at)
                     admission.ticket.mark_issued(
                         replace(
                             self._field_capture(
@@ -1418,6 +1436,15 @@ class RpcBusAdapter:
                     admission.values,
                     device_id=admission.device_id,
                 )
+                native_returned_at = self._clock()
+                accepted_at = self._next_capture_provenance(native_returned_at)
+                receipt = _normalize_receipt(response)
+                # Publish acceptance synchronously before a queued notification
+                # can drain; its capture fence belongs to the native return.
+                try:
+                    admission.ticket.mark_settled(receipt, accepted_at=accepted_at)
+                except Exception as error:
+                    logger.warning("WRITE_SETTLE_CALLBACK_FAILED %s", type(error).__name__)
             except asyncio.CancelledError:
                 logger.info("set_variables(%s) cancelled at session teardown", record.label)
                 raise
@@ -1433,12 +1460,11 @@ class RpcBusAdapter:
                 raise
             finally:
                 cap.cancel()
-        receipt = _normalize_receipt(response)
         if record.detached:
             logger.warning(
                 "detached set_variables(%s) completed after %.1fs (queue wait %.3fs); receipt: %s",
                 record.label,
-                self._rpc_elapsed(record),
+                native_returned_at - record.started_at,
                 self._queue_wait(record),
                 receipt,
             )
@@ -1447,7 +1473,7 @@ class RpcBusAdapter:
                 "set_variables(%s) receipt: %s (rpc %.3fs, queue wait %.3fs)",
                 record.label,
                 receipt,
-                self._rpc_elapsed(record),
+                native_returned_at - record.started_at,
                 self._queue_wait(record),
             )
         return receipt
