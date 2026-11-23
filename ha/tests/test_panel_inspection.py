@@ -438,6 +438,31 @@ async def test_unsupported_or_undersized_panel_has_stable_code(
     assert str(raised.value) == code
 
 
+async def test_i350_aarch64_panel_is_still_refused() -> None:
+    """Issue #155: an i350 (aarch64, Python 3.10.13) panel stays gated until qualified."""
+    shell = await _connected_shell(
+        RunResult(0, _output(architecture="aarch64", python_version="Python 3.10.13"), "")
+    )
+
+    with pytest.raises(PanelCompatibilityError) as raised:
+        await async_inspect_panel(shell, _IDENTITY)
+
+    assert raised.value.code == "unsupported_architecture"
+
+
+@pytest.mark.parametrize(
+    "architecture",
+    ("aarch64", "x86_64", "armv8l", "arm64", "AARCH64", "aarch64 ", ""),
+)
+async def test_only_armv7l_architecture_is_accepted(architecture: str) -> None:
+    shell = await _connected_shell(RunResult(0, _output(architecture=architecture), ""))
+
+    with pytest.raises(PanelCompatibilityError) as raised:
+        await async_inspect_panel(shell, _IDENTITY)
+
+    assert raised.value.code == "unsupported_architecture"
+
+
 @pytest.mark.parametrize(
     "stdout",
     (
@@ -568,3 +593,24 @@ async def test_inspection_rejects_shell_for_a_different_identity_before_command(
 
     assert raised.value.code == "host_key_changed"
     assert shell.commands == []
+
+
+async def test_aarch64_is_accepted_only_with_explicit_opt_in() -> None:
+    shell = await _connected_shell(RunResult(0, _output(architecture="aarch64"), ""))
+
+    with pytest.raises(PanelCompatibilityError) as raised:
+        await async_inspect_panel(shell, _IDENTITY)
+    assert raised.value.code == "unsupported_architecture"
+    assert raised.value.architecture == "aarch64"
+
+    facts = await async_inspect_panel(shell, _IDENTITY, allow_aarch64=True)
+    assert facts.architecture == "aarch64"
+
+
+async def test_opt_in_does_not_admit_other_unqualified_architectures() -> None:
+    shell = await _connected_shell(RunResult(0, _output(architecture="x86_64"), ""))
+
+    with pytest.raises(PanelCompatibilityError) as raised:
+        await async_inspect_panel(shell, _IDENTITY, allow_aarch64=True)
+    assert raised.value.code == "unsupported_architecture"
+    assert raised.value.architecture == "x86_64"

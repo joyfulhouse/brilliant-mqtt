@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Experimental, per-panel opt-in for aarch64 / i350 panels during Add panel.
+  Official support remains armv7l only; the architecture gate is unchanged
+  unless that panel's opt-in is checked (default off). Voice is refused on
+  aarch64. The i.MX6 Wi-Fi last-resort reset requires a positively bound
+  `mmc1` controller (same guard as #230).
+
+- A read-only panel diagnostic,
+  `scripts/brilliant-panel/panel_diagnostics.sh`, reports the architecture,
+  firmware, Python, message-bus library (import and ELF machine), storage,
+  Wi-Fi hardware and Hue CA path facts that are needed before another panel
+  architecture can be qualified. It writes nothing, never connects to the bus
+  and reads no secrets. Brilliant i350 (aarch64) panels remain experimental and require
+  explicit per-panel opt-in. See `docs/brilliant-panel/i350-support.md` for the
+  qualification gates (#155).
+
 ### Fixed
 
 - A bridge that recovers its local bus but cannot record that success in the
@@ -27,6 +44,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   counts. This matters only for non-default setups: the marker defaults to
   tmpfs under `/run`, which no shipped unit makes read-only.
   ([#143](https://github.com/joyfulhouse/brilliant-mqtt/issues/143))
+- The Wi-Fi watchdog's last-resort GPIO/usdhc Wi-Fi reset is i.MX6-specific.
+  It now requires the `mmc1` alias target to be bound to `sdhci-esdhc-imx`;
+  driver registration alone is insufficient. Without binding evidence the
+  reset is skipped and logged as a warning, and the guarded reboot still runs
+  (#155). Production binding evidence on the armv7 pilot remains a release
+  prerequisite.
+- Voice upload, configuration, enable and restart on a panel that is not armv7l
+  now fail with a clear "armv7l-only" error before changing the panel, including
+  repair of an existing payload and wake-word updates. Inspection and removal
+  remain available (#155).
+### Fixed
+
+- Installed panels now receive `service_crash_looping` when the bounded service
+  snapshot detects an auto-restarting bridge or watchdog, before candidate
+  mutation. Issue #226's screenshot establishes `snapshot_probe_failed`; a crash
+  loop remains an inferred cause pending reporter/pilot validation. Refs #226.
+- A failed post-capture re-snapshot retires only its own unused rollback baseline
+  before propagating the typed error. Failed cleanup reports
+  `baseline_capture_interrupted`; recovery artifacts must be preserved.
+- Core-service stop handles activating and deactivating units before checking
+  for a settled state. Baseline finalization preserves foreign or symlinked pins.
+- Service sampling adds about 27 seconds to an installed-panel add/update and
+  about 14 seconds to rollback verification. Recovery and supported HA uninstall
+  guidance is in `docs/TROUBLESHOOTING.md` and `docs/canary-rollback.md`.
+
 - Removing an unactivated onboarding baseline now checks candidate release
   paths with `os.path.lexists`, which older panel Pythons provide. A failed
   proof logs the stage (snapshot section, verify, check_restored kind,

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import os
@@ -819,7 +820,24 @@ def baseline_action(root: Path, identifier: str, digest: str, action: str) -> No
     release = Path(manifest["release_target"]) if manifest["release_target"] else None
     if action == "finalize":
         if release is not None:
-            (release / ".rollback-retained").unlink(missing_ok=True)
+            # Only this baseline's own regular-file pin; never another capture's.
+            pin = release / ".rollback-retained"
+            try:
+                descriptor = os.open(pin, _FILE_FLAGS | os.O_NONBLOCK)
+            except OSError as error:
+                if error.errno not in (errno.ENOENT, errno.ELOOP):
+                    raise
+            else:
+                try:
+                    metadata = os.fstat(descriptor)
+                    if (
+                        stat.S_ISREG(metadata.st_mode)
+                        and os.read(descriptor, 33) == identifier.encode("ascii")
+                        and os.path.samestat(pin.lstat(), metadata)
+                    ):
+                        pin.unlink()
+                finally:
+                    os.close(descriptor)
             _sync_directory(release)
         # Publish deletion intent on-panel too, so a lost complete.json during
         # recursive removal cannot make a durable FINALIZING record unreplayable.
