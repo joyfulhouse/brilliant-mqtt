@@ -68,6 +68,45 @@ available on other architectures.
 
 ---
 
+### Add or update fails with `service_crash_looping`
+
+The pre-change snapshot samples the bridge and both watchdogs with batched
+`systemctl show` calls for about 13.5 seconds, at 0.5-second intervals. An
+`auto-restart` sample or a restart counter increase of at least two refuses the
+snapshot with `service_crash_looping` before file reads or candidate mutation,
+even when agent files are absent: a loaded service can outlive its files.
+A final `reloading` state counts as running; unsettled final states,
+malformed readings, timeouts, or spans from the previous round's start through
+the current round's end over four seconds fail closed with
+`snapshot_probe_failed`. The sampler has a 40-second deadline and 32-round cap.
+Two consecutive all-stopped rounds may end sampling early. Two snapshots add
+about 27 seconds to a typical installed-panel add/update, and rollback
+verification uses the same sampler.
+
+The screenshot in issue #226 proves `snapshot_probe_failed`. A crash loop is an
+inferred explanation for that report, not a confirmed hardware RCA. This change
+has off-device regression coverage; reporter/pilot validation remains needed.
+Refs #226.
+
+Preserve the incumbent installation. Inspect service status and recent bridge
+or watchdog logs using read-only diagnostics, redacting credentials before
+sharing them. Restore the old bridge's health (for example broker reachability)
+and retry. An explicit release override is consumed before this check, so a
+retry may need a fresh approval; an automatic admission can also be recorded.
+
+If a crash loop starts during baseline capture, the re-snapshot refuses it and
+removes that capture's unused baseline. If removal fails, the error becomes
+`baseline_capture_interrupted`. Cancellation still propagates, with a sanitized
+warning carrying that code if cleanup also fails; follow
+[Interrupted baseline capture](canary-rollback.md#interrupted-baseline-capture).
+
+For an existing HA panel owner, uninstall/re-add is an alternative only after
+recovery is settled and retained baselines are explicitly finalized after
+sign-off. Turn off both watchdog switches, then use the supported
+`brilliant_mqtt.uninstall` action. That path restores virtual slider state before
+removing agent files. If there is no HA panel owner, collect redacted diagnostics
+and seek maintainer assistance; preserve files, pins and recovery artifacts.
+
 ## Connectivity
 
 ### Entities show as unavailable / panel `offline`

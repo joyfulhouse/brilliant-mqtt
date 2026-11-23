@@ -434,3 +434,78 @@ def test_directory_replaced_by_symlink_during_hashing_is_rejected(
         build_manifest("integration", root)
 
     assert raced
+
+
+def _finalize_fixture(tmp_path: Path, pin: str | None, *, symlink: bool = False) -> Path:
+    identifier = "c" * 32
+    release = tmp_path / "releases" / _RELEASE_NAME
+    release.mkdir(parents=True)
+    if pin is not None:
+        if symlink:
+            target = tmp_path / "elsewhere"
+            target.write_text(pin)
+            (release / ".rollback-retained").symlink_to(target)
+        else:
+            (release / ".rollback-retained").write_text(pin)
+    directory = tmp_path / ".rollback" / identifier
+    directory.mkdir(parents=True)
+    encoded = (
+        '{"limits":{"capture_seconds":120,"maximum_bytes":1,"maximum_entries":1},'
+        f'"release_target":"{release}"}}'
+    ).encode()
+    (directory / "complete.json").write_bytes(encoded)
+    baseline_action = cast("Callable[[Path, str, str, str], None]", _load_helper().baseline_action)
+    baseline_action(tmp_path, identifier, hashlib.sha256(encoded).hexdigest(), "finalize")
+    assert not directory.exists()
+    assert not (tmp_path / ".rollback" / f".{identifier}.finalizing").exists()
+    return release / ".rollback-retained"
+
+
+def test_finalize_removes_the_pin_naming_this_baseline(tmp_path: Path) -> None:
+    assert not os.path.lexists(_finalize_fixture(tmp_path, "c" * 32))
+
+
+def test_finalize_keeps_a_pin_naming_another_baseline(tmp_path: Path) -> None:
+    pin = _finalize_fixture(tmp_path, "d" * 32)
+    assert pin.read_text() == "d" * 32
+
+
+def test_finalize_keeps_a_symlinked_pin(tmp_path: Path) -> None:
+    pin = _finalize_fixture(tmp_path, "c" * 32, symlink=True)
+    assert pin.is_symlink()
+
+
+def test_finalize_without_a_pin_still_retires_the_baseline(tmp_path: Path) -> None:
+    assert not os.path.lexists(_finalize_fixture(tmp_path, None))
+
+
+def test_finalize_reads_at_most_33_bytes_and_preserves_oversized_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    read = os.read
+    open_descriptor = os.open
+    sizes: list[int] = []
+    pin_flags: list[int] = []
+
+    def nofollow_open(
+        path: str | Path, flags: int, mode: int = 0o777, *, dir_fd: int | None = None
+    ) -> int:
+        if Path(path).name == ".rollback-retained":
+            pin_flags.append(flags)
+            assert flags & os.O_NOFOLLOW
+            assert flags & os.O_NONBLOCK
+        return open_descriptor(path, flags, mode, dir_fd=dir_fd)
+
+    def bounded_read(descriptor: int, size: int) -> bytes:
+        sizes.append(size)
+        assert size == 33
+        return read(descriptor, size)
+
+    monkeypatch.setattr(os, "read", bounded_read)
+    monkeypatch.setattr(os, "open", nofollow_open)
+    marker = "c" * 32 + "x" * 4096
+    pin = _finalize_fixture(tmp_path, marker)
+
+    assert pin.read_text() == marker
+    assert sizes == [33]
+    assert len(pin_flags) == 1

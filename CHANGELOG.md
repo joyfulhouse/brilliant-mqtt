@@ -38,6 +38,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   remain available (#155).
 ### Fixed
 
+- Installed panels now receive `service_crash_looping` when the bounded service
+  snapshot detects an auto-restarting bridge or watchdog, before candidate
+  mutation. Issue #226's screenshot establishes `snapshot_probe_failed`; a crash
+  loop remains an inferred cause pending reporter/pilot validation. Refs #226.
+- A failed post-capture re-snapshot retires only its own unused rollback baseline
+  before propagating the typed error. Failed cleanup reports
+  `baseline_capture_interrupted`; recovery artifacts must be preserved.
+- Core-service stop handles activating and deactivating units before checking
+  for a settled state. Baseline finalization preserves foreign or symlinked pins.
+- Service sampling adds about 27 seconds to an installed-panel add/update and
+  about 14 seconds to rollback verification. Recovery and supported HA uninstall
+  guidance is in `docs/TROUBLESHOOTING.md` and `docs/canary-rollback.md`.
+
 - Removing an unactivated onboarding baseline now checks candidate release
   paths with `os.path.lexists`, which older panel Pythons provide. A failed
   proof logs the stage (snapshot section, verify, check_restored kind,

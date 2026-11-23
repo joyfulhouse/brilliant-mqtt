@@ -38,7 +38,7 @@ from custom_components.brilliant_mqtt.const import (
 from custom_components.brilliant_mqtt.entry_data import LegacyPanelStore
 from custom_components.brilliant_mqtt.fleet_manager import legacy_fleet_config
 from custom_components.brilliant_mqtt.manager import PanelManager
-from tests.fakes import FakeShell
+from tests.fakes import TEST_SNAPSHOT_SAMPLING, FakeShell
 from tests.test_init import ENTRY_DATA
 
 
@@ -55,6 +55,18 @@ def canary_rehearsal_umask(request: pytest.FixtureRequest) -> Iterator[None]:
         yield
     finally:
         os.umask(previous)
+
+
+@pytest.fixture(autouse=True)
+def fast_snapshot_sampling(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every test samples two immediate rounds instead of the ~13.5 s window."""
+    from custom_components.brilliant_mqtt import panel_ops
+
+    monkeypatch.setattr(
+        panel_ops,
+        "SNAPSHOT_LAYOUT_COMMAND",
+        panel_ops._layout_probe_command(TEST_SNAPSHOT_SAMPLING),
+    )
 
 
 @pytest.fixture(autouse=True)
