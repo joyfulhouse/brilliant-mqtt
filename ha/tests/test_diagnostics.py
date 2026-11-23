@@ -65,6 +65,18 @@ from tests import cert_fixtures
 from tests.fakes import FakeShell
 from tests.test_init import ENTRY_DATA
 
+_NO_UPDATE_STATE: dict[str, object] = {
+    "in_progress": False,
+    "progress": None,
+    "retry": None,
+    "last_error": None,
+    "interrupted": None,
+}
+
+
+def _no_update_state(_self: object) -> dict[str, object]:
+    return dict(_NO_UPDATE_STATE)
+
 
 @pytest.mark.allow_lingering_timers
 async def test_fleet_diagnostics_are_keyed_by_runtime_id_and_never_export_secrets(
@@ -207,6 +219,7 @@ async def test_fleet_diagnostics_are_keyed_by_runtime_id_and_never_export_secret
             },
             "problem": False,
             "problem_reason": None,
+            "update": _NO_UPDATE_STATE,
         },
         "panel-kitchen": {
             "availability": None,
@@ -224,6 +237,7 @@ async def test_fleet_diagnostics_are_keyed_by_runtime_id_and_never_export_secret
             "meta": None,
             "problem": True,
             "problem_reason": "runtime_setup_failed",
+            "update": _NO_UPDATE_STATE,
         },
     }
     # The fleet Hue CA default is public trust material, but like the broker CA it
@@ -308,7 +322,13 @@ async def test_fleet_diagnostics_resolve_scene_owner_id_to_panel_slug(
     runtime_panel = type(
         "PanelManager",
         (),
-        {"availability": None, "meta": None, "problem": False, "problem_reason": None},
+        {
+            "availability": None,
+            "meta": None,
+            "problem": False,
+            "problem_reason": None,
+            "update_diagnostics": _no_update_state,
+        },
     )()
     entry.runtime_data = type(
         "FleetManager",
@@ -466,7 +486,13 @@ async def test_diagnostics_missing_control_runtime_values_are_none(
     panel = type(
         "PanelManager",
         (),
-        {"availability": None, "meta": None, "problem": False, "problem_reason": None},
+        {
+            "availability": None,
+            "meta": None,
+            "problem": False,
+            "problem_reason": None,
+            "update_diagnostics": _no_update_state,
+        },
     )()
     entry.runtime_data = type(
         "FleetManager",
@@ -490,6 +516,7 @@ async def test_diagnostics_missing_control_runtime_values_are_none(
             "meta": None,
             "problem": False,
             "problem_reason": None,
+            "update": _NO_UPDATE_STATE,
         }
     }
     control = diag["ha_control"]
@@ -528,6 +555,7 @@ async def test_diagnostics_never_export_raw_panel_problem_text(
             "meta": None,
             "problem": True,
             "problem_reason": f"{reason_prefix}: {canary}",
+            "update_diagnostics": _no_update_state,
         },
     )()
     entry.runtime_data = type(
@@ -552,7 +580,13 @@ async def test_provisioning_journal_failure_does_not_block_diagnostics(
     panel = type(
         "PanelManager",
         (),
-        {"availability": None, "meta": None, "problem": False, "problem_reason": None},
+        {
+            "availability": None,
+            "meta": None,
+            "problem": False,
+            "problem_reason": None,
+            "update_diagnostics": _no_update_state,
+        },
     )()
     entry.runtime_data = type(
         "FleetManager",
@@ -580,7 +614,13 @@ async def test_unexpected_provisioning_diagnostics_failure_degrades_safely(
     panel = type(
         "PanelManager",
         (),
-        {"availability": None, "meta": None, "problem": False, "problem_reason": None},
+        {
+            "availability": None,
+            "meta": None,
+            "problem": False,
+            "problem_reason": None,
+            "update_diagnostics": _no_update_state,
+        },
     )()
     entry.runtime_data = type(
         "FleetManager",
@@ -610,12 +650,24 @@ async def test_diagnostics_use_one_panel_snapshot_across_journal_await(
     initial = type(
         "PanelManager",
         (),
-        {"availability": None, "meta": None, "problem": False, "problem_reason": None},
+        {
+            "availability": None,
+            "meta": None,
+            "problem": False,
+            "problem_reason": None,
+            "update_diagnostics": _no_update_state,
+        },
     )()
     newcomer = type(
         "PanelManager",
         (),
-        {"availability": "online", "meta": None, "problem": False, "problem_reason": None},
+        {
+            "availability": "online",
+            "meta": None,
+            "problem": False,
+            "problem_reason": None,
+            "update_diagnostics": _no_update_state,
+        },
     )()
     runtime = type(
         "FleetManager",

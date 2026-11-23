@@ -136,7 +136,8 @@ same panel is refused until this one finishes. Other operations on the same pane
 (uninstall, reboot, component changes, refreshing staged copies) are not blocked
 during the backoff. If Home Assistant unloads or reloads the integration while an
 update is waiting, the update stops without connecting and does not raise a
-Repair issue.
+panel-fault Repair issue. After restart, a separate interrupted-update Repair
+offers Retry or Dismiss, as described below.
 
 Authentication failures, host-key changes, key-exchange or protocol errors, and
 release-admission refusals are not retried. Panels use password-only root SSH,
@@ -147,10 +148,40 @@ MQTT shows the panel online but SSH from Home Assistant is unreachable, suspect 
 stale neighbor (ARP) entry on the Home Assistant host's route to the panel.
 Traffic from the panel toward Home Assistant usually clears it.
 
-Only the connect is retried. A connection lost after admission, baseline
-capture, transfer or activation has started is not retried automatically; the
-existing journal and rollback recovery applies (see
-[canary-rollback.md](canary-rollback.md)).
+An abnormal session loss during release admission may reconnect and repeat
+admission within the same 5-attempt / 120-second budget. This requires no release
+override and no active provisioning journal. The candidate version, ordinal,
+digest and digest of the selected component identities must still match exactly.
+A resumed connection never re-pins the host key. A single-use override may
+already be consumed, so an interrupted override requires fresh approval.
+
+Baseline capture and activation are never repeated. A loss during capture leaves
+any baseline in place and reports `baseline_capture_interrupted` unless a journal
+or retained record already owns recovery. Preserve the artifacts and obtain
+maintainer guidance; do not delete private records or baseline files to retry.
+After the update transaction exists, a lost session triggers verified rollback
+over a fresh pinned connection. See [canary-rollback.md](canary-rollback.md).
+
+Diagnostics and the Update entity's `update` attribute show `retry` (stage,
+attempt, max_attempts, reason, retry_in_seconds, next_attempt_at), `last_error`
+(stage, code, attempts), and any `interrupted` update. Progress also follows an
+update started by `redeploy` or a Repair. Values are allowlisted and omit raw
+exceptions and addresses.
+
+### Update interrupted by a Home Assistant restart
+
+During connect and admission, a private update intent records the exact target
+release, stage, attempt budget and deadline. After restart it becomes a fixable
+**Agent update was interrupted** Repair. Setup never connects for this intent,
+and it never automatically resumes the update. Retry starts a fresh budget and
+refuses a changed candidate, an existing recovery journal/baseline for the panel,
+or a concurrent repair/update. Dismiss forgets the intent. Recovery journals and
+retained baselines always take precedence. The intent is cleared before capture.
+
+The `expired` flag reflects the old deadline; on the entity it refreshes when its
+state is written. Home Assistant's storage helper logs disk-write failures
+without returning them to this intent store. Live pilot validation remains
+pending (Refs #219).
 
 ### Commands from HA don't drive the load
 

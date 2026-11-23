@@ -108,6 +108,35 @@ while obtaining redacted diagnostics and the HA repair/log code.
 | `rollback_deadline_exceeded` | Treat recovery as unverified. The pending journal remains; remote restore processes are terminated and settled before reuse. Resolve connectivity/storage delays before retrying. |
 | `rollback_failed` / `rollback_failed` state | Preserve artifacts and the actionable repair code for the maintainer. A missing or changed pinned release is not silently replaced with bundled code. |
 
+## Update session loss
+
+A managed UPDATE whose transport is lost first revalidates its exact active
+journal and current owner authorization, then durably requests rollback. The
+journal intentionally changes operation to ROLLBACK. Every fresh SSH attempt,
+including after backoff, reloads that exact record and invokes the central
+authorizer for its current operation. Successful connects recheck authorization
+before restoration. A missing authorizer, changed owner, password, pin or active
+transaction fails closed, preserving the journal and retained baseline.
+
+Reconnects use the journal's pinned key, at most five attempts within 120 seconds,
+and retry only classified network failures before SSH authentication. The
+300-second rollback deadline includes reconnect time. `connection_lost` identifies
+the triggering failure; `recovery_interrupted` means HA was stopping, and
+`recovery_connection_failed`, `panel_identity_mismatch`, or
+`panel_authentication_failed` identify reconnect failures. Activation and capture
+are never repeated. SSH keepalives detect silent transport loss in about 45
+seconds. No remote-command fencing is promised: a command already sent on the
+lost connection could finish late. Live pilot validation remains pending
+(Refs #219).
+
+## Interrupted baseline capture
+
+A session can fail after a capture finishes remotely and before HA receives its
+result. No update transaction then owns that baseline. The update reports
+`baseline_capture_interrupted` and does not capture again, activate, or remove
+the baseline. Preserve it and obtain maintainer guidance using redacted
+diagnostics. A successful capture is not evidence that a candidate was activated.
+
 ## Finalize only after sign-off
 
 Finalization intentionally and permanently removes this recovery guarantee.
