@@ -1623,12 +1623,41 @@ async def test_deploy_voice_payload_uploads_tarball_then_swaps() -> None:
 
 
 async def test_deploy_voice_payload_refuses_non_armv7l_before_touching_panel() -> None:
+    """Issue #155: the voice satellite payload ships armv7l native code only."""
     shell = await _connected(FakeShell(responses={_VOICE_ARCH_CHECK: RunResult(1, "", "")}))
     with pytest.raises(panel_ops.PanelOpError, match="armv7l-only"):
         await panel_ops.deploy_voice_payload(shell, "/local/voice.tar.gz", version="0.1.0")
     assert shell.commands == [_VOICE_ARCH_CHECK]
     assert shell.file_uploads == []
     assert shell.uploads == []
+
+
+@pytest.mark.parametrize("operation", ["config", "enable", "restart"])
+@pytest.mark.parametrize("exit_status", [1, 127])
+async def test_voice_mutation_refuses_unsupported_architecture(
+    operation: str, exit_status: int
+) -> None:
+    shell = await _connected(
+        FakeShell(responses={_VOICE_ARCH_CHECK: RunResult(exit_status, "", "")})
+    )
+    with pytest.raises(panel_ops.PanelOpError, match="armv7l-only"):
+        if operation == "config":
+            await panel_ops.ensure_voice_config(shell, "ENVDATA")
+        elif operation == "enable":
+            await panel_ops.enable_voice(shell)
+        else:
+            await panel_ops.restart_voice(shell)
+    assert shell.commands == [_VOICE_ARCH_CHECK]
+    assert shell.uploads == []
+    assert shell.file_uploads == []
+
+
+async def test_voice_inspection_and_removal_allowed_on_unsupported_architecture() -> None:
+    shell = await _connected(FakeShell(responses={_VOICE_ARCH_CHECK: RunResult(1, "", "")}))
+    await panel_ops.inspect_voice(shell)
+    await panel_ops.uninstall_voice(shell)
+    assert _VOICE_ARCH_CHECK not in shell.commands
+    assert f"systemctl disable --now {VOICE_SERVICE_NAME} 2>/dev/null || true" in shell.commands
 
 
 async def test_deploy_voice_payload_skips_version_when_swap_fails() -> None:
@@ -1644,9 +1673,10 @@ async def test_deploy_voice_payload_skips_version_when_swap_fails() -> None:
 async def test_ensure_voice_config_writes_unit_env_and_reloads() -> None:
     shell = await _connected(FakeShell())
     await panel_ops.ensure_voice_config(shell, env_content="ENVDATA")
+    assert shell.commands[0] == _VOICE_ARCH_CHECK
     # mkdir and cp unit commands precede the daemon-reload.
-    assert shell.commands[0] == f"mkdir -p {PANEL_VOICE_STAGED_DIR}"
-    assert shell.commands[1] == (
+    assert shell.commands[1] == f"mkdir -p {PANEL_VOICE_STAGED_DIR}"
+    assert shell.commands[2] == (
         f"cp {PANEL_VOICE_VAR_DIR}/{VOICE_SERVICE_NAME}.service {PANEL_VOICE_UNIT_FILE}"
     )
     assert shell.commands[-1] == "systemctl daemon-reload"
