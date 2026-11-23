@@ -343,7 +343,7 @@ def _aux_number_descriptor() -> EntityDescriptor:
         command_var="screen_brightness",
         value_kind="int",
         min_value=0,
-        max_value=10,
+        max_value=15,
         step=1,
     )
 
@@ -451,7 +451,7 @@ def test_aux_number_command_topic() -> None:
 def test_aux_number_min_max_step_mode() -> None:
     data = json.loads(config_payload(_aux_number_descriptor()))
     assert data["min"] == 0
-    assert data["max"] == 10
+    assert data["max"] == 15
     assert data["step"] == 1
     assert data["mode"] == "slider"
 
