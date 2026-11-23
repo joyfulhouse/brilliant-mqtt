@@ -434,3 +434,46 @@ def test_directory_replaced_by_symlink_during_hashing_is_rejected(
         build_manifest("integration", root)
 
     assert raced
+
+
+def _finalize_fixture(tmp_path: Path, pin: str | None, *, symlink: bool = False) -> Path:
+    identifier = "c" * 32
+    release = tmp_path / "releases" / _RELEASE_NAME
+    release.mkdir(parents=True)
+    if pin is not None:
+        if symlink:
+            target = tmp_path / "elsewhere"
+            target.write_text(pin)
+            (release / ".rollback-retained").symlink_to(target)
+        else:
+            (release / ".rollback-retained").write_text(pin)
+    directory = tmp_path / ".rollback" / identifier
+    directory.mkdir(parents=True)
+    encoded = (
+        '{"limits":{"capture_seconds":120,"maximum_bytes":1,"maximum_entries":1},'
+        f'"release_target":"{release}"}}'
+    ).encode()
+    (directory / "complete.json").write_bytes(encoded)
+    baseline_action = cast("Callable[[Path, str, str, str], None]", _load_helper().baseline_action)
+    baseline_action(tmp_path, identifier, hashlib.sha256(encoded).hexdigest(), "finalize")
+    assert not directory.exists()
+    assert not (tmp_path / ".rollback" / f".{identifier}.finalizing").exists()
+    return release / ".rollback-retained"
+
+
+def test_finalize_removes_the_pin_naming_this_baseline(tmp_path: Path) -> None:
+    assert not os.path.lexists(_finalize_fixture(tmp_path, "c" * 32))
+
+
+def test_finalize_keeps_a_pin_naming_another_baseline(tmp_path: Path) -> None:
+    pin = _finalize_fixture(tmp_path, "d" * 32)
+    assert pin.read_text() == "d" * 32
+
+
+def test_finalize_keeps_a_symlinked_pin(tmp_path: Path) -> None:
+    pin = _finalize_fixture(tmp_path, "c" * 32, symlink=True)
+    assert pin.is_symlink()
+
+
+def test_finalize_without_a_pin_still_retires_the_baseline(tmp_path: Path) -> None:
+    assert not os.path.lexists(_finalize_fixture(tmp_path, None))

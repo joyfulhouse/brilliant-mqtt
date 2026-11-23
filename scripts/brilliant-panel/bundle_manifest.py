@@ -819,7 +819,14 @@ def baseline_action(root: Path, identifier: str, digest: str, action: str) -> No
     release = Path(manifest["release_target"]) if manifest["release_target"] else None
     if action == "finalize":
         if release is not None:
-            (release / ".rollback-retained").unlink(missing_ok=True)
+            # Only this baseline's own regular-file pin; never another capture's.
+            pin = release / ".rollback-retained"
+            if (
+                not pin.is_symlink()
+                and pin.is_file()
+                and pin.read_text(encoding="ascii", errors="replace") == identifier
+            ):
+                pin.unlink()
             _sync_directory(release)
         # Publish deletion intent on-panel too, so a lost complete.json during
         # recursive removal cannot make a durable FINALIZING record unreplayable.
