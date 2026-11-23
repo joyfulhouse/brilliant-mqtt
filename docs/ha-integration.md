@@ -160,6 +160,10 @@ broker, command, or credential text.
   `unsupported_panel_toolchain`, `insufficient_memory`, or
   `insufficient_storage`: correct the reported compatibility prerequisite
   before retrying; the integration has not activated a candidate.
+- i350 / aarch64 panels remain unofficial. During **Add Brilliant panel**, an
+  experimental opt-in (default off) can admit that one panel; the armv7l
+  gate is otherwise unchanged. Voice is refused on aarch64. The i.MX6 Wi-Fi
+  last-resort reset is skipped when `sdhci-esdhc-imx` is absent.
 - Broker, TLS, authentication, ACL, retained-message, and MQTT timeout codes
   link directly to their error-specific section in the
   [MQTT prerequisite guide](install/mqtt-broker.md).

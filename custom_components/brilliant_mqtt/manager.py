@@ -1381,6 +1381,7 @@ class PanelManager:
         Deploys the payload only when absent (an OTA wipes /etc but not /var, so the
         common case just restores the unit/env from the surviving payload).
         """
+        await panel_ops.require_voice_architecture(shell)
         vstate = await panel_ops.inspect_voice(shell)
         if not vstate.payload_present:
             await panel_ops.deploy_voice_payload(shell, tarball, VOICE_PAYLOAD_VERSION)

@@ -32,6 +32,40 @@ Reset to `LOG_LEVEL=INFO` when done.
    VLAN can reach the broker on port 1883.
 3. Check the agent is running: `systemctl status brilliant-mqtt` on the panel.
 
+### "This panel architecture is not supported"
+
+Setup stopped with `unsupported_architecture`. brilliant-mqtt is qualified only
+on armv7l (i.MX6) Brilliant Controls. Newer i350 panels report `aarch64` and are
+**not supported yet**. This is deliberate. A contributor's experimental pilot
+in [#155](https://github.com/joyfulhouse/brilliant-mqtt/issues/155#issuecomment-7065744176)
+reports native bus-library import, core entities, healthy Wi-Fi and bus
+watchdogs, and working Hue CA recovery. OTA survival of `/var` and HA Control
+remain unverified; voice was not installed. Full qualification is still pending,
+so keep the architecture check in place.
+
+If you have an i350 and want to help qualify it, run the read-only diagnostic
+from a checkout of this repo and attach the output to
+[issue #155](https://github.com/joyfulhouse/brilliant-mqtt/issues/155) after
+reviewing it:
+
+```bash
+ssh -o NumberOfPasswordPrompts=1 root@<panel-ip> 'sh -s' \
+  < scripts/brilliant-panel/panel_diagnostics.sh > i350-diagnostics.txt
+```
+
+See [brilliant-panel/i350-support.md](brilliant-panel/i350-support.md) for what
+the diagnostic collects, what is architecture-bound, and the qualification gates.
+
+The Wi-Fi watchdog requires the `mmc1` alias target to be bound to
+`sdhci-esdhc-imx` before its GPIO reset. A registered driver directory (including
+`imx_sdhci_driver_present=1` in the diagnostic) is insufficient. Missing binding
+evidence produces a warning and reboot-only recovery. Production binding
+evidence on the armv7 pilot remains a release prerequisite.
+
+Voice upload, configuration, enable and restart require armv7l, including repair
+of an existing payload and wake-word updates. Inspection and removal remain
+available on other architectures.
+
 ---
 
 ### Add or update fails with `service_crash_looping`

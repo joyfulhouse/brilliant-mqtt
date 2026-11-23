@@ -3631,6 +3631,19 @@ def render_voice_env(
     )
 
 
+_VOICE_ARCH_CHECK = '[ "$(uname -m)" = armv7l ]'
+
+
+async def require_voice_architecture(shell: PanelShell) -> None:
+    """Refuse unsupported native voice code before configuring or starting it."""
+    arch_check = await shell.run(_VOICE_ARCH_CHECK)
+    if arch_check.exit_status != 0:
+        raise PanelOpError(
+            "voice satellite payload is armv7l-only; this panel's architecture is "
+            "not supported (see docs/brilliant-panel/i350-support.md)"
+        )
+
+
 async def deploy_voice_payload(shell: PanelShell, local_tarball_path: str, version: str) -> None:
     """Upload the voice payload tarball and swap the extracted tree into place.
 
@@ -3638,7 +3651,11 @@ async def deploy_voice_payload(shell: PanelShell, local_tarball_path: str, versi
     dir is brilliant-voice/, stripped on extract). Stage+swap so a failed transfer
     or extract never half-replaces a working install; the current tree is moved aside
     (not rm) so a mid-swap mv failure stays recoverable.
+
+    The payload bundles armv7l native code, so any other architecture is refused
+    before anything on the panel is touched (issue #155).
     """
+    await require_voice_architecture(shell)
     await shell.run(f"rm -rf {_VOICE_STAGING_DIR} {_VOICE_STAGING_TARBALL}")
     await shell.put_file(local_tarball_path, _VOICE_STAGING_TARBALL, 0o644)
     await _checked(shell, _voice_swap_command())
@@ -3667,6 +3684,7 @@ async def ensure_voice_config(shell: PanelShell, env_content: str) -> None:
     OTA-replaced, so copy the unit into /etc and write the env to both /etc and the
     /var staged copy. The env carries no secret but stays 0600 to match the bridge.
     """
+    await require_voice_architecture(shell)
     await _checked(shell, f"mkdir -p {PANEL_VOICE_STAGED_DIR}")
     await _checked(
         shell, f"cp {PANEL_VOICE_VAR_DIR}/{VOICE_SERVICE_NAME}.service {PANEL_VOICE_UNIT_FILE}"
@@ -3678,10 +3696,12 @@ async def ensure_voice_config(shell: PanelShell, env_content: str) -> None:
 
 
 async def enable_voice(shell: PanelShell) -> None:
+    await require_voice_architecture(shell)
     await _checked(shell, f"systemctl enable --now {VOICE_SERVICE_NAME}")
 
 
 async def restart_voice(shell: PanelShell) -> None:
+    await require_voice_architecture(shell)
     await _checked(shell, f"systemctl restart {VOICE_SERVICE_NAME}")
 
 
