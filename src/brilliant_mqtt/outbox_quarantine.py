@@ -118,10 +118,13 @@ def sidecar_path(state_path: Path) -> Path:
 
 
 def _qualifies(failures: tuple[AttributedFailure, ...]) -> bool:
-    sessions = {failure.session for failure in failures}
+    sessions: dict[str, int] = {}
+    for failure in failures:
+        # A repeated observation cannot move a session's first failure time.
+        sessions.setdefault(failure.session, failure.at_ms)
     if len(sessions) < QUARANTINE_FAILURES:
         return False
-    times = [failure.at_ms for failure in failures]
+    times = sessions.values()
     return max(times) - min(times) >= QUARANTINE_SPAN_MS
 
 
@@ -301,6 +304,8 @@ def _parse_suspect(raw: object) -> SuspectRecord:
     if quarantined_at_ms is not None and not _is_ms(quarantined_at_ms):
         raise ValueError("invalid quarantine time")
     failures = tuple(_parse_failure(item) for item in failures_raw)
+    if len({failure.session for failure in failures}) != len(failures):
+        raise ValueError("invalid quarantine history: repeated failure session")
     # The recorder uses the latest observation's time, even if NTP moved it
     # backwards; requiring a monotonic history would reject genuine evidence.
     if quarantined_at_ms is not None and (

@@ -32,6 +32,20 @@ the previous agent version until the next full meta republish replaces it.
 
 ## Schema v1
 
+Schema v1 has two wire shapes. Ordinary samples contain the response metrics
+listed below. While the scene outbox has failure evidence, `diag` contains
+`v` and an `outbox` object instead. The outbox details replace optional metrics
+within the ordinary metadata byte budget so diagnostics cannot prevent startup
+under a broker packet limit. Details include state, bounded record identity,
+kind, payload bytes and hash, failure count, and quarantine time. If these
+exceed the budget, only state, identity, and kind are published. See the
+[outbox quarantine contract](../issue-113-outbox-quarantine-contract.md).
+
+Consumers must skip samples without `uptime_s` and the metric counters when
+calculating rates. Missing metrics mean no counter sample; do not substitute
+zero or infer a process restart. Counters keep accumulating during this period
+and return when the evidence clears. The local outbox CLI retains full details.
+
 | Key inside `diag` | Operator definition |
 | --- | --- |
 | `v` | Schema version, currently `1`. |

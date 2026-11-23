@@ -103,6 +103,67 @@ def test_repeated_failures_in_one_session_count_once() -> None:
     assert suspect.quarantined_at_ms is None
 
 
+def test_late_duplicate_cannot_extend_the_distinct_session_span() -> None:
+    state = _fail(_fail(_fail(oq.QuarantineState(), "A", 0), "B", 25_000), "C", 35_000)
+    assert _fail(state, "A", 60_000) == state
+    duplicate = oq.AttributedFailure("A", 60_000)
+    suspect = state.get(_EVENT)
+    assert suspect is not None
+    malformed = oq.QuarantineState(
+        suspects=((_EVENT, oq.SuspectRecord(_SHA, (*suspect.failures, duplicate), None)),)
+    )
+    updated = _fail(malformed, "D", 40_000).get(_EVENT)
+    assert updated is not None and updated.quarantined_at_ms is None
+
+
+@pytest.mark.parametrize("quarantined_at_ms", [None, 60_000])
+def test_duplicate_session_history_is_ignored_on_load(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, quarantined_at_ms: int | None
+) -> None:
+    failures = tuple(
+        oq.AttributedFailure(session, at_ms)
+        for session, at_ms in (("A", 0), ("B", 25_000), ("C", 35_000), ("A", 60_000))
+    )
+    raw = oq.sidecar_payload(
+        oq.QuarantineState(
+            suspects=((_EVENT, oq.SuspectRecord(_SHA, failures, quarantined_at_ms)),)
+        )
+    )
+    path = tmp_path / "sidecar.json"
+    content = json.dumps(raw).encode()
+    path.write_bytes(content)
+    assert oq.load_sidecar(path) == oq.QuarantineState()
+    assert "quarantine sidecar" in caplog.text
+    assert path.read_bytes() == content
+
+
+async def test_duplicate_span_sidecar_retries_pending_record_on_restart(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    harness = _Harness(tmp_path)
+    bridge, _, mqtt = await harness.session(execution_scene=_POISON_SCENE)
+    await _offered(mqtt)
+    await _failures_reach(harness, 1)
+    await bridge.async_shutdown()
+    raw = json.loads(harness.sidecar.read_bytes())
+    suspect = next(iter(raw["suspects"].values()))
+    suspect["failures"] = [
+        {"session": session, "at_ms": at_ms}
+        for session, at_ms in (("A", 0), ("B", 25_000), ("C", 35_000), ("A", 60_000))
+    ]
+    suspect["quarantined_at_ms"] = 60_000
+    harness.sidecar.write_text(json.dumps(raw))
+    caplog.clear()
+    bridge, _, mqtt = await harness.session("accept")
+    try:
+        await _offered(mqtt)
+        assert bridge._outbox_reason() != "outbox_quarantine"
+        assert not mqtt.connection_lost
+        assert "quarantine sidecar" in caplog.text
+    finally:
+        await bridge.async_shutdown()
+
+
 def test_changed_payload_restarts_the_count() -> None:
     state = _fail(_fail(oq.QuarantineState(), "s1", 0), "s2", 30_000)
     state = _fail(state, "s3", 90_000, sha=_OTHER_SHA)
