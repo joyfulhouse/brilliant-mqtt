@@ -3638,6 +3638,86 @@ async def test_set_voice_wake_word_voice_disabled_no_ssh(
     assert shell.connect_count == 0  # no SSH when voice is disabled
 
 
+async def test_set_voice_wake_word_refuses_non_armv7_without_writes(
+    hass: HomeAssistant,
+) -> None:
+    old_word = "okay_nabu"
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="office",
+        data={**_voice_entry_data(), CONF_VOICE_WAKE_WORD: old_word},
+        version=2,
+    )
+    entry.add_to_hass(hass)
+    shell = _make_voice_shell(payload_present=True)
+    arch_check = '[ "$(uname -m)" = armv7l ]'
+    shell.responses[arch_check] = RunResult(1, "", "")
+    with patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell):
+        manager = _legacy_manager(hass, entry)
+        with pytest.raises(HomeAssistantError) as err:
+            await manager.async_set_voice_wake_word("hey_jarvis")
+    assert err.value.translation_key == "voice_failed"
+    assert shell.commands == [arch_check]
+    assert shell.uploads == []
+    assert shell.file_uploads == []
+    assert entry.data[CONF_VOICE_WAKE_WORD] == old_word
+    assert not shell.connected
+
+
+async def test_deploy_existing_voice_payload_on_armv7_restores_without_upload(
+    hass: HomeAssistant,
+) -> None:
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=_voice_entry_data(), version=2)
+    entry.add_to_hass(hass)
+    shell = _make_voice_shell(payload_present=True)
+    shell.responses['[ "$(uname -m)" = armv7l ]'] = RunResult(0, "", "")
+    await shell.connect()
+    try:
+        await _legacy_manager(hass, entry)._deploy_voice(shell, _FAKE_TARBALL)
+    finally:
+        await shell.close()
+    assert panel_ops.VOICE_INSPECT_COMMAND in shell.commands
+    assert shell.file_uploads == []
+    assert any(p == "/etc/brilliant-voice.env" for p, _data, _mode in shell.uploads)
+    assert "systemctl enable --now brilliant-voice" in shell.commands
+
+
+@pytest.mark.allow_lingering_timers
+async def test_repair_existing_voice_payload_refuses_non_armv7(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    payload_dir: Path,
+) -> None:
+    from homeassistant.helpers import issue_registry as ir
+
+    shell = _make_voice_shell(payload_present=True)
+    arch_check = '[ "$(uname -m)" = armv7l ]'
+    shell.responses[arch_check] = RunResult(1, "", "")
+    with (
+        patch("custom_components.brilliant_mqtt.manager.LegacyAsyncsshShell", return_value=shell),
+        patch(_FETCH_PATCH, return_value=_FAKE_TARBALL),
+    ):
+        entry = MockConfigEntry(
+            domain=DOMAIN, unique_id="office", data=_voice_entry_data(), version=2
+        )
+        entry.add_to_hass(hass)
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        await _entry_manager(entry).async_repair(trigger="button")
+        await hass.async_block_till_done()
+    assert "systemctl enable --now brilliant-mqtt" in shell.commands
+    assert arch_check in shell.commands
+    assert not any(
+        "brilliant-voice" in c for c in shell.commands if c != panel_ops.VOICE_INSPECT_COMMAND
+    )
+    assert not any("brilliant-voice" in p for p, _data, _mode in shell.uploads)
+    assert shell.file_uploads == []
+    issue = ir.async_get(hass).async_get_issue(DOMAIN, f"voice_missing_{entry.entry_id}")
+    assert issue is not None
+    assert issue.severity == ir.IssueSeverity.WARNING
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
 @pytest.mark.allow_lingering_timers
 async def test_repair_fold_in_voice_enabled_absent_payload(
     hass: HomeAssistant,

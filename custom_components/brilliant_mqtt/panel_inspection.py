@@ -26,6 +26,9 @@ _MAX_KIB_VALUE = (2**63 - 1) // 1024
 _PANEL_PYTHON = "/data/switch-embedded/env/bin/python3"
 _MODEL_PATH = "/sys/firmware/devicetree/base/model"
 _RELEASE_INFO_PATH = "/etc/release_info.json"
+# Deliberate gate (issue #155): only armv7l (i.MX6) panels are qualified. Other
+# architectures (e.g. the aarch64 i350) need scripts/brilliant-panel/
+# panel_diagnostics.sh and the gates in docs/brilliant-panel/i350-support.md first.
 _SUPPORTED_ARCHITECTURES = frozenset({"armv7l"})
 _SERVICE_STATES = frozenset(
     {

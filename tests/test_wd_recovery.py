@@ -1,3 +1,6 @@
+import inspect
+import logging
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -35,7 +38,10 @@ def test_restart_services_sequence() -> None:
 def test_gpio_reset_then_reboot() -> None:
     r = Rec()
     result = recovery.gpio_reset_and_reboot(
-        run=r.run, write=r.write, read_alias=lambda: "2194000.mmc"
+        run=r.run,
+        write=r.write,
+        read_alias=lambda: "2194000.mmc",
+        reset_supported=lambda: True,
     )
     # unbind the wifi usdhc controller
     assert ("/sys/bus/platform/drivers/sdhci-esdhc-imx/unbind", "2194000.mmc") in r.writes
@@ -56,6 +62,126 @@ def test_gpio_reset_then_reboot() -> None:
     # reboot is LAST
     assert r.cmds[-1] == ["systemctl", "reboot"]
     assert result == 0
+
+
+def test_gpio_reset_skipped_off_imx_but_still_reboots(caplog: pytest.LogCaptureFixture) -> None:
+    """Issue #155: the GPIO 2/5 + sdhci-esdhc-imx reset is i.MX6-specific. On any
+    other SoC it must write nothing (not even read the alias), log once, and still
+    request the reboot through the normal path."""
+    r = Rec()
+    alias_reads: list[str] = []
+
+    def read_alias() -> str | None:
+        alias_reads.append("read")
+        return "2194000.mmc"
+
+    with caplog.at_level(logging.WARNING, logger="brilliant_wifi_watchdog"):
+        result = recovery.gpio_reset_and_reboot(
+            run=r.run,
+            write=r.write,
+            read_alias=read_alias,
+            sleep=lambda _: None,
+            reset_supported=lambda: False,
+        )
+    assert r.writes == []
+    assert alias_reads == []
+    assert r.cmds == [["systemctl", "reboot"]]
+    assert result == 0
+    warnings = [rec for rec in caplog.records if rec.levelno == logging.WARNING]
+    assert [w.getMessage() for w in warnings] == [
+        "i.MX mmc1 controller binding unverified; skipping GPIO/usdhc reset"
+    ]
+    assert warnings[0].name == "brilliant_wifi_watchdog"
+
+
+def test_gpio_reset_on_imx_logs_no_warning(caplog: pytest.LogCaptureFixture) -> None:
+    r = Rec()
+    with caplog.at_level(logging.WARNING, logger="brilliant_wifi_watchdog"):
+        recovery.gpio_reset_and_reboot(
+            run=r.run,
+            write=r.write,
+            read_alias=lambda: "2194000.mmc",
+            sleep=lambda _: None,
+            reset_supported=lambda: True,
+        )
+    assert r.writes
+    assert [rec for rec in caplog.records if rec.levelno >= logging.WARNING] == []
+
+
+def test_imx_reset_supported_requires_more_than_registered_driver_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = tmp_path / "sdhci-esdhc-imx"
+    monkeypatch.setattr(recovery, "_IMX_SDHCI_DRIVER_DIR", str(driver))
+    monkeypatch.setattr(recovery, "_ALIAS_PATH", str(tmp_path / "missing_alias"))
+    assert recovery.imx_wifi_reset_supported() is False
+    driver.mkdir()
+    assert recovery.imx_wifi_reset_supported() is False
+
+
+def test_gpio_reset_defaults_to_the_imx_driver_probe() -> None:
+    default = inspect.signature(recovery.gpio_reset_and_reboot).parameters["reset_supported"]
+    assert default.default is recovery.imx_wifi_reset_supported
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "missing_alias",
+        "empty_alias",
+        "unbound",
+        "other_controller",
+        "dangling",
+        "other_driver",
+        "bound",
+    ],
+)
+def test_gpio_reset_requires_bound_mmc1_controller(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str
+) -> None:
+    driver = tmp_path / "bus/platform/drivers/sdhci-esdhc-imx"
+    driver.mkdir(parents=True)
+    alias = tmp_path / "firmware/devicetree/base/aliases/mmc1"
+    alias.parent.mkdir(parents=True)
+    if target != "missing_alias":
+        alias.write_bytes(
+            b"" if target == "empty_alias" else b"/soc/aips-bus@02100000/usdhc@02194000\x00"
+        )
+    device = tmp_path / "devices/platform/soc/2194000.mmc"
+    device.mkdir(parents=True)
+    (device / "driver").symlink_to(driver if target != "other_driver" else tmp_path)
+    if target in ("bound", "other_driver", "other_controller", "dangling"):
+        name = "2198000.mmc" if target == "other_controller" else "2194000.mmc"
+        (driver / name).symlink_to(device if target != "dangling" else tmp_path / "missing")
+    monkeypatch.setattr(recovery, "_ALIAS_PATH", str(alias))
+    monkeypatch.setattr(recovery, "_IMX_SDHCI_DRIVER_DIR", str(driver))
+    r = Rec()
+    sleeps: list[float] = []
+    assert recovery.imx_wifi_reset_supported() is (target == "bound")
+    assert recovery.gpio_reset_and_reboot(run=r.run, write=r.write, sleep=sleeps.append) == 0
+    assert r.cmds == [["systemctl", "reboot"]]
+    if target == "bound":
+        assert r.writes[0] == (str(driver / "unbind"), "2194000.mmc")
+        assert ("/sys/class/gpio/gpio2/value", "0") in r.writes
+        assert ("/sys/class/gpio/gpio5/value", "0") in r.writes
+        assert sleeps == [1]
+    else:
+        assert r.writes == []
+        assert sleeps == []
+
+
+def test_gpio_reset_missing_alias_is_reboot_only_even_with_supported_driver() -> None:
+    r = Rec()
+    recovery.gpio_reset_and_reboot(
+        run=r.run,
+        write=r.write,
+        read_alias=lambda: None,
+        reset_supported=lambda: True,
+        sleep=lambda _: None,
+    )
+    assert r.writes == []
+    assert r.cmds == [["systemctl", "reboot"]]
 
 
 # ---------------------------------------------------------------------------
