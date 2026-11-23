@@ -451,6 +451,10 @@ def _scene_settings(enabled: bool, watermark_file: str) -> Settings:
 
 
 class _SessionBus:
+    capture_generation = 0
+    capture_sequence = 0
+    privacy_revocation = None
+
     def __init__(self, events: list[str]) -> None:
         self.events = events
         self.reconnect_callback: Callable[[], Awaitable[None]] | None = None

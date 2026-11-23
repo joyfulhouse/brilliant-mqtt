@@ -40,6 +40,7 @@ from ..const import (
     DOMAIN,
     ENTRY_KIND_FLEET,
 )
+from ..migration_coordinator import migration_blocks_entry_writes
 from ..voice_payload import VoicePayloadError
 from . import gateway
 from .schemas import (
@@ -93,10 +94,18 @@ class LegacyPanelReconfigureFlow(_Base):
     """
 
     def _legacy_reconfigure_entry(self) -> ConfigEntry[Any] | None:
+        if migration_blocks_entry_writes(self.hass):
+            return None
         entry = self._get_reconfigure_entry()
         if entry.data.get(CONF_ENTRY_KIND) == ENTRY_KIND_FLEET:
             return None
         return entry
+
+    def _reconfigure_unavailable(self) -> str:
+        """Explain why a legacy section cannot be edited right now."""
+        if migration_blocks_entry_writes(self.hass):
+            return "migration_in_progress"
+        return "reconfigure_not_supported"
 
     async def async_step_reconfigure(
         self, user_input: dict[str, Any] | None = None
@@ -104,7 +113,7 @@ class LegacyPanelReconfigureFlow(_Base):
         """Offer one focused section per concern instead of a wall of inputs."""
         del user_input
         if self._legacy_reconfigure_entry() is None:
-            return self.async_abort(reason="reconfigure_not_supported")
+            return self.async_abort(reason=self._reconfigure_unavailable())
         return self.async_show_menu(
             step_id="reconfigure",
             menu_options=RECONFIGURE_MENU_OPTIONS,
@@ -241,7 +250,7 @@ class LegacyPanelReconfigureFlow(_Base):
         """Change the panel address and/or rotate its root password."""
         entry = self._legacy_reconfigure_entry()
         if entry is None:
-            return self.async_abort(reason="reconfigure_not_supported")
+            return self.async_abort(reason=self._reconfigure_unavailable())
         errors: dict[str, str] = {}
         if user_input is not None:
             # Reject control chars on the RAW input first, THEN strip benign
@@ -281,7 +290,7 @@ class LegacyPanelReconfigureFlow(_Base):
         """Point the panel at a different MQTT broker or rotate its credential."""
         entry = self._legacy_reconfigure_entry()
         if entry is None:
-            return self.async_abort(reason="reconfigure_not_supported")
+            return self.async_abort(reason=self._reconfigure_unavailable())
         errors: dict[str, str] = {}
         if user_input is not None:
             errors = control_char_errors(
@@ -317,7 +326,7 @@ class LegacyPanelReconfigureFlow(_Base):
         """Install/remove optional components using the stored SSH credential."""
         entry = self._legacy_reconfigure_entry()
         if entry is None:
-            return self.async_abort(reason="reconfigure_not_supported")
+            return self.async_abort(reason=self._reconfigure_unavailable())
         errors: dict[str, str] = {}
         if user_input is not None:
             # A control char in voice_ha_host crashes render_voice_env → _env_quote.
@@ -357,7 +366,7 @@ class LegacyPanelReconfigureFlow(_Base):
         """Edit the HA-control globals; they fan out to every panel entry."""
         entry = self._legacy_reconfigure_entry()
         if entry is None:
-            return self.async_abort(reason="reconfigure_not_supported")
+            return self.async_abort(reason=self._reconfigure_unavailable())
         errors: dict[str, str] = {}
         if user_input is not None:
             # Gate the RAW label as well as the stripped one below: str.strip()
@@ -403,7 +412,7 @@ class LegacyPanelReconfigureFlow(_Base):
         """Edit the mesh leader-election priority and push it to the panel."""
         entry = self._legacy_reconfigure_entry()
         if entry is None:
-            return self.async_abort(reason="reconfigure_not_supported")
+            return self.async_abort(reason=self._reconfigure_unavailable())
         errors: dict[str, str] = {}
         if user_input is not None:
             updates = {CONF_MESH_PRIORITY: int(user_input[CONF_MESH_PRIORITY])}

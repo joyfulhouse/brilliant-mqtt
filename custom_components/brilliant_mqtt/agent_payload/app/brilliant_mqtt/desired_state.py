@@ -61,6 +61,22 @@ def _normalize_value(v: object) -> str:
     return str(v)
 
 
+def atomic_write_json(path: Path, payload: object) -> None:
+    """Durably persist JSON *payload* to *path* (write temp, fsync, replace, fsync dir)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(json.dumps(payload))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    dir_fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
 class DesiredState:
     """peripheral_id -> {var: desired bus-string value}, persisted as JSON.
 
@@ -146,15 +162,4 @@ class DesiredState:
         desired config at next boot. Saves only happen on operator commands,
         so the extra syncs cost nothing in steady state.
         """
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self._path.with_name(self._path.name + ".tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(json.dumps(self._state))
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, self._path)
-        dir_fd = os.open(self._path.parent, os.O_RDONLY)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
+        atomic_write_json(self._path, self._state)
