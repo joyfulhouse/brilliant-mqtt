@@ -52,6 +52,7 @@ CONF_MQTT_TLS_ENABLED = "mqtt_tls_enabled"
 CONF_MQTT_TLS_CA = "mqtt_tls_ca"
 # Voice satellite feature keys.
 CONF_VOICE_ENABLED = "voice_enabled"
+CONF_ALLOW_AARCH64 = "allow_aarch64"
 CONF_VOICE_WAKE_WORD = "voice_wake_word"
 CONF_VOICE_HA_HOST = "voice_ha_host"
 # HA mirror feature keys.

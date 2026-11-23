@@ -303,6 +303,8 @@ async def _async_inspect_candidate(
     host: str,
     root_password: str,
     identity: HostIdentity,
+    *,
+    allow_aarch64: bool = False,
 ) -> PanelFacts:
     """Authenticate only to the previously fetched identity and inspect read-only."""
     async with _fleet_lock(hass):
@@ -310,7 +312,7 @@ async def _async_inspect_candidate(
         primary: BaseException | None = None
         try:
             await shell.connect()
-            return await async_inspect_panel(shell, identity)
+            return await async_inspect_panel(shell, identity, allow_aarch64=allow_aarch64)
         except BaseException as error:
             primary = error
             raise
