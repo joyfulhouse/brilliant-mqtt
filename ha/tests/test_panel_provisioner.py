@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -523,6 +523,7 @@ class _FakeJournal:
     complete_commit_started: asyncio.Event = field(default_factory=asyncio.Event)
     created_record: ProvisioningRecord | None = None
     track_retained: bool = False
+    fail_remove_retained: bool = False
     retained: dict[UUID, RetainedRollback] = field(default_factory=dict)
 
     async def async_begin_ownerless_finalize(self, expected: RetainedRollback) -> RetainedRollback:
@@ -574,6 +575,8 @@ class _FakeJournal:
         )
 
     async def async_remove_retained(self, transaction_id: UUID) -> None:
+        if self.fail_remove_retained:
+            raise OSError("retained removal failed")
         current = self.retained.get(transaction_id)
         if current is None or current.state != "finalizing":
             return
@@ -716,6 +719,7 @@ class _FakeOperations:
     rollback_started: asyncio.Event = field(default_factory=asyncio.Event)
     rolled_back_snapshot: panel_ops.PanelSnapshot | None = None
     reachability: str = "ok"
+    snapshot_override: Callable[[PanelShell], Awaitable[panel_ops.PanelSnapshot]] | None = None
 
     @asynccontextmanager
     async def release_transaction(
@@ -742,6 +746,8 @@ class _FakeOperations:
     async def finalize_baseline(self, shell: PanelShell, snapshot: panel_ops.PanelSnapshot) -> None:
         del shell, snapshot
         self.events.append(("finalize_baseline",))
+        if "finalize_baseline" in self.fail_at:
+            raise OSError("finalize io failure")
 
     async def probe_broker_reachability(
         self,
@@ -776,8 +782,9 @@ class _FakeOperations:
         on_service_stopped()
 
     async def snapshot_panel(self, shell: PanelShell) -> panel_ops.PanelSnapshot:
-        del shell
         self.events.append(("snapshot",))
+        if self.snapshot_override is not None:
+            return await self.snapshot_override(shell)
         return self.snapshot
 
     async def stage_release(
@@ -1433,6 +1440,93 @@ async def test_broker_preflight_failure_discards_unactivated_baseline() -> None:
     assert ("journal_unactivated_discard",) in harness.events
     assert ("journal_remove_retained",) in harness.events
     assert not any(event[0] == "rollback" for event in harness.events)
+
+
+async def test_broker_preflight_discard_keeps_baseline_when_live_service_drifts() -> None:
+    """A changed bridge active state is the same proof the ownerless path requires."""
+    harness = _Harness()
+    harness.journal.track_retained = True
+    captured = panel_snapshot_from_stored(_release_link_snapshot())
+    drifted = replace(captured, bridge_service=replace(captured.bridge_service, active=False))
+
+    async def live_snapshot(_shell: PanelShell) -> panel_ops.PanelSnapshot:
+        seen = sum(1 for event in harness.events if event[0] == "snapshot")
+        return captured if seen == 1 else drifted
+
+    harness.operations.snapshot_override = live_snapshot
+    harness.preflight_error = OperationError.for_code(
+        OperationStage.FLEET_AUTH,
+        "broker_connect_failed",
+    )
+
+    with pytest.raises(PanelProvisioningError) as raised:
+        await harness.provisioner().async_install(
+            _request(),
+            _fleet(),
+            harness.progress,
+        )
+
+    assert raised.value.code == "preflight_failed"
+    assert raised.value.cleanup_code is None
+    assert sum(1 for event in harness.events if event[0] == "snapshot") >= 2
+    assert not any(event[0] == "finalize_baseline" for event in harness.events)
+    retained = harness.journal.retained[_TRANSACTION_ID]
+    assert retained.state == "armed"
+    assert retained.record.prior_snapshot.bridge_service.active is True
+
+
+@pytest.mark.parametrize("fault", ["finalize", "remove"])
+async def test_broker_preflight_retained_cleanup_failure_stays_actionable_and_retries(
+    fault: str,
+) -> None:
+    """Finalize or removal failure stays visible after the active journal is cleared."""
+    harness = _Harness()
+    harness.journal.track_retained = True
+    harness.preflight_error = OperationError.for_code(
+        OperationStage.FLEET_AUTH,
+        "broker_connect_failed",
+    )
+    if fault == "finalize":
+        harness.operations.fail_at.add("finalize_baseline")
+    else:
+        harness.journal.fail_remove_retained = True
+
+    with pytest.raises(PanelProvisioningError) as raised:
+        await harness.provisioner().async_install(
+            _request(),
+            _fleet(),
+            harness.progress,
+        )
+
+    assert raised.value.code == "preflight_failed"
+    assert raised.value.cleanup_code == "cleanup_failed"
+    assert (
+        "repair",
+        _TRANSACTION_ID,
+        "preflight_failed",
+        "cleanup_failed",
+    ) in harness.events
+    retained = harness.journal.retained[_TRANSACTION_ID]
+    assert retained.state == "finalizing"
+    assert retained.finalization_origin == "ownerless_unactivated"
+    assert retained.ownerless_unactivated_discard_allowed
+    assert harness.journal.record is None
+
+    harness.operations.fail_at.discard("finalize_baseline")
+    harness.journal.fail_remove_retained = False
+    provisioner = harness.provisioner()
+
+    async def unowned(_retained: RetainedRollback) -> bool:
+        return False
+
+    provisioner._retained_owner_exists = unowned
+    await provisioner.async_discard_unactivated_ownerless_baseline(
+        retained,
+        "office.iot.example",
+        "SECRET-root-password",
+        HostIdentity(_PUBLIC_KEY, _FINGERPRINT),
+    )
+    assert _TRANSACTION_ID not in harness.journal.retained
 
 
 async def test_non_broker_preflight_failure_keeps_armed_baseline() -> None:

@@ -5,8 +5,7 @@ from __future__ import annotations
 import ipaddress
 import re
 
-_ADDON_SLUG = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)+$")
-_REPO_ADDON_HOST = re.compile(r"^[0-9a-f]{8}-[a-z0-9-]+$")
+_DNS_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$", re.IGNORECASE)
 
 
 def panel_unreachable_broker_host_reason(host: str) -> str | None:
@@ -25,13 +24,10 @@ def panel_unreachable_broker_host_reason(host: str) -> str | None:
     if candidate == "local.hass.io" or candidate.endswith(".local.hass.io"):
         return "hass_internal_dns"
     single_label = "." not in candidate
+    # Known Home Assistant-internal names only. Ordinary hyphenated LAN labels
+    # such as mqtt-broker are accepted; a panel may resolve them.
     if candidate.startswith("a0d7b954-") or (single_label and candidate.startswith("core-")):
         return "addon_internal_name"
-    if single_label and (
-        _REPO_ADDON_HOST.fullmatch(candidate) is not None
-        or _ADDON_SLUG.fullmatch(candidate) is not None
-    ):
-        return "addon_slug"
     return None
 
 
@@ -44,7 +40,7 @@ def format_broker_endpoint(host: str, port: int) -> str:
         or not host
         or len(host) > 253
         or any(ord(char) < 33 or ord(char) == 127 for char in host)
-        or any(char in host for char in "@/\\")
+        or not _is_diagnostic_broker_host(host)
     ):
         return ""
     rendered_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
@@ -52,6 +48,26 @@ def format_broker_endpoint(host: str, port: int) -> str:
     if len(endpoint) > 300:
         return ""
     return endpoint
+
+
+def _is_diagnostic_broker_host(host: str) -> bool:
+    """True for a DNS name or IP literal, never a URL, query, or userinfo form."""
+    if host.startswith("[") and host.endswith("]"):
+        try:
+            ipaddress.ip_address(host[1:-1])
+        except ValueError:
+            return False
+        return True
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        return True
+    candidate = host[:-1] if host.endswith(".") else host
+    if not candidate or len(candidate) > 253 or candidate.startswith(".") or ".." in candidate:
+        return False
+    return all(_DNS_LABEL.fullmatch(label) is not None for label in candidate.split("."))
 
 
 def _is_loopback(host: str) -> bool:

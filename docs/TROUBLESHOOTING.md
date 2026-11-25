@@ -43,6 +43,11 @@ watchdogs, and working Hue CA recovery. OTA survival of `/var` and HA Control
 remain unverified; voice was not installed. Full qualification is still pending,
 so keep the architecture check in place.
 
+Add panel can admit one aarch64 panel only when that flow's experimental
+opt-in is checked. The checkbox defaults off and is stored on that panel
+alone; it does not lift the armv7l gate for any other panel. The dedicated
+note is [brilliant-panel/i350-support.md](brilliant-panel/i350-support.md).
+
 If you have an i350 and want to help qualify it, run the read-only diagnostic
 from a checkout of this repo and attach the output to
 [issue #155](https://github.com/joyfulhouse/brilliant-mqtt/issues/155) after

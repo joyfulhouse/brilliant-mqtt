@@ -919,6 +919,7 @@ class _InstallState:
     failure_code: str = "invalid_provisioning_dependency"
     failure_stage: str = "provisioning"
     discard_unactivated_baseline: bool = False
+    pending_retained_cleanup: bool = False
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -1090,7 +1091,10 @@ class PanelProvisioner:
                 )
                 if (
                     compensation.error is not None
-                    and state.journal_phase is ProvisioningPhase.STAGED
+                    and (
+                        state.journal_phase is ProvisioningPhase.STAGED
+                        or state.pending_retained_cleanup
+                    )
                     and cancellation is None
                     and primary is not None
                 ):
@@ -1677,9 +1681,10 @@ class PanelProvisioner:
     async def _async_try_discard_unactivated_baseline(self, state: _InstallState) -> bool:
         """Drop an armed pre-activation baseline after a broker preflight failure.
 
-        Proof matches the ownerless unactivated discard: the live panel still
-        matches the capture and the candidate directory is gone. A failed proof
-        leaves the armed baseline in place.
+        Proof matches the ownerless unactivated discard, including a fresh live
+        snapshot. Drift leaves the armed baseline in place. A later retained
+        finalize or removal failure stays pending so the original broker error
+        still reports cleanup and a fresh-auth retry can finish it.
         """
         if (
             state.shell is None
@@ -1688,12 +1693,18 @@ class PanelProvisioner:
             or state.transaction_id is None
         ):
             return False
+        retained = await self._journal.async_retained(state.transaction_id)
+        if retained is None or not retained.ownerless_unactivated_discard_allowed:
+            return False
+        record = await self._journal.async_load()
+        password = ""
+        if isinstance(record, ProvisioningRecord) and record.transaction_id == state.transaction_id:
+            password = record.panel_request.root_password
         try:
-            await self._operations.prove_unactivated_capture(
+            await self._async_prove_unactivated_panel(
                 state.shell,
-                state.snapshot,
-                version=state.staged.version,
-                transaction_id=state.transaction_id,
+                retained,
+                password=password,
             )
         except (PanelOpError, PanelProvisioningError, ValueError, TypeError):
             return False
@@ -1702,6 +1713,7 @@ class PanelProvisioner:
         retained = await self._journal.async_retained(state.transaction_id)
         if retained is None or not retained.ownerless_unactivated_discard_allowed:
             return True
+        state.pending_retained_cleanup = True
         current = await self._journal.async_begin_ownerless_unactivated_discard(retained)
         await self._operations.finalize_baseline(
             state.shell,
@@ -1709,6 +1721,7 @@ class PanelProvisioner:
         )
         await self._journal.async_remove_retained(current.record.transaction_id)
         await self._repair_reporter.async_clear_rollback_failure(current.record.transaction_id)
+        state.pending_retained_cleanup = False
         return True
 
     async def _async_reopen_compensate_and_close(
@@ -1745,22 +1758,26 @@ class PanelProvisioner:
         original_code: str,
         compensation: _Settlement,
     ) -> None:
+        retained_cleanup_pending = state.pending_retained_cleanup
         if (
             compensation.error is None
-            or state.journal_phase
-            not in {
-                ProvisioningPhase.STAGED,
-                ProvisioningPhase.ACTIVATION_PENDING,
-                ProvisioningPhase.ACTIVATED,
-                ProvisioningPhase.VERIFYING,
-                ProvisioningPhase.ROLLBACK_PENDING,
-            }
             or state.transaction_id is None
+            or (
+                state.journal_phase
+                not in {
+                    ProvisioningPhase.STAGED,
+                    ProvisioningPhase.ACTIVATION_PENDING,
+                    ProvisioningPhase.ACTIVATED,
+                    ProvisioningPhase.VERIFYING,
+                    ProvisioningPhase.ROLLBACK_PENDING,
+                }
+                and not retained_cleanup_pending
+            )
         ):
             return
         compensation_code = (
             "cleanup_failed"
-            if state.journal_phase is ProvisioningPhase.STAGED
+            if retained_cleanup_pending or state.journal_phase is ProvisioningPhase.STAGED
             else "rollback_failed"
         )
         await _settle(

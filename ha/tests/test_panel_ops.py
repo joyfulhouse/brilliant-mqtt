@@ -2734,6 +2734,114 @@ def test_broker_reachability_script_distinguishes_dns_and_refusal() -> None:
     assert panel_ops.interpret_broker_reachability("not-a-cause\n") == "connect"
 
 
+def _run_reachability_with_fake_dns(
+    mode: str,
+    tmp_path: Path,
+    *,
+    timeout_seconds: float = 0.4,
+) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+    """Execute the generated probe. The child scripts DNS and owns any listener."""
+    site = tmp_path / "site"
+    site.mkdir(parents=True)
+    log_path = tmp_path / "socket-log.txt"
+    (site / "sitecustomize.py").write_text(
+        "import os\n"
+        "import socket\n"
+        "import time\n"
+        "log_path = os.environ['BRILLIANT_SOCKET_LOG']\n"
+        "mode = os.environ['BRILLIANT_REACH_MODE']\n"
+        "real_socket = socket.socket\n"
+        "def note(line):\n"
+        "    with open(log_path, 'a', encoding='utf-8') as handle:\n"
+        "        handle.write(line + '\\n')\n"
+        "if mode == 'ipv6':\n"
+        "    listener = real_socket(socket.AF_INET6, socket.SOCK_STREAM)\n"
+        "    listener.bind(('::1', 0))\n"
+        "    listener.listen(1)\n"
+        "    bound = listener.getsockname()[1]\n"
+        "    payload = [(\n"
+        "        socket.AF_INET6, socket.SOCK_STREAM, socket.IPPROTO_TCP, '',\n"
+        "        ('::1', bound, 0, 0),\n"
+        "    )]\n"
+        "    stall = set()\n"
+        "else:\n"
+        "    listener = real_socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+        "    listener.bind(('127.0.0.1', 0))\n"
+        "    listener.listen(1)\n"
+        "    bound = listener.getsockname()[1]\n"
+        "    payload = [\n"
+        "        (\n"
+        "            socket.AF_INET6, socket.SOCK_STREAM, socket.IPPROTO_TCP, '',\n"
+        "            ('2001:db8::50', bound, 0, 0),\n"
+        "        ),\n"
+        "        (\n"
+        "            socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, '',\n"
+        "            ('127.0.0.1', bound),\n"
+        "        ),\n"
+        "    ]\n"
+        "    stall = {'2001:db8::50'}\n"
+        "def fake_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):\n"
+        "    return payload\n"
+        "class RecordingSocket(real_socket):\n"
+        "    def __init__(self, family, type, proto=0):\n"
+        "        note('open')\n"
+        "        super().__init__(family, type, proto)\n"
+        "    def settimeout(self, value):\n"
+        "        note('timeout ' + repr(value))\n"
+        "        super().settimeout(value)\n"
+        "    def connect(self, address):\n"
+        "        if address[0] in stall:\n"
+        "            time.sleep(0.05)\n"
+        "            raise TimeoutError()\n"
+        "        return super().connect(address)\n"
+        "    def close(self):\n"
+        "        note('close')\n"
+        "        super().close()\n"
+        "socket.getaddrinfo = fake_getaddrinfo\n"
+        "socket.socket = RecordingSocket\n",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(site) + os.pathsep + env.get("PYTHONPATH", "")
+    env["BRILLIANT_REACH_MODE"] = mode
+    env["BRILLIANT_SOCKET_LOG"] = str(log_path)
+    command = panel_ops.broker_reachability_command(
+        "broker.example",
+        1883,
+        timeout_seconds=timeout_seconds,
+    )
+    command = command.replace(panel_ops._PANEL_PYTHON, shlex.quote(sys.executable))
+    completed = subprocess.run(
+        ["/bin/sh", "-c", command],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        env=env,
+    )
+    log = log_path.read_text(encoding="utf-8").splitlines() if log_path.exists() else []
+    return completed, log
+
+
+def test_broker_reachability_script_connects_ipv6_and_aaaa_first(tmp_path: Path) -> None:
+    """IPv6 sockaddrs are 4-tuples; AAAA-first results must still reach a later address."""
+    ipv6_only, ipv6_log = _run_reachability_with_fake_dns("ipv6", tmp_path / "ipv6")
+    assert ipv6_only.returncode == 0, ipv6_only.stderr
+    assert panel_ops.interpret_broker_reachability(ipv6_only.stdout) == "ok"
+    assert ipv6_log.count("open") == ipv6_log.count("close") >= 1
+
+    aaaa_first, aaaa_log = _run_reachability_with_fake_dns("aaaa", tmp_path / "aaaa")
+    assert aaaa_first.returncode == 0, aaaa_first.stderr
+    assert panel_ops.interpret_broker_reachability(aaaa_first.stdout) == "ok"
+    assert aaaa_log.count("open") == aaaa_log.count("close") == 2
+    timeouts = [
+        float(line.removeprefix("timeout ")) for line in aaaa_log if line.startswith("timeout ")
+    ]
+    assert len(timeouts) == 2
+    assert timeouts[1] < timeouts[0]
+    assert timeouts[0] <= 0.4
+
+
 def test_snapshot_layout_probe_accepts_is_enabled_without_stdout(tmp_path: Path) -> None:
     """The layout probe must not abort when a core unit is absent on systemd 250.
 

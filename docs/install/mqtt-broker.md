@@ -126,7 +126,7 @@ address, or a hostname that the panel's DNS can resolve. Do not enter:
 - `core-mosquitto` or other single-label `core-*` add-on names
 - names ending in `.local.hass.io`
 - `localhost` or any `127.x` / `::1` loopback address
-- `a0d7b954-*` add-on hostnames, or other hyphenated single-label add-on slugs
+- `a0d7b954-*` add-on hostnames
 
 Setup and options reject those hosts with `broker_host_not_panel_reachable`
 before a panel is changed. The broker host field describes the same rule.
