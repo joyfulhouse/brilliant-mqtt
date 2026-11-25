@@ -281,18 +281,20 @@ class PanelSubentryFlow(ConfigSubentryFlow, _PanelOnboardingMixin):
             return _panel_failure("inspection_failed", stage="panel_inspection")
         return None
 
-    async def _async_sync_verified_address(
+    async def _async_commit_verified_owner(
         self,
         panel: PanelConfig,
+        *,
         host: str,
-    ) -> _FlowFailure | None:
-        """Keep this panel's journal and retained baseline on a proven new host.
+        root_password: str,
+    ) -> _FlowFailure | str | None:
+        """Commit a verified host and credential while the live owner still matches.
 
-        The SSH pin and slug are unchanged. Records for any other panel stay put.
-        A storage failure leaves the subentry on its previous address.
+        Returns None when the journal, retained rows, and configuration owner
+        all show the new values. Returns ``parent_changed`` when a newer repair
+        won the race, without leaving a retargeted journal behind. A storage
+        failure leaves a restart-recoverable intent instead of a split owner.
         """
-        if host == panel.host:
-            return None
         from ..provisioning_journal import ProvisioningJournal, ProvisioningJournalError
 
         try:
@@ -301,8 +303,13 @@ class PanelSubentryFlow(ConfigSubentryFlow, _PanelOnboardingMixin):
                 public_key=panel.ssh_host_key,
                 fingerprint=panel.identity_fingerprint,
                 host=host,
+                expected_host=panel.host,
+                expected_password=panel.root_password,
+                root_password=root_password,
             )
         except ProvisioningJournalError as error:
+            if error.code == "owner_changed":
+                return "parent_changed"
             _LOGGER.error(
                 "Verified address change for panel %s could not update provisioning records: %s",
                 panel.panel,
@@ -356,7 +363,7 @@ class PanelSubentryFlow(ConfigSubentryFlow, _PanelOnboardingMixin):
         target = self._reconfigure_target()
         if target is None:
             return self.async_abort(reason="invalid_parent")
-        entry, subentry, current = target
+        _entry, _subentry, current = target
         if not self._capture_or_compare_reconfigure(current):
             return self.async_abort(reason="parent_changed")
         errors: dict[str, str] = {}
@@ -378,16 +385,19 @@ class PanelSubentryFlow(ConfigSubentryFlow, _PanelOnboardingMixin):
                     target = self._reconfigure_target()
                     if target is None:
                         return self.async_abort(reason="invalid_parent")
-                    entry, subentry, latest = target
+                    _entry, _subentry, latest = target
                     if not self._capture_or_compare_reconfigure(latest):
                         return self.async_abort(reason="parent_changed")
-                    failure = await self._async_sync_verified_address(latest, host)
-                    if failure is None:
-                        return self.async_update_and_abort(
-                            entry,
-                            subentry,
-                            data={**subentry.data, CONF_HOST: host},
-                        )
+                    outcome = await self._async_commit_verified_owner(
+                        latest,
+                        host=host,
+                        root_password=latest.root_password,
+                    )
+                    if isinstance(outcome, str):
+                        return self.async_abort(reason=outcome)
+                    if outcome is None:
+                        return self.async_abort(reason="reconfigure_successful")
+                    failure = outcome
         source = {CONF_HOST: self._reconfigure_host or current.host}
         return self.async_show_form(
             step_id="address",
@@ -404,7 +414,7 @@ class PanelSubentryFlow(ConfigSubentryFlow, _PanelOnboardingMixin):
         target = self._reconfigure_target()
         if target is None:
             return self.async_abort(reason="invalid_parent")
-        entry, subentry, current = target
+        _entry, _subentry, current = target
         if not self._capture_or_compare_reconfigure(current):
             return self.async_abort(reason="parent_changed")
         errors: dict[str, str] = {}
@@ -426,20 +436,19 @@ class PanelSubentryFlow(ConfigSubentryFlow, _PanelOnboardingMixin):
                     target = self._reconfigure_target()
                     if target is None:
                         return self.async_abort(reason="invalid_parent")
-                    entry, subentry, latest = target
+                    _entry, _subentry, latest = target
                     if not self._capture_or_compare_reconfigure(latest):
                         return self.async_abort(reason="parent_changed")
-                    failure = await self._async_sync_verified_address(latest, host)
-                    if failure is None:
-                        return self.async_update_and_abort(
-                            entry,
-                            subentry,
-                            data={
-                                **subentry.data,
-                                CONF_HOST: host,
-                                CONF_ROOT_PASSWORD: password,
-                            },
-                        )
+                    outcome = await self._async_commit_verified_owner(
+                        latest,
+                        host=host,
+                        root_password=password,
+                    )
+                    if isinstance(outcome, str):
+                        return self.async_abort(reason=outcome)
+                    if outcome is None:
+                        return self.async_abort(reason="reconfigure_successful")
+                    failure = outcome
         return self.async_show_form(
             step_id="repair_credentials",
             data_schema=panel_ssh_credentials_schema(),

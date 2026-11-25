@@ -14,6 +14,7 @@ from enum import StrEnum
 from typing import Any, Self
 from uuid import RFC_4122, UUID
 
+from homeassistant.config_entries import ConfigEntry, ConfigSubentry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.json import json_bytes
 from homeassistant.helpers.storage import Store as HomeAssistantStore
@@ -21,6 +22,15 @@ from homeassistant.util import json as json_util
 from homeassistant.util.json import json_loads
 
 from .broker import BrokerKind
+from .const import (
+    CONF_HOST,
+    CONF_IDENTITY_FINGERPRINT,
+    CONF_PANEL,
+    CONF_ROOT_PASSWORD,
+    CONF_SSH_HOST_KEY,
+    DOMAIN,
+    SUBENTRY_TYPE_PANEL,
+)
 from .release_identity import RollbackBaseline
 from .shell import HostIdentity, PanelIdentityError, known_hosts_line
 
@@ -206,6 +216,7 @@ _JOURNAL_ERROR_CODES = frozenset(
         "journal_transaction_in_progress",
         "journal_transaction_mismatch",
         "journal_transaction_missing",
+        "owner_changed",
         "rollback_verification_required",
         "subentry_creation_not_proven",
     }
@@ -1004,6 +1015,76 @@ class ProvisioningRecord:
         )
 
 
+_PENDING_OWNER_KEYS = frozenset({"slug", "public_key", "fingerprint", "host", "root_password"})
+_JOURNAL_ENVELOPE_KEYS = (
+    frozenset({"record"}),
+    frozenset({"record", "pending_owner"}),
+    frozenset({"pending_owner"}),
+)
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _PendingOwner:
+    """Durable intent to move one verified panel owner. Stored only in the active journal."""
+
+    slug: str
+    public_key: str = field(repr=False)
+    fingerprint: str
+    host: str
+    root_password: str = field(repr=False)
+
+    def __post_init__(self) -> None:
+        identity_failed = False
+        identity: HostIdentity | None = None
+        try:
+            identity = HostIdentity(self.public_key, self.fingerprint)
+            known_hosts_line(self.host, identity.public_key)
+        except (PanelIdentityError, TypeError, ValueError):
+            identity_failed = True
+        if identity_failed or identity is None:
+            raise _invalid()
+        if not isinstance(self.slug, str) or _PANEL_SLUG.fullmatch(self.slug) is None:
+            raise _invalid()
+        object.__setattr__(self, "public_key", identity.public_key)
+        object.__setattr__(self, "fingerprint", identity.fingerprint)
+        object.__setattr__(self, "root_password", _secret_text(self.root_password))
+
+    def __repr__(self) -> str:
+        return "_PendingOwner(<redacted>)"
+
+    def _to_storage(self) -> dict[str, object]:
+        return {
+            "slug": self.slug,
+            "public_key": self.public_key,
+            "fingerprint": self.fingerprint,
+            "host": self.host,
+            "root_password": self.root_password,
+        }
+
+    @classmethod
+    def _from_storage(cls, raw: object) -> Self:
+        value = _exact_keys(raw, _PENDING_OWNER_KEYS)
+        return cls(
+            slug=_string(value["slug"]),
+            public_key=_string(value["public_key"]),
+            fingerprint=_string(value["fingerprint"]),
+            host=_string(value["host"]),
+            root_password=_string(value["root_password"]),
+        )
+
+
+def _pending_secrets(
+    record: ProvisioningRecord | None,
+    pending: _PendingOwner | None,
+) -> tuple[str, ...]:
+    found: list[str] = []
+    if record is not None:
+        found.extend(_storage_secrets(record))
+    if pending is not None:
+        found.extend((pending.root_password, pending.host, pending.public_key, pending.fingerprint))
+    return tuple(item for item in found if item)
+
+
 @dataclass(slots=True)
 class _JournalCoordinator:
     """One in-process transaction view shared by every flow for this HA instance."""
@@ -1011,6 +1092,7 @@ class _JournalCoordinator:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     loaded: bool = False
     record: ProvisioningRecord | None = None
+    pending_owner: _PendingOwner | None = None
     last_storage_error: str | None = None
 
 
@@ -1298,6 +1380,86 @@ def _record_at_host(record: ProvisioningRecord, host: str) -> ProvisioningRecord
     return replace(record, panel_request=replace(record.panel_request, host=host))
 
 
+def _record_at_owner(record: ProvisioningRecord, pending: _PendingOwner) -> ProvisioningRecord:
+    """Move the active journal onto the verified host and credential.
+
+    Retained rows never take this path: they stay password-free.
+    """
+    return replace(
+        record,
+        panel_request=replace(
+            record.panel_request,
+            host=pending.host,
+            root_password=pending.root_password,
+        ),
+    )
+
+
+def _config_owner_matches(data: Mapping[str, Any], pending: _PendingOwner) -> bool:
+    """Match a fleet pin, or a legacy key whose fingerprint was derived from it."""
+    if data.get(CONF_PANEL) != pending.slug or data.get(CONF_SSH_HOST_KEY) != pending.public_key:
+        return False
+    stored_fingerprint = data.get(CONF_IDENTITY_FINGERPRINT)
+    if isinstance(stored_fingerprint, str) and stored_fingerprint:
+        return stored_fingerprint == pending.fingerprint
+    return True
+
+
+def _matching_config_owner(
+    hass: HomeAssistant,
+    pending: _PendingOwner,
+) -> tuple[ConfigEntry[Any], ConfigSubentry | None, Mapping[str, Any]] | None:
+    """Return the single configuration owner of this verified panel, if it is unique."""
+    matches: list[tuple[ConfigEntry[Any], ConfigSubentry | None, Mapping[str, Any]]] = []
+    for entry in hass.config_entries.async_entries(DOMAIN):
+        panel_subentries = [
+            subentry
+            for subentry in entry.subentries.values()
+            if subentry.subentry_type == SUBENTRY_TYPE_PANEL
+        ]
+        if panel_subentries:
+            for subentry in panel_subentries:
+                if _config_owner_matches(subentry.data, pending):
+                    matches.append((entry, subentry, subentry.data))
+        elif _config_owner_matches(entry.data, pending):
+            matches.append((entry, None, entry.data))
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
+
+def _active_adoption_needed(record: ProvisioningRecord | None, pending: _PendingOwner) -> bool:
+    return (
+        record is not None
+        and _same_verified_panel(
+            record.panel_request,
+            slug=pending.slug,
+            public_key=pending.public_key,
+            fingerprint=pending.fingerprint,
+        )
+        and (
+            record.panel_request.host != pending.host
+            or record.panel_request.root_password != pending.root_password
+        )
+    )
+
+
+def _retained_adoption_needed(
+    records: Mapping[str, RetainedRollback],
+    pending: _PendingOwner,
+) -> bool:
+    return any(
+        _same_verified_panel(
+            retained.record.panel_request,
+            slug=pending.slug,
+            public_key=pending.public_key,
+            fingerprint=pending.fingerprint,
+        )
+        and retained.record.panel_request.host != pending.host
+        for retained in records.values()
+    )
+
+
 class ProvisioningJournal:
     """Serialize one provisioning transaction before every observable phase change."""
 
@@ -1325,6 +1487,7 @@ class ProvisioningJournal:
         """Load and strictly validate the single durable transaction."""
         async with self._coordinator.lock:
             await self._async_reload()
+            await self._async_apply_pending_owner(require_owner=False)
             return self._coordinator.record
 
     async def async_create(self, record: ProvisioningRecord) -> ProvisioningRecord:
@@ -1433,58 +1596,63 @@ class ProvisioningJournal:
         public_key: str,
         fingerprint: str,
         host: str,
+        expected_host: str,
+        expected_password: str,
+        root_password: str,
     ) -> None:
         """Point this panel's records at a host whose SSH pin was just verified.
 
         Ownership is the slug plus the pinned public key and fingerprint. A
         record for any other panel is left unchanged, including one that only
-        shares the previous address.
+        shares the previous address. The live configuration owner is re-read
+        under the journal lock and must still be *expected_host* and
+        *expected_password*; otherwise nothing is written. The active journal
+        receives *root_password*. Retained rows stay password-free.
+
+        The intent is saved before any host changes, so a crash between the
+        journal, the retained store, and the configuration owner is finished
+        by the next load.
         """
         async with self._coordinator.lock:
             await self._async_reload()
-            changed = 0
-            active = self._coordinator.record
-            if (
-                active is not None
-                and _same_verified_panel(
-                    active.panel_request,
+            await self._async_apply_pending_owner(require_owner=False)
+            if self._coordinator.pending_owner is not None:
+                raise ProvisioningJournalError("journal_save_failed")
+            owner = _matching_config_owner(
+                self._hass,
+                _PendingOwner(
                     slug=slug,
                     public_key=public_key,
                     fingerprint=fingerprint,
-                )
-                and active.panel_request.host != host
+                    host=host,
+                    root_password=root_password,
+                ),
+            )
+            if owner is None:
+                raise ProvisioningJournalError("owner_changed")
+            _entry, _subentry, data = owner
+            if (
+                data.get(CONF_HOST) != expected_host
+                or data.get(CONF_ROOT_PASSWORD) != expected_password
             ):
-                await self._async_save(_record_at_host(active, host))
-                changed += 1
-            records = await self._async_retained_load()
-            retained_changed = False
-            for key, retained in records.items():
-                request = retained.record.panel_request
-                if (
-                    not _same_verified_panel(
-                        request,
-                        slug=slug,
-                        public_key=public_key,
-                        fingerprint=fingerprint,
-                    )
-                    or request.host == host
-                ):
-                    continue
-                records[key] = replace(
-                    retained,
-                    record=_record_at_host(retained.record, host),
-                )
-                retained_changed = True
-                changed += 1
-            if retained_changed:
-                await self._async_retained_save(records)
-            if changed:
-                _LOGGER.info(
-                    "Retargeted %s provisioning record(s) for panel %s "
-                    "after a verified address change",
-                    changed,
-                    slug,
-                )
+                raise ProvisioningJournalError("owner_changed")
+            pending = _PendingOwner(
+                slug=slug,
+                public_key=public_key,
+                fingerprint=fingerprint,
+                host=host,
+                root_password=root_password,
+            )
+            retained = await self._async_retained_load()
+            # No active journal or retained row belongs to this panel. The
+            # configuration entry is the only durable owner, so update it directly.
+            if not _active_adoption_needed(
+                self._coordinator.record, pending
+            ) and not _retained_adoption_needed(retained, pending):
+                self._update_config_owner(owner, pending)
+                return
+            await self._async_persist(self._coordinator.record, pending)
+            await self._async_apply_pending_owner(require_owner=True)
 
     async def async_arm(self, record: ProvisioningRecord) -> None:
         async with self._coordinator.lock:
@@ -1779,48 +1947,132 @@ class ProvisioningJournal:
             raise ProvisioningJournalError("journal_load_failed")
         if raw is None:
             record = None
+            pending = None
         else:
             parse_failed = False
             record = None
+            pending = None
             try:
-                envelope = _exact_keys(raw, frozenset({"record"}))
-                record = ProvisioningRecord._from_storage(envelope["record"])
+                if frozenset(raw) not in _JOURNAL_ENVELOPE_KEYS:
+                    raise _invalid()
+                if "record" in raw:
+                    record = ProvisioningRecord._from_storage(raw["record"])
+                if "pending_owner" in raw:
+                    pending = _PendingOwner._from_storage(raw["pending_owner"])
             except ProvisioningJournalError:
                 raise
             except Exception:
                 parse_failed = True
-            if parse_failed or record is None:
+            if parse_failed or ("record" in raw and record is None):
                 raise _invalid()
         self._coordinator.record = record
+        self._coordinator.pending_owner = pending
         self._coordinator.loaded = True
 
-    async def _async_current(self, transaction_id: UUID) -> ProvisioningRecord:
-        candidate_id = _uuid4(transaction_id)
-        await self._async_reload()
-        record = self._coordinator.record
-        if record is None:
-            raise ProvisioningJournalError("journal_transaction_missing")
-        if record.transaction_id != candidate_id:
-            raise ProvisioningJournalError("journal_transaction_mismatch")
-        return record
+    async def _async_apply_pending_owner(self, *, require_owner: bool) -> None:
+        """Finish one interrupted verified-owner adoption, including configuration.
 
-    async def _async_save(self, record: ProvisioningRecord) -> None:
-        payload = {"record": record._to_storage()}
-        secrets = _storage_secrets(record)
-        _require_storage_round_trip(payload, self._coordinator, secrets, store="journal")
-        save_outcome = await _async_settle_storage(
-            self._hass,
-            self._store.async_save(payload),
+        The pending intent stays on disk until the active journal, the retained
+        rows, and the configuration owner all show it. Retained rows receive
+        only the host.
+        """
+        pending = self._coordinator.pending_owner
+        if pending is None:
+            return
+        owner = _matching_config_owner(self._hass, pending)
+        if owner is None:
+            if require_owner:
+                raise ProvisioningJournalError("journal_save_failed")
+            return
+        active = self._coordinator.record
+        if active is not None and _same_verified_panel(
+            active.panel_request,
+            slug=pending.slug,
+            public_key=pending.public_key,
+            fingerprint=pending.fingerprint,
+        ):
+            updated = _record_at_owner(active, pending)
+            if updated != active:
+                await self._async_save(updated)
+        records = await self._async_retained_load()
+        retained_changed = False
+        for key, retained in list(records.items()):
+            request = retained.record.panel_request
+            if (
+                not _same_verified_panel(
+                    request,
+                    slug=pending.slug,
+                    public_key=pending.public_key,
+                    fingerprint=pending.fingerprint,
+                )
+                or request.host == pending.host
+            ):
+                continue
+            records[key] = replace(retained, record=_record_at_host(retained.record, pending.host))
+            retained_changed = True
+        if retained_changed:
+            await self._async_retained_save(
+                records,
+                secrets=(
+                    pending.root_password,
+                    pending.host,
+                    pending.public_key,
+                    pending.fingerprint,
+                ),
+            )
+        self._update_config_owner(owner, pending)
+        await self._async_persist(self._coordinator.record, None)
+        _LOGGER.info(
+            "Retargeted provisioning records for panel %s after a verified address change",
+            pending.slug,
         )
+
+    def _update_config_owner(
+        self,
+        owner: tuple[ConfigEntry[Any], ConfigSubentry | None, Mapping[str, Any]],
+        pending: _PendingOwner,
+    ) -> None:
+        entry, subentry, data = owner
+        if (
+            data.get(CONF_HOST) == pending.host
+            and data.get(CONF_ROOT_PASSWORD) == pending.root_password
+        ):
+            return
+        updated = {**data, CONF_HOST: pending.host, CONF_ROOT_PASSWORD: pending.root_password}
+        try:
+            if subentry is None:
+                self._hass.config_entries.async_update_entry(entry, data=updated)
+            else:
+                self._hass.config_entries.async_update_subentry(entry, subentry, data=updated)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            raise ProvisioningJournalError("journal_save_failed") from None
+
+    async def _async_persist(
+        self,
+        record: ProvisioningRecord | None,
+        pending: _PendingOwner | None,
+    ) -> None:
+        """Write the journal envelope, or remove it when both parts are gone."""
+        if record is None and pending is None:
+            await self._async_remove()
+            self._coordinator.pending_owner = None
+            return
+        payload: dict[str, object] = {}
+        if record is not None:
+            payload["record"] = record._to_storage()
+        if pending is not None:
+            payload["pending_owner"] = pending._to_storage()
+        secrets = _pending_secrets(record, pending)
+        _require_storage_round_trip(payload, self._coordinator, secrets, store="journal")
+        save_outcome = await _async_settle_storage(self._hass, self._store.async_save(payload))
         cancellation = save_outcome.cancellation
         failure = save_outcome.error
         del save_outcome
         mismatch = False
         if failure is None:
-            verification = await _async_settle_storage(
-                self._hass,
-                self._store.async_load(),
-            )
+            verification = await _async_settle_storage(self._hass, self._store.async_load())
             if cancellation is None:
                 cancellation = verification.cancellation
             if verification.error is not None:
@@ -1835,10 +2087,24 @@ class ProvisioningJournal:
                 failure = StorageFailure("read-back did not match the written provisioning journal")
             _raise_storage_failure(self._coordinator, failure, secrets, store="journal")
         self._coordinator.record = record
+        self._coordinator.pending_owner = pending
         self._coordinator.loaded = True
         self._coordinator.last_storage_error = None
         if cancellation is not None:
             raise cancellation from None
+
+    async def _async_current(self, transaction_id: UUID) -> ProvisioningRecord:
+        candidate_id = _uuid4(transaction_id)
+        await self._async_reload()
+        record = self._coordinator.record
+        if record is None:
+            raise ProvisioningJournalError("journal_transaction_missing")
+        if record.transaction_id != candidate_id:
+            raise ProvisioningJournalError("journal_transaction_mismatch")
+        return record
+
+    async def _async_save(self, record: ProvisioningRecord) -> None:
+        await self._async_persist(record, self._coordinator.pending_owner)
 
     async def _async_remove(self) -> None:
         remove_outcome = await _async_settle_storage(
@@ -1863,6 +2129,7 @@ class ProvisioningJournal:
                 raise cancellation from None
             raise ProvisioningJournalError("journal_remove_failed")
         self._coordinator.record = None
+        self._coordinator.pending_owner = None
         self._coordinator.loaded = True
         if cancellation is not None:
             raise cancellation from None

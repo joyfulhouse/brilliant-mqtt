@@ -276,6 +276,18 @@ def known_hosts_line(host: str, public_key: str) -> str:
     return f"{_validate_host(host)} {_canonical_public_key(public_key)}\n"
 
 
+def validated_public_key_fingerprint(public_key: str) -> str:
+    """Return the SHA-256 fingerprint of one validated, comment-free public key."""
+    canonical = _canonical_public_key(public_key)
+    try:
+        fingerprint = asyncssh.import_public_key(canonical).get_fingerprint("sha256")
+    except Exception:
+        raise PanelIdentityError("host_key_fingerprint_invalid") from None
+    if not isinstance(fingerprint, str) or not fingerprint:
+        raise PanelIdentityError("host_key_fingerprint_invalid")
+    return fingerprint
+
+
 def _pinned_host_key_algorithms(public_key: str) -> tuple[str, ...]:
     """Return only SHA-2-safe algorithms backed by one canonical key pin."""
     algorithm = _canonical_public_key(public_key).partition(" ")[0]

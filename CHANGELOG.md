@@ -112,6 +112,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when the slug and pinned SSH identity still match. A different slug or SSH
   identity is still refused. `baseline_owner_mismatch` is shown and logged
   instead of the generic `canary_operation_failed`.
+- A version-3 panel that stored an SSH host key and no fingerprint can still
+  finalize or roll back when that key matches the baseline. A different key is
+  refused. An interrupted verified address or credential change is completed
+  from its saved intent on the next load, so the active journal, retained
+  baseline, and panel configuration stay on one owner. A stale canary or an
+  older repair cannot overwrite a newer verified host or password. Retained
+  baselines stay password-free.
 
 ## [0.12.2] - 2026-11-17
 

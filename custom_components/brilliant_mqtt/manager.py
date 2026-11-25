@@ -112,6 +112,7 @@ from .shell import (
     PanelIdentityError,
     PanelShell,
     _LegacyAsyncsshShell,
+    validated_public_key_fingerprint,
 )
 from .voice_payload import VoicePayloadError, async_fetch_voice_payload
 
@@ -497,6 +498,24 @@ _RELAY_CONTEXT_SUFFIX = {
     "refresh": "refresh failed; will retry next reconcile",
     "update": "update failed",
 }
+
+
+def _resolved_owner_fingerprint(data: Mapping[str, Any]) -> str | None:
+    """Use a stored fleet pin, or derive one from a validated legacy host key.
+
+    A non-empty ``identity_fingerprint`` is strict. Version-3 entries have only
+    ``ssh_host_key``; their fingerprint is the validated key's SHA-256 pin.
+    """
+    stored = data.get(CONF_IDENTITY_FINGERPRINT)
+    if isinstance(stored, str) and stored:
+        return stored
+    key = data.get(DATA_SSH_HOST_KEY)
+    if not isinstance(key, str) or not key:
+        return None
+    try:
+        return validated_public_key_fingerprint(key)
+    except PanelIdentityError:
+        return None
 
 
 class PanelManager:
@@ -1799,42 +1818,59 @@ class PanelManager:
     async def async_canary_operation(self, operation: str, name: str) -> None:
         """Bind an explicitly named rollback/finalization to this one panel owner."""
         from .fleet_manager import _get_recovery_provisioner
-        from .provisioning_journal import ProvisioningJournal
 
         try:
             transaction = UUID(name)
             journal = ProvisioningJournal(self.hass)
-            retained = await journal.async_retained(transaction)
-            if retained is None:
-                raise _CanaryOperationError("baseline_missing")
-            request = retained.record.panel_request
-            pinned_key = self.store.data.get(DATA_SSH_HOST_KEY)
-            pinned_fingerprint = self.store.data.get(CONF_IDENTITY_FINGERPRINT)
-            host = str(self.store.data[CONF_HOST])
-            if (
-                request.slug != self.panel
-                or request.public_key != pinned_key
-                or request.fingerprint != pinned_fingerprint
-            ):
-                raise _CanaryOperationError("baseline_owner_mismatch")
-            # A verified address change keeps the pin and slug. The retained
-            # capture may still name the previous host; point it at the current
-            # subentry before SSH and credential lookup.
-            if request.host != host:
-                await journal.async_adopt_verified_host(
-                    slug=self.panel,
-                    public_key=str(pinned_key),
-                    fingerprint=str(pinned_fingerprint),
-                    host=host,
-                )
+            adopted = False
+            for _attempt in range(2):
                 retained = await journal.async_retained(transaction)
+                if retained is None:
+                    raise _CanaryOperationError("baseline_missing")
+                request = retained.record.panel_request
+                pinned_key = self.store.data.get(DATA_SSH_HOST_KEY)
+                fingerprint = _resolved_owner_fingerprint(self.store.data)
+                host = self.store.data.get(CONF_HOST)
+                password = self.store.data.get(CONF_ROOT_PASSWORD)
                 if (
-                    retained is None
-                    or retained.record.panel_request.host != host
-                    or retained.record.panel_request.slug != self.panel
-                    or retained.record.panel_request.public_key != pinned_key
+                    not isinstance(pinned_key, str)
+                    or not isinstance(host, str)
+                    or not isinstance(password, str)
+                    or fingerprint is None
+                    or request.slug != self.panel
+                    or request.public_key != pinned_key
+                    or request.fingerprint != fingerprint
                 ):
                     raise _CanaryOperationError("baseline_owner_mismatch")
+                # Re-read the live owner under the journal lock. A stale snapshot
+                # must not retarget a newer verified address.
+                try:
+                    await journal.async_adopt_verified_host(
+                        slug=self.panel,
+                        public_key=pinned_key,
+                        fingerprint=fingerprint,
+                        host=host,
+                        expected_host=host,
+                        expected_password=password,
+                        root_password=password,
+                    )
+                except ProvisioningJournalError as error:
+                    if error.code != "owner_changed":
+                        raise
+                    continue
+                retained = await journal.async_retained(transaction)
+                live_host = self.store.data.get(CONF_HOST)
+                if (
+                    retained is not None
+                    and retained.record.panel_request.host == live_host
+                    and retained.record.panel_request.slug == self.panel
+                    and retained.record.panel_request.public_key == pinned_key
+                    and retained.record.panel_request.fingerprint == fingerprint
+                ):
+                    adopted = True
+                    break
+            if not adopted:
+                raise _CanaryOperationError("baseline_owner_mismatch")
             provisioner = _get_recovery_provisioner(self.hass)
             if operation == "rollback":
                 await provisioner.async_rollback(transaction)
