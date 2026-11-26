@@ -93,6 +93,31 @@ class CaptureProvenance:
     issued_values: tuple[tuple[str, str], ...] = ()
 
 
+@dataclass(frozen=True)
+class PrimitiveField:
+    """Frozen native scalar, shareable without materializing a Variable."""
+
+    name: str
+    value: str
+    externally_settable: bool = False
+    timestamp_ms: int | None = None
+
+
+@dataclass(frozen=True)
+class PrimitiveCapture:
+    """One peripheral's frozen fields and sanitized native reporting mask.
+
+    A partial mirror can contain copied fields: only ``reported``/``removed``
+    are evidence. A reliable complete read also proves omitted fields absent.
+    """
+
+    fields: tuple[PrimitiveField, ...]
+    complete: bool = True
+    reliable: bool = True
+    reported: frozenset[str] = frozenset()
+    removed: frozenset[str] = frozenset()
+
+
 @dataclass
 class BrilliantDevice:
     """Normalized representation of one load/sensor peripheral on a Brilliant panel."""
