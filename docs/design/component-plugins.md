@@ -421,7 +421,14 @@ fresh boot baseline, consent/session checks and handoff grant new ownership.
 Unknown boot identity blocks handoff; never infer it from firmware version.
 
 An originally masked/inactive service is a valid restored state and does not
-require a running health signal. Conflicting live operator changes, missing
+require a running health signal. Service restoration never replays old privacy
+or consent values over a newer denial. Persist current denies separately from
+the rollback snapshot and enforce them for stock as well as plugin capture.
+If the adapter cannot restore a stock service without reopening denied capture,
+keep that optional function stopped/fenced, report `recovery_required`, and
+preserve the exact baseline for resolution; do not call that exact restoration.
+Qualify denial followed by plugin failure/disable/OTA, not only plugin teardown.
+Conflicting live operator changes, missing
 baseline or failed restore produce `recovery_required`, persistent HA Repair,
 and no further automatic mutation. Preserve private journals/artifacts; do not
 claim rollback because the candidate stopped. Topic cleanup or provider token
