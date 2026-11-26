@@ -65,6 +65,7 @@ Proposed boundaries:
 | `mesh_settlement.py` (new) | Typed events, slot, pure synchronous transition logic, renderer and effect tokens. |
 | `bus.py` | Loop-confined provenance allocation and immediate synchronous ingress for normalized captures, generation changes and native outcomes. Sole panel-library boundary. |
 | `write_admission.py` | Ticket outcome replay and callbacks; identity remains separate from command replacement identity. |
+| `mqttio.py` | Capture opaque owner references at local command ingress; retain them through queues/coalescing and reject cross-owner folds. |
 | `model.py`, `protocols.py` | Immutable provenance and narrow synchronous ingress contracts; no panel types. |
 | `bridge.py` | Slot lifecycle, command translation, timers, bounded publication worker and independent discovery/subscription repair. |
 | `__main__.py` | Consume a latched mesh-fatal condition in the existing coordinator tick and rebuild the session with existing teardown/backoff. |
@@ -77,6 +78,17 @@ mesh observation without valid provenance is rejected as evidence and cannot
 silently become a fresh confirmation.
 
 ## Event envelope and ingress ordering
+
+Use one owner object as the lifetime identity. Acquisition, retyping/removal or
+source-generation replacement permanently revokes the old object; a current
+binding gets a new one. The same reference follows a queued MQTT command,
+admission ticket and effects. Historical references to a lease/binding token
+mean this object, not additional stamp classes or independent epoch counters.
+Its birth sequence and unknown-state barrier use the event envelope's existing
+sequence. Keep one current-command ID alongside the existing ticket identity
+for folds; use the originating timeout/return event sequence for a window,
+plus one render revision for debt.
+Do not build another general lease/permit framework.
 
 Every event carries `source`, `generation`, `sequence`, `captured_at` (monotonic),
 and peripheral identity. Native events also carry the immutable command ID and
@@ -133,9 +145,9 @@ refresh unrelated target evidence. Async callbacks may request publication or
 metadata repair but must not reduce the same capture twice. Standby sink scope
 remains closed. Acquisition installs its sink before its first existing read.
 
-Every acquisition and binding replacement reserves a never-reused capture floor
-from the shared allocator. A full read keeps its read-start registration token;
-sink delivery validates that token and the floor before slot creation, motion
+Every acquisition and binding replacement creates a new owner with its event
+sequence as a birth floor. Sink delivery checks source/generation and this
+floor before slot creation, motion
 history, inventory/routing contribution or field merging. Thus a read started
 in lease A cannot finish into lease B on the same bus generation, even before
 B's first read finishes. Metadata freshness and inventory deletion have their
@@ -158,11 +170,22 @@ newer admitted inventory/explicit creation event; stale async state callbacks
 cannot create slots or routes.
 
 Successful full-device reads also emit an immutable `Inventory` event with
-read-start provenance, registration, successful/complete scope and returned
+read-start provenance, successful/complete scope and returned
 peripheral IDs, including an empty inventory. It is delivered synchronously
 even when no per-peripheral capture exists. A successful scoped
 `get_peripheral() -> None` emits `PeripheralAbsent` at its read-start boundary.
 A failed, timed-out, partial or out-of-scope read emits no absence inference.
+
+Read result shapes have explicit semantics. A well-formed device with an empty
+peripheral mapping is a successful complete empty inventory. Successful
+`get_device("ble_mesh") -> None` is ambiguous parent disappearance: emit
+`ScopeUnknown` at read start, invalidate unshadowed pre-boundary primary
+validity/matching evidence, and retain bindings/routes for existing repair.
+An incomplete object such as `peripherals=None` takes the same evidence-neutral
+topology path with a bounded diagnostic, never an authoritative empty inventory.
+Transport exception/timeout has no inventory/absence contribution. ScopeUnknown
+does not replace newer explicit target evidence; it cannot cause a target echo
+from older evidence. Test all four shapes through actual `get_all()`.
 
 For each owned peripheral missing from a complete inventory, reduce versioned
 absence for its fields and primary-confirmation evidence, subject to each
@@ -220,6 +243,19 @@ recovery with unchanged leadership.
 
 ### Folded command admission
 
+The MQTT reader captures the current owner reference for each mesh command
+callback before its first deferred transport/lane queue. The owner already
+contains its source incarnation/generation and binding; no separate ingress
+permit is minted. A currently unowned mesh topic is rejected, not saved for
+later route reuse. Preserve the reference through bounded queues and field
+coalescing; different owners cannot merge or fold even at the same topic.
+At dequeue, the bridge checks that original owner is still current/live before
+translation and at admission. It cannot replace it with today's route owner.
+Thus old intent A queued across same-topic remove/recreate or withdraw/acquire
+cannot become a valid write under B. Already-authorized native work remains
+subject to the existing nonpreemption/lock rule. Other command consumers keep
+their existing behavior; the MQTT layer treats owner references as opaque.
+
 A successful latest-command fold is the ownership-transfer boundary, not the
 later re-entry of the MQTT lane into the bridge. The synchronous fold hook
 validates the current lease/binding and translates the newest payload. If
@@ -229,14 +265,53 @@ before a released device lock can issue the replacement. Failed folds transfer
 nothing. Re-handling adopts this command ID/window; it cannot begin another
 window or discard a contradiction that arrived before waiter resumption.
 
-On retranslation after retyping or a `TicketAdoptionError`, revoke the old
-association/listener and tombstone its waiting admission before installing a
-fresh ticket/command ID for current targets. An already-issued stale write
+Retyping revokes the owner, so queued old intent is rejected rather than
+retranslated against its successor. On a `TicketAdoptionError` while the same
+owner remains live, revoke the old association/listener and tombstone its
+waiting admission before installing a fresh ticket/command ID for current
+targets. An already-issued stale write
 retains its native lock and may finish; it cannot settle the fresh command.
 Cancellation before issue tombstones admission without starting an unknown
 window or publishing native failure. Withdrawal cancels waiting tickets before
 joining cleanup. Test the production MQTT lane folding B into waiting A, B
 issuing/returning and a real contradiction before B's re-handler resumes.
+
+### Native issue authorization and detached callers
+
+Every mesh primary, auxiliary and maintenance ticket retains that same owner
+reference. Under the existing device lock, immediately before native issue,
+require it to remain current/live and its generation to equal the adapter's.
+A mesh issue-sink exception revokes the owner and prevents the RPC; logging then
+proceeding is forbidden. Preserve other consumers' existing best-effort issue
+notification behavior. This is an owner check, not a second permit object.
+
+Prepare the loop-owned issue event without an await; then check the owner
+and mark native work authorized under the same session/generation lock
+used by the processor hook. No user callback runs while holding that thread
+lock. A hook that wins first denies/tombstones the waiting admission before any
+native call. Authorization that wins first is the native-issue linearization
+point: it is now issued work, retains the device lock and cannot be retracted
+by a later hook, even if transport bytes have not yet left. Call the RPC with
+no intervening await or fallible mesh sink after this commit. If preparation
+succeeds but the generation changes before commit, reduce pre-issue revocation
+instead of sending. This closes the foreign-hook/lock-acquisition gap without
+holding a thread lock across a native await.
+
+An issued command worker cancellation is deliberately fail-closed: abandon its
+intent, clear targets/deadline, and mark the load unconfirmed/null immediately.
+The native RPC and device lock continue; keep only its completion listener.
+Pre-return mirror values cannot release this unknown hold. Real native return
+sets the existing unknown-state barrier to its return sequence; the next
+trusted primary capture beyond it can resume ordinary state. Do not rearm or
+confirm this abandoned command, and do not fabricate a native cancellation or
+failure. A newer explicit command may replace it normally. This intentional
+policy for an abandoned caller avoids another independently owned five-second
+timer. It is a deliberate conservative trade-off: the user sees `unknown`
+state until the next trusted primary capture after real native completion,
+even if that native request ultimately succeeded. Ordinary caller timeout retains its existing five-second deadline and
+late-acceptance full-window behavior; it is not abandonment. Test cancellation
+at t=1, contrary capture t=6 and native success t=7: stay unconfirmed/unknown
+through return, then recover from a genuinely later existing read/push.
 
 ## State, identities and invariants
 
@@ -322,28 +397,31 @@ issue fence; it adds no requested phase to the wire contract and creates no nati
 | Validated newest command, active lease | Increment command ID, retire old window, enter `ISSUING`; wire `superseded` if replacing tracked feedback, otherwise `idle`; no new await or feedback publish before normal native admission. |
 | Native issue for current ticket | Record issue fence and actual targets; remain `ISSUING`. Admission waiting/supersession does not fabricate a native issue. |
 | Caller timeout while native unresolved | `UNRESOLVED`; wire `pending`, primary unknown; arm original 80-second deadline from timeout, fixed once. Observations update auxiliary/current observed state but cannot settle this request. |
-| Current native acceptance, before or after caller timeout | `ACCEPTED`; wire `pending`, primary unknown; record native-return fence/receipt; clear pre-acceptance matching evidence; arm a fresh 80-second window from actual return capture time, never callback delivery time. Replace any unresolved timer. |
+| Current non-abandoned native acceptance, before or after caller timeout | `ACCEPTED`; wire `pending`, primary unknown; record native-return fence/receipt; clear pre-acceptance matching evidence; arm a fresh 80-second window from actual return capture time, never callback delivery time. Replace any unresolved timer and all prior-window terminal/ordinary obligations, even for the same command ID; synchronously revoke its in-flight pending or terminal child. |
 | Caller timeout after known acceptance/rejection | Ignore; native outcome already owns the phase and receipt. |
-| Current native rejection | `TERMINAL/failed`, clear request/deadlines/evidence, retire timer, render latest observation. Works after caller detaches and after unresolved expiry. |
-| Native timeout or non-teardown cancellation after issue, without acceptance | Enter `INCONCLUSIVE`; keep existing unresolved deadline if present; otherwise arm the original 80-second window at outcome capture time. Record its native-return fence; clear pre-return evidence without rearming the deadline. Post-fence target contradiction yields `contradicted`. Fresh post-fence matches may confirm only at expiry, preserving #232's settled native-timeout observation contract; no acceptance receipt or physical-success claim is invented. |
+| Current non-abandoned native rejection | `TERMINAL/failed`, clear request/deadlines/evidence, retire timer, render latest observation. Works after ordinary caller timeout and after unresolved expiry. |
+| Native timeout or non-teardown cancellation actually ends a non-abandoned native operation, without acceptance | Enter `INCONCLUSIVE`; keep existing unresolved deadline if present; otherwise arm the original 80-second window at outcome capture time. Record its native-return fence; clear pre-return evidence without rearming the deadline. Post-fence target contradiction yields `contradicted`. Fresh post-fence matches may confirm only at expiry, preserving #232's settled native-timeout observation contract; no acceptance receipt or physical-success claim is invented. |
 | Cancellation/rejection of a never-issued waiting admission | Tombstone its ticket, revoke the association and return to quiet/superseded as appropriate; no native failure or unknown-outcome window. |
+| Command worker canceled after issue, without withdrawal | Abandon the intent and publish unconfirmed/null; keep the native lock/completion listener. No new timeout handle, native-return fence or rearmed request. Real completion then a later trusted primary capture can release the hold. Ordinary five-second caller timeout is a different event. |
+| Real native completion for abandoned intent | Set its unknown-state barrier to the return sequence only if that abandoned hold is still current. Keep unconfirmed/null until later trusted primary evidence; never rearm, confirm or replace a newer command. |
 | Teardown cancellation | Withdrawal semantics; never a failure publish from the old lease. |
 | Eligible matching observation in `ACCEPTED` or `INCONCLUSIVE`, captured strictly before deadline | Store latest observed fields and target evidence. Remain pending until expiry; no optimistic echo. Each target needs post-fence evidence, all current and fresh. |
 | Eligible target contradiction in `ACCEPTED` or `INCONCLUSIVE` | `TERMINAL/contradicted`, revoke matching evidence/timer and render latest native state, including when delivered at/after deadline. |
 | Complete observation missing any required target in `ACCEPTED` or `INCONCLUSIVE` | Clear matching eligibility, primary unknown where absent; remain pending until expiry. Missing is not an implicit OFF or a match. |
 | Partial observation omitting a target in `ACCEPTED` or `INCONCLUSIVE` | Preserve that target's evidence and its original age; absence does not refresh it. Explicit removal clears it. |
 | Pre-acceptance or old-generation observation | Cannot affect accepted-request evidence; old-generation or per-field out-of-order fields cannot replace current observed state. Current-generation pre-fence fields may update ordinary observed/auxiliary fields while primary remains held unknown. |
-| Current expiry in `UNRESOLVED` | `TERMINAL/unconfirmed`, primary unknown, clear request/deadlines; retain unresolved ticket identity so a later current acceptance can start its fresh window or rejection can publish failed. |
-| Current expiry in `ACCEPTED` or `INCONCLUSIVE` | `QUIET/idle` with observed primary only if every requested target has fresh, post-return-fence, same-generation matching evidence captured strictly before deadline, and no newer contrary/missing evidence. Otherwise `TERMINAL/unconfirmed`, primary unknown. Clear window in either case. Never manufacture target values for an echo. A settled inconclusive ticket cannot acquire a second native outcome. |
+| Current expiry in `UNRESOLVED` | `TERMINAL/unconfirmed`, primary unknown, clear request/deadlines; revoke the old pending child. Retain unresolved ticket identity so a later current acceptance can start its fresh window or rejection can publish failed. |
+| Current expiry in `ACCEPTED` or `INCONCLUSIVE` | `QUIET/idle` with observed primary only if every requested target has fresh, post-return-fence, same-generation matching evidence captured strictly before deadline, and no newer contrary/missing evidence. Otherwise `TERMINAL/unconfirmed`, primary unknown. Clear window and revoke its pending child in either case, including successful idle expiry. Never manufacture target values for an echo. A settled inconclusive ticket cannot acquire a second native outcome. |
 | Current observation in `QUIET` or `TERMINAL` | Merge eligible fields independently. Releasing an unknown hold requires explicit primary/required-target evidence captured after retirement, in the active epoch/generation/lease. Auxiliary-only captures cannot unmask cached `on`. Terminal publication debt precedes later idle debt. An unresolved expired ticket remains outcome-eligible until superseded, generation/binding change or withdrawal. |
 | Generation invalidation, any active phase | Immediately clear request, receipt, all confirmation evidence, primary validity, motion history and window; revoke old command outcomes and effects; reserve retirement floor; enter `TERMINAL/unconfirmed`, primary unknown. Fresh explicit new-generation primary evidence can resume ordinary idle state. Never reissue the write. |
 | Peripheral removal or retyping/rebinding | Revoke old binding, ticket and effects, reserve new binding floor and update desired routing membership. Removal drops the old slot after cleanup; retyping starts from admitted current metadata. Delayed old reads cannot recreate it. |
 | Successful complete inventory omits peripheral, or scoped lookup returns None | Reduce per-field absence at the read boundary; clear unshadowed target match/primary validity even without a device capture. If binding is truly absent, retire request/timer and old effects, publish only its owned unknown absence obligation, then remove after bounded routing/config cleanup. Failed/partial/out-of-scope reads are not absence. |
+| Successful missing parent or incomplete parent object | `ScopeUnknown` invalidates unshadowed pre-boundary primary/matching eligibility; retain topology/routes, no destructive cleanup. A newer explicit field wins; transport failure has no absence contribution. |
 | Auxiliary/maintenance issue/outcome | Update only current per-field association/projection as specified above; never transition the primary request, evidence or deadline. Caller echo has no state-changing transition. |
 | Replacement, superseded waiter, duplicate outcome, old timer or old effect | Only a validated new command replaces ownership. Other stale IDs/tokens are no-ops; they cannot arm a window or publish. |
 | Publication accepted/failed | Exact ordinary revision acknowledgment clears only its debt; exact current terminal-obligation acknowledgment releases its latch, leaving newer ordinary debt. Failure retains bounded debt for existing retry triggers. Neither result changes native outcome, evidence or deadline. |
 | Routing/discovery completion | Commit only current desired binding/membership, or retain current repair debt; never mutate write evidence or cancel current ownership because an older repair completed. |
-| Wrong incarnation, registration, acquisition/binding floor or stale hook | Ignore before slot creation, derivation, inventory contribution or effect admission. A valid field from an otherwise admitted capture still uses its own watermark. |
+| Wrong incarnation/owner, pre-birth capture or stale hook | Ignore before slot creation, derivation, inventory contribution or effect admission. A valid field from an otherwise admitted capture still uses its own watermark. |
 | Synchronous ingress failure or noncooperative effect past teardown bound | Revoke write/state-effect admission, retire confirmation ownership and latch session-fatal recovery. Coordinator rebuilds; healthy bus/MQTT/election cannot suppress recovery. |
 | Withdraw/shutdown | `INACTIVE`, revoke lease/tickets/deadlines/debt synchronously; cancel and join bounded workers separately; publish no shared terminal clear/offline message. |
 
@@ -394,32 +472,44 @@ update a second payload cache. On failure retain only the current bounded
 obligations. Retry on existing change/reconcile/session-recovery triggers; do
 not add a tight retry loop.
 
-Supersession, contradiction, generation/binding invalidation and withdrawal
-revoke a stale in-flight effect and request cancellation of its publish child
-task synchronously, before the command or capture returns. The single lane
-worker joins that child before any new publish. A fake transport blocked before
+Every window replacement or end revokes the previous window's in-flight effect:
+new acceptance (including same-command late acceptance), every expiry
+(including successful `QUIET/idle`), supersession, contradiction, abandonment,
+generation/binding invalidation and withdrawal. Replace old-window ordinary and
+terminal debt with the transition's current debt and request cancellation of
+the obsolete publish child synchronously, before dispatch returns. This rule
+does not cancel a current terminal obligation for an ordinary field update.
+The single lane worker joins that child before any new publish. A fake transport blocked before
 handoff must observe cancellation before its release gate opens, and must never
 send the old requested value afterward. This preserves both the cancellation
 and wire assertions in #232's
 `test_adapter_rearm_publish_stays_cancellable[supersede]` and the separate
 withdrawal case. Revocation does not await this join before native admission.
 There is one worker and at most one publish child per peripheral, regardless
-of replacement rate. A noncooperative child hits a bounded teardown limit and
-latches session-fatal recovery; do not start a competing lane on that client.
+of replacement rate. Reuse the existing one-second worker-settle bound
+(`_SHUTDOWN_WORKER_SETTLE_S`) for this join, using a bounded wait even if the
+child suppresses cancellation. Failure to settle latches session-fatal recovery
+through existing bounded teardown; do not start a competing lane on that client.
 
 A single lane prevents an old pending publish from completing *after* a newer
 terminal publish to the same topic: the newer publish waits for completion or
 joined cancellation. Internal expiry still occurs at the fixed monotonic
-deadline while MQTT is blocked. Its terminal transition revokes stale pending
-publication without waiting for the broker. An obsolete ack releases only its
-own in-flight bookkeeping, then the worker sends current terminal/current debt.
+deadline while MQTT is blocked. Every expiry revokes stale pending publication
+without waiting for the broker, whether its result is unconfirmed or idle.
+An obsolete ack releases only its own in-flight bookkeeping, then the worker
+sends current terminal/current debt. A late acceptance similarly cannot leave
+the lane blocked behind the previous unresolved window's earlier wire deadline.
 
 Terminal status for the current command/window is latched until an attempt
 with that exact obligation is accepted by MQTT. Ordinary subsequent observations
 may update fields but cannot replace this terminal status with idle before that
 attempt; latest ordinary state follows it. A newer terminal for the same command
 replaces the older terminal reason, and a new command, removal or withdrawal
-revokes the previous command's obligation. This bounds memory and does not
+revokes the previous command's obligation. A new window of the same command,
+including late acceptance after unresolved expiry, also revokes the old
+window's obligation and cancels/joins its stale pre-handoff child. Window ID is
+part of every obligation/ack token. Ordinary observations in an unchanged
+terminal window preserve the latch. This bounds memory and does not
 promise delivery of every transient reason or feedback from superseded
 commands. Tests block the lane, contradict and then observe, and require a
 current terminal attempt before eventual ordinary idle state.
@@ -432,6 +522,10 @@ clear those newer fields' publication debt. A replaced terminal obligation,
 command or lease makes the old obligation ack ineligible. Ordinary publication
 debt still clears only for its exact render revision. This separation prevents
 an auxiliary stream from starving terminal delivery or losing newer state.
+Render a terminal obligation with its own reason/mask plus eligible current
+auxiliary fields: `unconfirmed` always has null primary. It cannot borrow an
+idle projection's known primary while waiting for its attempt. A stale prior-
+window terminal ack cannot release the new pending window's debt or deadline.
 
 Tokens cannot retract a PUBLISH already handed to a broker. An old in-flight
 document can temporarily reach the broker before the latest one; wire deadline
@@ -487,13 +581,47 @@ workers after revocation/join; tombstones are bounded by active work rather
 than every ID ever seen. Sequence counters consume constant object count.
 Active slots plus retired cleanup records share a fixed internal ceiling of
 256 per mesh bridge, including pending topic operations derived from those
-records. Check before allocation; exceeding the ceiling immediately closes
-mesh ingress/admission and latches existing session recovery/backoff. Do not
-retain another retired slot or spawn another cleanup worker to handle overflow.
-This is a fail-closed resource guard, with the documented 40-peripheral mesh
-well below it, not a claim that arbitrary inventory churn can be delivered
-losslessly while the broker is unavailable. Test churn with a blocked broker
-through the ceiling, not just repeated commands for one peripheral.
+records. Check before allocation, and preflight complete inventory capacity
+before field/slot creation. Exceeding the ceiling closes mesh state/command
+admission with one disabled flag;
+capacity alone must not tear down the shared healthy bus/MQTT sessions or
+interrupt the wired bridge. Keep only counts, mode and bounded admitted/cleanup
+records, never another slot/worker for overflow. Log flag changes with bounded
+diagnostics, not on every notification.
+Revoke existing mesh owners/tickets and confirmation windows synchronously;
+cancel/join their old effects and use only the bounded admitted records to
+publish unconfirmed/null and finish route cleanup. Capacity cannot leave an
+old command eligible to issue or an old match eligible to confirm.
+
+The same stable oversized topology stays disabled across ordinary ticks and
+elections. Capacity never requests a shared session rebuild; an unrelated
+rebuild simply preflights capacity again. Re-enable only when an existing
+successful complete inventory plus retained cleanup fits the ceiling,
+creating current owners from that admitted inventory. The inventory control
+path remains enabled while mesh state/command admission is disabled; it only
+counts/preflights before allocating owners. Otherwise keep the flag
+disabled. No persistent circuit, retry counter or new polling is needed.
+Noncooperative transport/actual sink failures remain separate fatal recovery
+cases. Test a stable 257-binding inventory over many ticks/resyncs: no repeated
+rebuild/acquisition attempts, no mesh writes, wired commands/publishes continue.
+Also test recovery from a newer fitting inventory.
+
+The documented 40-peripheral mesh is a sample, not a protocol limit. This guard
+does not promise lossless arbitrary inventory churn behind an unavailable
+broker. Test blocked-broker churn through the ceiling and repeated successful
+create/write/remove cycles in one generation.
+
+Adapter/compatibility metadata follows the same lifetime accounting. Mesh uses
+its slot field watermarks and issue/return sequences, so mesh writes/captures
+must not allocate or scan `_field_eras` at all. Skip this unused bookkeeping
+for mesh writes/captures; leave wired/privacy era behavior unchanged. The mesh acquisition,
+binding and topology floors provide ABA protection for delayed reads after
+mesh-era retirement. On completed removal, drop materialized `_devices` views,
+payload/field caches, command-generation associations and unused topic-repair
+entries as well as reducer slots. Keep lifecycle/binding identities globally
+unique instead of retaining a counter for every old peripheral ID. Tests count
+adapter keys, scan work and compatibility maps through successful churn; a
+small live-slot count alone is insufficient evidence of bounded work.
 
 Cost is O(fields in the admitted capture/command) per event; reconnect is
 O(current slots) once per reconnect. Use existing normalized/frozen captures
@@ -550,6 +678,15 @@ historical #232 port:
 | Never-issued cancellation, waiting withdrawal, 40-peripheral notification storm and blocked MQTT | No spurious unknown/failure window, waiting RPC tombstoned, baseline read counts, bounded tasks and normalization/render work. |
 | Successful full inventory omits a matched peripheral, or scoped lookup returns None, before expiry | No old idle/target echo; versioned absence clears unshadowed match/primary validity, removes absent binding after owned unknown publication and bounded cleanup. Failed/partial reads do not remove it. |
 | Auxiliary/maintenance return, newer native auxiliary contradiction, delayed caller echo | Current native value wins; optimistic echo still works without intervening native evidence and preserves primary pending/unknown and evidence age. |
+| Old queued mesh intent crosses same-topic owner replacement, followed by current intent | Zero native calls for old intent, exactly one for current intent; queue coalescing/folds never cross owner references. |
+| Foreign reconnect hook advances generation before waiting mesh task wins device lock; separate issue-sink exception | Positive issue authorization fails, no native observer call, waiting admission tombstoned; already-authorized RPC retains its lock. Wired best-effort issue-callback behavior stays unchanged. |
+| Issued command worker canceled at t=1, RPC unresolved through t=6, native success t=7 | Intent is abandoned/unconfirmed immediately; no pre-return contradiction or false native cancellation; keep unknown through return, then resume only on a later trusted primary capture. No new independent deadline timer. |
+| Successful scoped parent lookup returns None, empty mapping, incomplete object and exception in separate runs | Explicit ScopeUnknown versus authoritative inventory versus no absence contribution; older negative evidence cannot erase newer target capture. |
+| Unresolved expiry terminal blocked before handoff, then same-command acceptance rearms and old ack arrives | Cancel/join only old window effect, publish fresh pending deadline, no old pre-handoff unconfirmed send or stale debt clearing. |
+| Blocked unresolved pending publish followed by late acceptance | Cancel/join the prior pending child and publish the new full-window deadline; stale ack cannot clear current debt. A noncooperative child reaches bounded fatal recovery; already handed-off packets cannot be retracted. |
+| Blocked pending publish followed by successful `QUIET/idle` expiry | Expiry revokes/joins the pending child even without a terminal failure; eventually publish current idle state, or bounded fatal recovery for a noncooperative child. |
+| Many successful create/write/remove cycles without reconnect | Adapter era keys, per-capture scan work, materialized views and route/payload maps remain bounded; wired/privacy provenance passes unchanged. |
+| Stable 257-binding inventory over repeated ticks/resyncs, then newer fitting inventory | Mesh stays safely disabled with bounded attempts and records while wired service continues; existing inventory event permits bounded recovery, without added polling. |
 
 1. Obtain both design reviews on the exact draft head and resolve design
    findings before runtime code. Record reviewer sessions and verdicts in S9's
