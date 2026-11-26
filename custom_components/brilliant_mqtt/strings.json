@@ -447,7 +447,11 @@
         "baseline_capture_interrupted": "Baseline capture was interrupted and a rollback baseline may remain on the panel. Preserve any journal and baseline, and follow docs/canary-rollback.md before retrying.",
         "ownerless_recovery_unavailable": "This retained baseline is owned, still in use, or not verified restored. Preserve the journal and baseline. Finish recovery or use the owning panel's canary actions; do not delete private storage to retry.",
         "ownerless_finalize_reauthentication_required": "Retained baseline cleanup requires fresh authentication. Start Add Brilliant panel again with the panel address and root password, verify its pinned identity, and explicitly confirm cleanup. Interrupted cleanup remains retained.",
-        "aarch64_opt_in_required": "Check the box to continue with this experimental i350 / aarch64 panel, or go back to cancel."
+        "aarch64_opt_in_required": "Check the box to continue with this experimental i350 / aarch64 panel, or go back to cancel.",
+        "canary_owner_changed": "The panel owner, address, identity, or login changed during this action, or more than one owner matches. Keep the baseline and repair; verify the panel configuration before retrying.",
+        "canary_record_changed": "The retained baseline or active operation changed during this action. Keep the journal and baseline, and follow docs/canary-rollback.md before retrying.",
+        "canary_action_unavailable": "This retained baseline has interrupted, separately authorized, or inconsistent recovery state. Preserve the journal and baseline and follow docs/canary-rollback.md.",
+        "canary_manual_action_required": "An explicit action at a new panel address was interrupted. Automatic replay and a new rollback are refused. Preserve the journal and baseline and follow docs/canary-rollback.md."
       },
       "abort": {
         "already_configured": "Panel `{panel_name}` is already configured.",
@@ -848,6 +852,26 @@
     "migration_quiet_state_unwritable": {
       "title": "Brilliant restored panels stay in quiet mode",
       "description": "Home Assistant cannot read or update `.storage/brilliant_mqtt.migration_quiet`, which records Brilliant legacy entries restored by a migration that must start without contacting their panel. Until it can, those entries keep starting quietly and their one-time legacy HA-mirror retirement audit stays deferred. Check the storage directory's permissions and free space, then restart Home Assistant."
+    },
+    "canary_new_address": {
+      "title": "Finalize or roll back {panel} at its new address",
+      "fix_flow": {
+        "step": {
+          "init": {
+            "title": "Choose a retained baseline action",
+            "description": "The retained baseline still names the previous address. Each action verifies the pinned identity and current login first; the retained address is kept. Interrupted or ambiguous work requires manual recovery; healthy panels continue running. Finalize removes the rollback guarantee. Rollback restores and verifies the baseline, which remains available for later finalization. Each choice uses the current configured address for this action only. Result code: {code}",
+            "data": {
+              "action": "Action"
+            }
+          }
+        },
+        "error": {
+          "action_refused": "The action did not finish cleanly. Check the result code and the canary recovery documentation before retrying."
+        },
+        "abort": {
+          "rollback_complete": "Rollback was verified. The retained baseline remains. Open this repair again and choose finalize after checking the panel."
+        }
+      }
     }
   }
 }

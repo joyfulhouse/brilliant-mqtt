@@ -11,8 +11,9 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers import issue_registry as ir
 
 from custom_components.brilliant_mqtt import fleet_manager as fm
+from custom_components.brilliant_mqtt.canary_actions import address_issue_id
 from custom_components.brilliant_mqtt.const import CONF_HOST, CONF_ROOT_PASSWORD, DOMAIN
-from custom_components.brilliant_mqtt.entry_data import EntryDataError
+from custom_components.brilliant_mqtt.manager import PanelManager
 from custom_components.brilliant_mqtt.panel_provisioner import PanelProvisioningError
 from custom_components.brilliant_mqtt.provisioning_journal import (
     JOURNAL_STORAGE_KEY,
@@ -100,6 +101,8 @@ async def test_fleet_recovery_keeps_ownerless_marker_separate_and_rechecks_owner
         ),
     )
     await journal.async_create(second)
+    second_retained = await journal.async_retained(second.transaction_id)
+    assert second_retained is not None
     if reject_when == "finalize":
         await journal.async_complete_cleanup(second.transaction_id)
         await journal.async_retained_state(second.transaction_id, "finalizing")
@@ -123,8 +126,24 @@ async def test_fleet_recovery_keeps_ownerless_marker_separate_and_rechecks_owner
     monkeypatch.setattr(fleet, "_async_authorize_background_recovery", locked_authorize)
     monkeypatch.setattr(fleet, "_async_schedule_reload_once", Mock())
     if reject_when == "before":
-        with pytest.raises(EntryDataError, match="provisioning_ownership_mismatch"):
-            await fleet._async_reconcile()
+        sibling = _panel("bedroom", "SHA256:bedroom", subentry_id="panel-bedroom")
+        hass.config_entries.async_add_subentry(entry, sibling)
+        started: list[str] = []
+
+        async def setup_panel(manager: PanelManager) -> None:
+            started.append(manager.panel)
+
+        monkeypatch.setattr(PanelManager, "async_setup", setup_panel)
+        await fleet._async_reconcile()
+        assert set(started) == {"kitchen", "bedroom"}
+        assert "panel-bedroom" in fleet.panels
+        issues = ir.async_get(hass).issues
+        assert [
+            issue_id
+            for (domain, issue_id) in issues
+            if domain == DOMAIN and issue_id.startswith("canary_new_address_")
+        ] == [address_issue_id(second_retained)]
+        assert await journal.async_retained(second.transaction_id) == second_retained
         assert fleet._recovery_task is None
     else:
         await fleet._async_prepare_provisioning()
@@ -261,11 +280,24 @@ async def test_queued_explicit_rollback_revalidates_its_current_authority(
         report.assert_not_awaited()
     else:
         dispatch.assert_not_awaited()
-        report.assert_awaited_once_with(
-            rollback.transaction_id,
-            original_code="restart_recovery",
-            rollback_code="rollback_credentials_unavailable",
-        )
+        if revoke == "host":
+            report.assert_not_awaited()
+            retained = await journal.async_retained(rollback.transaction_id)
+            assert retained is not None
+            issue = ir.async_get(hass).async_get_issue(DOMAIN, address_issue_id(retained))
+            assert issue is not None and issue.is_fixable
+            assert (
+                ir.async_get(hass).async_get_issue(
+                    DOMAIN, fm._provisioning_repair_issue_id(rollback.transaction_id)
+                )
+                is None
+            )
+        else:
+            report.assert_awaited_once_with(
+                rollback.transaction_id,
+                original_code="restart_recovery",
+                rollback_code="rollback_credentials_unavailable",
+            )
     assert await journal.async_load() == rollback
 
 

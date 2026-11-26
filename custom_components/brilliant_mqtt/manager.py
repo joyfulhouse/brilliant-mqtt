@@ -1789,28 +1789,11 @@ class PanelManager:
 
     async def async_canary_operation(self, operation: str, name: str) -> None:
         """Bind an explicitly named rollback/finalization to this one panel owner."""
-        from .fleet_manager import _get_recovery_provisioner
-        from .provisioning_journal import ProvisioningJournal
+        from .canary_actions import async_run_canary
 
         try:
             transaction = UUID(name)
-            retained = await ProvisioningJournal(self.hass).async_retained(transaction)
-            if retained is None:
-                raise ValueError("baseline_missing")
-            request = retained.record.panel_request
-            if (
-                request.slug != self.panel
-                or request.host != self.store.data[CONF_HOST]
-                or request.public_key != self.store.data.get(DATA_SSH_HOST_KEY)
-            ):
-                raise ValueError("baseline_owner_mismatch")
-            provisioner = _get_recovery_provisioner(self.hass)
-            if operation == "rollback":
-                await provisioner.async_rollback(transaction)
-            elif operation == "finalize":
-                await provisioner.async_finalize(transaction)
-            else:
-                raise ValueError("invalid_canary_operation")
+            await async_run_canary(self.hass, self.store, operation, transaction)
         except Exception as error:
             code = getattr(error, "code", "canary_operation_failed")
             if not isinstance(code, str) or re.fullmatch(r"[a-z_]{1,64}", code) is None:

@@ -69,7 +69,9 @@ publishes are needed for these operations.
 5. If HA restarts or the action is interrupted, allow the existing recovery runner
    to reconcile durable intent. A restore operation is explicitly journaled as
    rollback; it is never recovered as an unactivated candidate cleanup. Retrying a
-   failed rollback uses another fresh deployment ID.
+   failed rollback uses another fresh deployment ID. For a panel whose address
+   changed after capture, use the manual repair described below; that action is
+   not replayed at its new address after a restart.
 
 Restoration is byte-exact **except for the deployment-correlation field in the
 live environment file**. That field must change to reject delayed messages from
@@ -105,6 +107,10 @@ while obtaining redacted diagnostics and the HA repair/log code.
 | `baseline_retained_finalize_first` | A rollback baseline remains for this panel. Keep it through the agreed soak. After sign-off, explicitly run Finalize retained canary with its transaction name before another update, or roll back; rejection leaves the baseline intact. Repair, post-OTA refresh and component enablement report the same code instead of installing or replacing bridge or watchdog code while the baseline is retained. |
 | `release_update_required` | Repair, post-OTA refresh and component enablement keep installed code and only install code that is missing. Change it with the canaried Update entity or `brilliant_mqtt.redeploy`. |
 | `rollback_credentials_unavailable` | Restore the exact HA panel owner/configuration and its pinned host identity; then retry. Do not enable automatic host-key trust. |
+| `canary_owner_changed` | The original panel owner, address, pin, slug or login changed, or more than one owner matches. Preserve the baseline and verify the panel configuration before another explicit action. |
+| `canary_record_changed` | The exact retained record or active operation changed. Preserve the journal and baseline; let another active operation finish before retrying. |
+| `canary_action_unavailable` | This manual address path cannot settle the retained state or provenance. Preserve interrupted or inconsistent work for maintainer investigation. |
+| `canary_manual_action_required` | A manual rollback at a changed address was interrupted. Automatic replay and a new rollback are refused, including if the address changes back. Preserve the journal and baseline for maintainer assistance; this path adds no resume mechanism. |
 | `rollback_health_failed` | Bytes may already be restored. Check HA's broker connection and panel connectivity. Retained MQTT history cannot satisfy this check. Retry after resolving connectivity. |
 | `rollback_deadline_exceeded` | Treat recovery as unverified. The pending journal remains; remote restore processes are terminated and settled before reuse. Resolve connectivity/storage delays before retrying. |
 | `rollback_failed` / `rollback_failed` state | Preserve artifacts and the actionable repair code for the maintainer. A missing or changed pinned release is not silently replaced with bundled code. |
@@ -124,14 +130,61 @@ data:
   name: "12345678-1234-4abc-8def-1234567890ab"
 ```
 
-`finalizing` is saved before deleting artifacts. If HA restarts, the existing
-recovery runner finishes deletion. Download diagnostics and confirm the name no
-longer appears. Successful finalization synchronously purges the named HA retained
-record and the on-panel archive and `complete.json`; no deferred garbage collection
-is required. Finalize promptly at the agreed soak end to bound the extra credential
+For an unchanged address, `finalizing` is saved before deleting artifacts. If HA
+restarts, the existing recovery runner finishes deletion at that address.
+Changed-address actions require fresh manual admission as described below.
+Download diagnostics and confirm the name no longer appears. Successful
+finalization synchronously purges the named HA retained record and the on-panel
+archive and `complete.json`; no deferred garbage collection is required.
+Finalize promptly at the agreed soak end to bound the extra credential
 storage window. Until explicitly finalized, the baseline has no automatic expiry.
 An in-flight execution journal prevents finalization. Uninstall
 also refuses to destroy a retained baseline; finalize intentionally first.
+
+## Retained baseline after a panel address change
+
+Changing a panel subentry's network address leaves the retained baseline's
+original address intact. Home Assistant raises **Finalize or roll back [panel name]
+at its new address** when it detects this difference. Open that repair and
+explicitly choose finalize after sign-off, or rollback. The existing
+`canary_finalize` and `canary_rollback` actions also support this path when you
+target exactly that panel and supply its baseline name.
+
+Each action freshly verifies the current address against the baseline's pinned
+SSH identity and authenticates using the panel subentry's current login. This
+permission applies to that action only. The integration does not move the
+baseline, change its recorded address, or automatically repeat the action on
+startup or reload.
+
+Changed-address finalization leaves the passive retained record in place until
+cleanup succeeds, so an interruption requires another explicit action. Rollback
+uses the existing execution journal and preserves `canary_manual_action_required`
+until it completes; a restart does not reuse the temporary address.
+An interrupted manual rollback is preserved for investigation and cannot be
+resumed through this path.
+
+Before recording a new rollback intent, the action verifies the retained capture
+at the current address. If an interrupted finalize already removed that capture,
+rollback refuses without creating a new execution journal or restoring files.
+
+This manual path refuses restored baselines from an original install or upgrade:
+the stored evidence cannot distinguish an owned restore from completed onboarding
+compensation that had no configured owner. Keep that baseline and its repair for
+maintainer assistance with manual finalization. Restored update baselines remain
+eligible when their fresh restore evidence and current owner are consistent.
+
+If the configured address changes back while the repair form is open, submit a
+new explicitly targeted ordinary action instead. The stale address-change form
+refuses rather than silently changing the action it offers.
+
+If the panel owner, slug, pin, or exact retained record changes during the action,
+or ownership is ambiguous, the action refuses with a typed code and leaves the
+repair available. Another active operation must finish first. Preserve unresolved
+or inconsistent recovery state for investigation; the repair does not discard
+that evidence to make progress. Other healthy panels can continue to start.
+
+Automatic retargeting of retained baselines and provisioning journals is outside
+this manual path. Live panel validation remains required.
 
 ## Storage, limits, and evidence
 

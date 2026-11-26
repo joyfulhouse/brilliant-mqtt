@@ -24,6 +24,7 @@ from homeassistant.util import json as json_util
 from . import panel_ops
 from .broker import BrokerKind, BrokerProfile
 from .broker_validation import BrokerValidator
+from .canary_actions import async_defer_address_action
 from .const import (
     CONF_ALLOW_AARCH64,
     CONF_BROKER_KIND,
@@ -770,6 +771,7 @@ def _build_panel_provisioner(
         recovery_authorizer=recovery_authorizer
         or partial(_async_authorize_recorded_recovery, hass),
         retained_owner_exists=partial(_async_retained_owner_exists, hass),
+        retained_deferred=partial(async_defer_address_action, hass),
         transaction_lookup=partial(_async_transaction_lookup, hass),
         repair_reporter=_ProvisioningRepairReporter(hass),
     )
@@ -828,6 +830,7 @@ def _get_recovery_provisioner(
     *,
     removed_entry: ConfigEntry[Any] | None = None,
     expected_record: ProvisioningRecord | None = None,
+    expected_identity: HostIdentity | None = None,
 ) -> PanelProvisioner:
     """Build recovery-only orchestration; fresh installation stays unavailable."""
 
@@ -836,6 +839,10 @@ def _get_recovery_provisioner(
         raise RuntimeError("recovery_only_provisioner")
 
     if removed_entry is None and expected_record is None:
+        if expected_identity is not None:
+            return _build_panel_provisioner(
+                hass, partial(async_verify_host_identity, expected=expected_identity)
+            )
         return _build_panel_provisioner(hass, recovery_only_identity_fetcher)
     if removed_entry is None or expected_record is None:
         raise ValueError("removed_recovery_authority_incomplete")
@@ -1291,6 +1298,21 @@ class FleetManager:
         except asyncio.CancelledError:
             raise
         except Exception as error:
+            if isinstance(error, PanelProvisioningError) and error.code in {
+                "provisioning_recovery_required",
+                "rollback_credentials_unavailable",
+                "canary_manual_action_required",
+            }:
+                try:
+                    retained = await ProvisioningJournal(self.hass).async_retained(
+                        record.transaction_id
+                    )
+                    if retained is not None and async_defer_address_action(
+                        self.hass, retained, required=error.code == "canary_manual_action_required"
+                    ):
+                        return
+                except Exception:
+                    pass
             await reporter.async_report_rollback_failure(
                 record.transaction_id,
                 original_code="restart_recovery",
@@ -1347,9 +1369,19 @@ class FleetManager:
         """Bind cheap handoffs now and schedule orphan network recovery separately."""
         self._pending_handoff = None
         journal = ProvisioningJournal(self.hass)
+        deferred: set[UUID] = set()
         try:
             record = await journal.async_load()
             for retained in await journal.async_retained_records():
+                manual = (
+                    record is not None
+                    and record.transaction_id == retained.record.transaction_id
+                    and record.last_error is not None
+                    and record.last_error.code == "canary_manual_action_required"
+                )
+                if async_defer_address_action(self.hass, retained, required=manual):
+                    deferred.add(retained.record.transaction_id)
+                    continue
                 password = retained.compensation_password(record)
                 if retained.state == "restore_requested" and (
                     record is None or password is not None
@@ -1360,7 +1392,23 @@ class FleetManager:
                         )
                     if password is None:
                         raise EntryDataError("rollback_credentials_unavailable")
-                    await journal.async_begin_restore(retained.record.transaction_id, password)
+
+                    def authorize_restore(expected: RetainedRollback = retained) -> None:
+                        if async_defer_address_action(self.hass, expected):
+                            raise PanelProvisioningError("rollback_credentials_unavailable")
+
+                    try:
+                        await journal.async_begin_restore(
+                            retained.record.transaction_id,
+                            password,
+                            expected=retained,
+                            authorize=authorize_restore,
+                        )
+                    except PanelProvisioningError as error:
+                        if error.code != "rollback_credentials_unavailable":
+                            raise
+                        deferred.add(retained.record.transaction_id)
+                        continue
                     record = await journal.async_load()
                 elif (
                     retained.state == "finalizing"
@@ -1380,6 +1428,9 @@ class FleetManager:
             await self._async_persist_parent_normalization(None)
             return
 
+        if record.transaction_id in deferred:
+            return
+
         if record.operation is ProvisioningOperation.ONBOARDING_ROLLBACK:
             compensation = await journal.async_retained(record.transaction_id)
             if compensation is None or compensation.compensation_password(record) is None:
@@ -1388,6 +1439,14 @@ class FleetManager:
             return
 
         if record.operation is ProvisioningOperation.ROLLBACK:
+            rollback_retained = await journal.async_retained(record.transaction_id)
+            manual = (
+                record.last_error is not None
+                and record.last_error.code == "canary_manual_action_required"
+            )
+            if rollback_retained is not None and manual:
+                async_defer_address_action(self.hass, rollback_retained, required=True)
+                return
             if await _async_rollback_credential(self.hass, record.panel_request) is None:
                 raise EntryDataError("rollback_credentials_unavailable")
             self._async_schedule_background_recovery(record)
