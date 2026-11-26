@@ -66,6 +66,9 @@ class MeshBusClient(Protocol):
     def register_mesh_write_guard(
         self, guard: Callable[[AdmissionTicket, str], bool]
     ) -> Callable[[], None]: ...
+    def set_mesh_settle_callback(
+        self, ticket: AdmissionTicket, callback: Callable[[str | BaseException], None]
+    ) -> None: ...
     def bind_mesh_ticket(
         self,
         ticket: AdmissionTicket,

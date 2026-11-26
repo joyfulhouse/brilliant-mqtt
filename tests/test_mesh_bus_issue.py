@@ -399,3 +399,127 @@ async def test_real_native_acceptance_and_masked_contradiction_precede_waiter_re
     assert await caller == "'ok'"
     remove()
     await adapter.shutdown()
+
+
+async def test_disabled_resident_admission_cannot_wait_for_recovery_or_retry_ticket() -> None:
+    from brilliant_mqtt.write_admission import TicketAdoptionError
+
+    harness = _Harness()
+    enabled = False
+    remove = harness.adapter.register_mesh_write_guard(lambda _ticket, _pid: enabled)
+    lock = harness.adapter._write_locks.setdefault("ble_mesh", asyncio.Lock())
+    await lock.acquire()
+    ticket = AdmissionTicket()
+    caller = harness.submit("switch_config:mac", {"slider_config": "new"}, ticket=ticket)
+    await _settle()
+    try:
+        assert caller.done()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        assert ticket.settled
+        assert ticket.issued_at is None
+        enabled = True
+        with pytest.raises(TicketAdoptionError):
+            await harness.adapter.set_variables(
+                "ble_mesh", "switch_config:mac", [VarSet("slider_config", "new")], ticket=ticket
+            )
+        assert harness.observer.calls == []
+    finally:
+        lock.release()
+        await harness.adapter.shutdown()
+        await asyncio.gather(caller, return_exceptions=True)
+        remove()
+
+
+async def test_mesh_fatal_readoption_does_not_settle_physically_outstanding_ticket() -> None:
+    harness = _Harness()
+    ticket = AdmissionTicket()
+    caller = await harness.queue("p", {"on": "0"}, ticket=ticket)
+    harness.adapter._fail_mesh(RuntimeError("sink"))
+    with pytest.raises(WriteCancelled):
+        await harness.adapter.set_variables("ble_mesh", "p", [VarSet("on", "0")], ticket=ticket)
+    assert not ticket.settled
+    assert ticket.returned_at is None
+    assert harness.adapter.outstanding_mesh_ticket("p") is ticket
+    await harness.release(0)
+    assert await caller == "'ok'"
+    assert ticket.outcome == "'ok'"
+    await harness.adapter.shutdown()
+
+
+async def test_inherited_completion_listener_does_not_rebind_ticket_command_owner() -> None:
+    from brilliant_mqtt.mesh_settlement_types import Completion, CompletionHold
+
+    observer, adapter = _gated_adapter()
+    original = owner_for(adapter)
+    ticket = bind(adapter, original)
+    caller = asyncio.create_task(
+        adapter.set_variables("ble_mesh", "p", [VarSet("on", "0")], ticket=ticket)
+    )
+    await _settle()
+    issue = ticket.issued_at
+    assert issue is not None
+    adapter._on_proc_reconnect()
+    successor = MeshSettlement(
+        original.metadata,
+        source=adapter.capture_source,
+        generation=adapter.capture_generation,
+        birth_sequence=adapter.capture_sequence,
+        born_at=adapter._clock(),
+        completion_hold=CompletionHold(
+            ticket, issue.incarnation, issue.source_generation, issue.sequence
+        ),
+        initial_unconfirmed=True,
+    )
+
+    def complete(_outcome: str | BaseException) -> None:
+        boundary = ticket.returned_at
+        assert boundary is not None
+        successor.dispatch(Completion(envelope(successor, boundary), ticket))
+
+    adapter.set_mesh_settle_callback(ticket, complete)
+    assert ticket.mesh_owner is original
+    observer.release.set()
+    assert await caller == "'ok'"
+    assert successor.view.completion_hold is None
+    assert successor.view.targets == ()
+    assert successor.render(adapter._clock())["state"] is None
+    assert not adapter.consume_mesh_fatal()
+    await adapter.shutdown()
+
+
+async def test_final_commit_denies_hook_after_last_loop_eligibility_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _StartHarness(monkeypatch, gated_writes=True)
+    adapter = RpcBusAdapter()
+    await adapter.start()
+    prepared = False
+    hook_called = False
+
+    def prepare() -> None:
+        nonlocal prepared
+        prepared = True
+
+    def guard(_ticket: AdmissionTicket, _pid: str) -> bool:
+        nonlocal hook_called
+        if prepared and not hook_called:
+            hook_called = True
+            foreign(harness.procs[0].reconnect_cbs[0])
+        return True
+
+    remove = adapter.register_mesh_write_guard(guard)
+    owner = owner_for(adapter)
+    ticket = bind(adapter, owner, prepare=prepare)
+    try:
+        with pytest.raises(WriteCancelled):
+            await adapter.set_variables("ble_mesh", "p", [VarSet("on", "0")], ticket=ticket)
+        assert hook_called
+        assert harness.write_starts == []
+        assert ticket.issued_at is None
+        assert ticket.returned_at is None
+        assert owner.view.phase is Phase.INACTIVE
+    finally:
+        remove()
+        harness.write_release.set()
+        await adapter.shutdown()

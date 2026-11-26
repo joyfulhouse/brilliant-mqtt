@@ -359,3 +359,127 @@ async def test_resident_slider_scoped_read_retains_real_config_without_load_owne
     assert device is not None
     assert device.variables["slider_config"].value == "encoded-config"
     await adapter.shutdown()
+
+
+async def test_unrequested_delta_fields_do_not_change_admitted_target_reliability() -> None:
+    from brilliant_mqtt.mesh_ingress import MeshCapture
+
+    peripheral = _RawPeripheral()
+    peripheral.variables["power"] = _RawVariable("42")
+    adapter, _, _ = adapter_for(None)
+    seen: list[object] = []
+    adapter.register_mesh_sink(seen.append, want_fields=lambda _pid: frozenset({"on"}))
+    await notify(adapter, _RawDevice("ble_mesh", {"p": peripheral}), [delta("p", "on", "power")])
+    assert isinstance(seen[0], MeshCapture)
+    assert seen[0].capture.reliable
+    assert seen[0].capture.reported == frozenset({"on"})
+    await adapter.shutdown()
+
+
+async def test_read_timeout_has_no_inventory_or_absence_contribution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, native, _ = adapter_for(_RawDevice("ble_mesh", {}))
+    native.release.clear()
+    seen: list[object] = []
+    adapter.register_mesh_sink(seen.append, want_fields=lambda _pid: None)
+    monkeypatch.setattr(bus_mod, "_READ_DEADLINE_S", 0.01)
+    with pytest.raises(asyncio.TimeoutError):
+        await adapter.get_all()
+    assert seen == []
+    assert native.reads == ["own", "ble_mesh"]
+    await adapter.shutdown()
+
+
+async def test_mesh_registration_cleanup_and_churn_leave_no_per_id_adapter_state() -> None:
+    from brilliant_mqtt.commands import VarSet
+    from tests.fakes import _GatedRpcObserver
+
+    observer = _GatedRpcObserver()
+    observer.release.set()
+    adapter = RpcBusAdapter()
+    adapter._obs = observer
+    adapter._own_device_id = "own"
+    capture_count = 0
+
+    def capture(_event: object) -> None:
+        nonlocal capture_count
+        capture_count += 1
+
+    remove = adapter.register_mesh_sink(capture, want_fields=lambda _pid: frozenset({"on"}))
+    for index in range(40):
+        pid = str(index)
+        await notify(adapter, _RawDevice("ble_mesh", {pid: _RawPeripheral()}), [delta(pid, "on")])
+        await adapter.set_variables("ble_mesh", pid, [VarSet("on", "0")])
+        await notify(adapter, _RawDevice("ble_mesh", {}), [delta(pid, deleted=True)])
+    assert capture_count == 80
+    assert adapter._field_eras == {}
+    assert adapter._write_admissions == {}
+    assert adapter._write_serving == {}
+    assert not adapter._write_tasks
+    assert adapter._write_waiters == {"ble_mesh": []}
+    assert list(adapter._write_locks) == ["ble_mesh"]
+    assert not adapter._pending_tasks
+    assert not adapter._pending_pushes
+    remove()
+    remove()
+    assert adapter._mesh_sinks == []
+    adapter.register_mesh_sink(capture, want_fields=lambda _pid: None)
+    adapter.register_mesh_write_guard(lambda _ticket, _pid: True)
+    await adapter.shutdown()
+    assert adapter._mesh_sinks == []
+    assert adapter._mesh_write_guard is None
+
+
+@pytest.mark.parametrize("newer_on", [False, True], ids=["disjoint", "overlap"])
+async def test_actual_read_push_overlap_merges_owner_fields_independently(newer_on: bool) -> None:
+    from brilliant_mqtt.commands import VarSet
+    from brilliant_mqtt.mesh_ingress import MeshCapture
+    from brilliant_mqtt.mesh_settlement_types import Observe
+    from tests.test_mesh_bus_issue import bind, envelope
+    from tests.test_mesh_bus_reconnect import owner_for
+
+    class WritingNative(Native):
+        async def request_set_variables_in_peripheral(
+            self, peripheral_id: str, values: dict[str, str], *, device_id: str
+        ) -> str:
+            return "ok"
+
+    old = _RawPeripheral("1")
+    old.variables["power"] = _RawVariable("0")
+    adapter, _, clock = adapter_for(None)
+    native = WritingNative(_RawDevice("ble_mesh", {"p": old}))
+    adapter._obs = native
+    owner = owner_for(adapter)
+    ticket = bind(adapter, owner)
+
+    def ingress(event: object) -> None:
+        if isinstance(event, MeshCapture):
+            owner.dispatch(Observe(envelope(owner, event.provenance), event.capture))
+
+    adapter.register_mesh_sink(ingress, want_fields=lambda _pid: frozenset({"on", "power"}))
+    await adapter.set_variables("ble_mesh", "p", [VarSet("on", "0")], ticket=ticket)
+    clock.advance(10)
+    native.release.clear()
+    read = asyncio.create_task(adapter.get_all())
+    await native.started.wait()
+    current = _RawPeripheral("0")
+    current.variables["power"] = _RawVariable("200")
+    clock.advance(10)
+    await notify(
+        adapter,
+        _RawDevice("ble_mesh", {"p": current}),
+        [delta("p", *(("on", "power") if newer_on else ("power",)))],
+    )
+    clock.advance(10)
+    native.release.set()
+    await read
+    rendered = owner.render(clock())
+    assert rendered["power"] == 20
+    if newer_on:
+        assert owner.view.status == "pending"
+        assert rendered["state"] is None
+    else:
+        assert owner.view.status == "contradicted"
+        assert rendered["state"] == "ON"
+    await adapter.shutdown()

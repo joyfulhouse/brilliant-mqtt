@@ -83,8 +83,9 @@ class Variable:
 class CaptureProvenance:
     """Adapter-local ordering for a native snapshot or write-issue boundary.
 
-    This is not a native revision or a physical timestamp. It only establishes
-    which captures happened before an issued write in one adapter generation.
+    Sequences order boundaries throughout one adapter incarnation; generation
+    fences reconnects. ``captured_at`` is monotonic read-start/push-capture time,
+    never a native variable timestamp. Defaults preserve wired/fake consumers.
     """
 
     source_generation: int

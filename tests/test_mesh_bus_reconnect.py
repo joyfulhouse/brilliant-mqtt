@@ -117,3 +117,163 @@ async def test_public_local_boundaries_share_read_push_issue_sequence_domain() -
     assert (first.origin, second.origin) == ("mqtt", "timer")
     assert first.captured_at == second.captured_at == 7
     await adapter.shutdown()
+
+
+@pytest.mark.parametrize("on_thread", [False, True], ids=["loop", "foreign"])
+@pytest.mark.parametrize("reconnect", [False, True], ids=["control", "hook"])
+async def test_actual_hook_fences_an_already_ready_real_owner_expiry(
+    monkeypatch: pytest.MonkeyPatch,
+    on_thread: bool,
+    reconnect: bool,
+) -> None:
+    from dataclasses import replace
+
+    from brilliant_mqtt.mesh_ingress import MeshGeneration
+    from brilliant_mqtt.mesh_settlement_types import (
+        Begin,
+        Envelope,
+        Expire,
+        Issue,
+        NativeOutcome,
+        Observe,
+        OutcomeKind,
+        Revoke,
+        Source,
+    )
+    from brilliant_mqtt.model import CaptureProvenance, PrimitiveCapture, PrimitiveField
+    from brilliant_mqtt.write_admission import AdmissionTicket
+    from tests.fakes import FakeClock
+
+    harness = _StartHarness(monkeypatch)
+    clock = FakeClock()
+    adapter = RpcBusAdapter(clock=clock)
+    await adapter.start()
+    owner = owner_for(adapter)
+
+    def env(boundary: CaptureProvenance) -> Envelope:
+        return Envelope(
+            owner,
+            Source(boundary.incarnation, boundary.origin),
+            boundary.source_generation,
+            boundary.sequence,
+            boundary.captured_at,
+            "p",
+        )
+
+    ticket = AdmissionTicket()
+    owner.dispatch(Begin(env(adapter.reserve_mesh_boundary("mqtt")), ticket, (("on", "0"),)))
+    command = owner.view.command_id
+    owner.dispatch(
+        Issue(env(adapter.reserve_mesh_boundary("issue")), command, ticket, (("on", "0"),))
+    )
+    owner.dispatch(
+        NativeOutcome(
+            env(adapter.reserve_mesh_boundary("native")),
+            command,
+            ticket,
+            OutcomeKind.ACCEPTED,
+            "ok",
+        )
+    )
+    clock.advance(75)
+    owner.dispatch(
+        Observe(
+            env(adapter.reserve_mesh_boundary("push")),
+            PrimitiveCapture((PrimitiveField("on", "0"),)),
+        )
+    )
+    clock.advance(5)
+    window = owner.view.window
+    assert window is not None
+    expiry = Expire(env(adapter.reserve_mesh_boundary("timer")), window, clock())
+
+    def generation(event: object) -> None:
+        if isinstance(event, MeshGeneration):
+            owner.dispatch(
+                Revoke(env(replace(event.provenance, source_generation=owner.generation)))
+            )
+
+    adapter.register_mesh_sink(generation, want_fields=lambda _pid: None)
+
+    def ready_expiry() -> None:
+        if adapter.mesh_owner_live(owner):
+            owner.dispatch(expiry)
+
+    asyncio.get_running_loop().call_soon(ready_expiry)
+    if reconnect:
+        hook = harness.procs[0].reconnect_cbs[0]
+        foreign(hook) if on_thread else hook()
+    await asyncio.sleep(0)
+    if reconnect:
+        assert owner.view.status == "unconfirmed"
+        assert owner.render(clock())["state"] is None
+        assert owner.view.window is None
+    else:
+        assert owner.view.status == "idle"
+        assert owner.render(clock())["state"] == "OFF"
+    await adapter.shutdown()
+
+
+async def test_foreign_hook_cannot_erase_current_generation_wired_issue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from brilliant_mqtt.commands import VarSet
+    from brilliant_mqtt.write_admission import AdmissionTicket
+    from tests.fakes import _RawPeripheral
+    from tests.test_write_admission import _settle
+
+    native = _StartHarness(monkeypatch, gated_writes=True)
+    adapter = RpcBusAdapter()
+    await adapter.start()
+    device_id = adapter.own_device_id
+    assert device_id is not None
+    lock = adapter._write_locks.setdefault(device_id, asyncio.Lock())
+    await lock.acquire()
+    ticket = AdmissionTicket()
+    caller = asyncio.create_task(
+        adapter.set_variables(device_id, "p", [VarSet("on", "0")], ticket=ticket)
+    )
+
+    async def read(device_id: str, peripheral_id: str) -> _RawPeripheral:
+        return _RawPeripheral("0")
+
+    monkeypatch.setattr(adapter._obs, "get_peripheral", read, raising=False)
+    try:
+        await _settle()
+        lock.release()  # queues the writer before the foreign hook's loop fanout
+        foreign(native.procs[0].reconnect_cbs[0])
+        await _settle()
+        issued = ticket.issued_at
+        assert issued is not None
+        assert issued.source_generation == adapter.capture_generation
+        captured = await adapter.get_peripheral(device_id, "p")
+        assert captured is not None and captured.capture_provenance is not None
+        assert (
+            dict(captured.capture_provenance.field_eras)["on"] == dict(issued.field_eras)["on"] == 1
+        )
+        assert adapter.recent_reconnects(60) == 1
+    finally:
+        native.write_release.set()
+        await asyncio.gather(caller, return_exceptions=True)
+        await adapter.shutdown()
+
+
+async def test_foreign_hook_cannot_erase_new_generation_privacy_denial(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests.fakes import _RawDevice, _RawPeripheral
+
+    native = _StartHarness(monkeypatch)
+    adapter = RpcBusAdapter()
+    await adapter.start()
+    peripheral = _RawPeripheral("1", "privacy_toggle")
+    peripheral.peripheral_type = 22
+    raw = _RawDevice(adapter.own_device_id, {"hardware": peripheral})
+    asyncio.get_running_loop().call_soon(adapter._dispatch_raw_device, raw)
+    foreign(native.procs[0].reconnect_cbs[0])
+    await asyncio.sleep(0)
+    denial = adapter.privacy_revocation
+    assert denial is not None
+    assert denial.source_generation == adapter.capture_generation
+    assert adapter.recent_reconnects(60) == 1
+    await adapter.shutdown()
