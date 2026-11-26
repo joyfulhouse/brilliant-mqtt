@@ -1202,8 +1202,14 @@ class RetainedRollback:
     state: str = "armed"
     recovery_deployment_id: str | None = None
     finalization_origin: str | None = None
+    config_owner: tuple[str, str | None] | None = None
 
     def __post_init__(self) -> None:
+        if self.config_owner is not None:
+            if not isinstance(self.config_owner, tuple) or len(self.config_owner) != 2:
+                raise _invalid()
+            _string(self.config_owner[0])
+            _optional_string(self.config_owner[1])
         if self.state not in _RETAINED_STATES or self.record.prior_snapshot.baseline is None:
             raise _invalid()
         if self.finalization_origin is not None and (
@@ -1323,6 +1329,11 @@ class RetainedRollback:
         }
         if self.finalization_origin is not None:
             payload["finalization_origin"] = self.finalization_origin
+        if self.config_owner is not None:
+            payload["config_owner"] = {
+                "entry_id": self.config_owner[0],
+                "subentry_id": self.config_owner[1],
+            }
         return payload
 
     @classmethod
@@ -1330,7 +1341,13 @@ class RetainedRollback:
         keys = frozenset({"record", "state", "recovery_deployment_id"})
         if isinstance(raw, Mapping) and "finalization_origin" in raw:
             keys |= {"finalization_origin"}
+        if isinstance(raw, Mapping) and "config_owner" in raw:
+            keys |= {"config_owner"}
         value = _exact_keys(raw, keys)
+        config_owner = None
+        if "config_owner" in value:
+            owner = _exact_keys(value["config_owner"], frozenset({"entry_id", "subentry_id"}))
+            config_owner = (_string(owner["entry_id"]), _optional_string(owner["subentry_id"]))
         record = dict(_exact_keys(value["record"], _RECORD_KEYS))
         request = dict(
             _exact_keys(record["panel_request"], _PANEL_REQUEST_KEYS - {"root_password"})
@@ -1342,6 +1359,7 @@ class RetainedRollback:
             _string(value["state"]),
             _optional_string(value["recovery_deployment_id"]),
             _optional_string(value.get("finalization_origin")),
+            config_owner,
         )
 
 
@@ -1536,18 +1554,30 @@ class ProvisioningJournal:
             self._report_pending_owners()
             return self._coordinator.record
 
-    async def async_has_pending_address_change(self, request: StoredPanelRequest) -> bool:
+    async def async_has_address_records(self, *, slug: str, public_key: str) -> bool:
+        """Keep unjournaled legacy entries on their existing config-only path."""
+        async with self._coordinator.lock:
+            await self._async_reload()
+            self._report_pending_owners()
+            requests = [
+                item.record.panel_request for item in (await self._async_retained_load()).values()
+            ]
+            if self._coordinator.record is not None:
+                requests.append(self._coordinator.record.panel_request)
+            return any(
+                item.slug == slug and item.public_key == public_key for item in requests
+            ) or any(
+                item.slug == slug and item.public_key == public_key
+                for item in self._coordinator.pending_owners
+            )
+
+    async def async_has_pending_address_change(self, *, slug: str, public_key: str) -> bool:
         """Require fresh address verification before this panel's recovery can run."""
         async with self._coordinator.lock:
             await self._async_reload()
             self._report_pending_owners()
             return any(
-                _same_verified_panel(
-                    request,
-                    slug=item.slug,
-                    public_key=item.public_key,
-                    fingerprint=item.fingerprint,
-                )
+                item.slug == slug and item.public_key == public_key
                 for item in self._coordinator.pending_owners
             )
 
@@ -1732,6 +1762,13 @@ class ProvisioningJournal:
                 raise ProvisioningJournalError("journal_save_failed")
             remaining = tuple(item for item in previous if item not in matching)
             retained = await self._async_retained_load()
+            if any(
+                item.record.panel_request.slug == slug
+                and item.record.panel_request.public_key == public_key
+                and item.config_owner not in {None, (entry_id, subentry_id)}
+                for item in retained.values()
+            ):
+                raise ProvisioningJournalError("owner_changed")
             # No active journal or retained row belongs to this panel. The
             # configuration entry is the only durable owner, so update it directly.
             if (
@@ -1811,6 +1848,7 @@ class ProvisioningJournal:
         state: str,
         *,
         evidence: str | None = None,
+        config_owner: tuple[str, str | None] | None = None,
     ) -> None:
         records = await self._async_retained_load()
         key = str(_uuid4(transaction_id))
@@ -1828,7 +1866,10 @@ class ProvisioningJournal:
         if state != current.state and state not in allowed[current.state]:
             raise ProvisioningJournalError("invalid_journal_transition")
         records[key] = replace(
-            current, state=state, recovery_deployment_id=evidence or current.recovery_deployment_id
+            current,
+            state=state,
+            recovery_deployment_id=evidence or current.recovery_deployment_id,
+            config_owner=config_owner if config_owner is not None else current.config_owner,
         )
         await self._async_retained_save(records)
 
@@ -1838,9 +1879,12 @@ class ProvisioningJournal:
         state: str,
         *,
         evidence: str | None = None,
+        config_owner: tuple[str, str | None] | None = None,
     ) -> None:
         async with self._coordinator.lock:
-            await self._async_retained_state(transaction_id, state, evidence=evidence)
+            await self._async_retained_state(
+                transaction_id, state, evidence=evidence, config_owner=config_owner
+            )
 
     async def async_request_restore(self, transaction_id: UUID) -> None:
         await self.async_retained_state(transaction_id, "restore_requested")
@@ -2074,6 +2118,14 @@ class ProvisioningJournal:
 
     def _report_pending_owners(self) -> None:
         """Keep interrupted moves visible without changing any saved owner."""
+        pending_ids = {self._pending_issue_id(item) for item in self._coordinator.pending_owners}
+        for (domain, issue_id), issue in tuple(ir.async_get(self._hass).issues.items()):
+            if (
+                domain == DOMAIN
+                and issue.translation_key == "address_change_incomplete"
+                and issue_id not in pending_ids
+            ):
+                ir.async_delete_issue(self._hass, DOMAIN, issue_id)
         for pending in self._coordinator.pending_owners:
             ir.async_create_issue(
                 self._hass,

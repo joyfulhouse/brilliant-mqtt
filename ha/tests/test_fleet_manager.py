@@ -480,6 +480,7 @@ async def test_initial_setup_normalizes_owner_then_commits_exact_runtime_handoff
     )
     entry.add_to_hass(hass)
     journal = Mock(
+        async_has_pending_address_change=AsyncMock(return_value=False),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record()),
         async_complete_commit=AsyncMock(),
@@ -550,6 +551,7 @@ async def test_cancel_during_pending_handoff_commit_clears_resolved_repair(
         commit_finished.set()
 
     journal = Mock(
+        async_has_pending_address_change=AsyncMock(return_value=False),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record()),
         async_complete_commit=AsyncMock(side_effect=complete_commit),
@@ -602,6 +604,7 @@ async def test_first_handoff_normalizes_reserved_empty_owner_to_exact_subentry(
     )
     entry.add_to_hass(hass)
     journal = Mock(
+        async_has_pending_address_change=AsyncMock(return_value=False),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record()),
         async_complete_commit=AsyncMock(),
@@ -651,6 +654,7 @@ async def test_committed_handoff_clears_before_runtime_failure(
     )
     entry.add_to_hass(hass)
     journal = Mock(
+        async_has_pending_address_change=AsyncMock(return_value=False),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record(phase=ProvisioningPhase.COMMITTED)),
         async_clear_committed=AsyncMock(),
@@ -708,6 +712,7 @@ async def test_cancel_during_startup_committed_clear_clears_resolved_repair(
         clear_finished.set()
 
     journal = Mock(
+        async_has_pending_address_change=AsyncMock(return_value=False),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record(phase=ProvisioningPhase.COMMITTED)),
         async_clear_committed=AsyncMock(side_effect=clear_committed),
@@ -772,6 +777,7 @@ async def test_committed_handoff_corruption_fails_closed_with_repair(
     )
     entry.add_to_hass(hass)
     journal = Mock(
+        async_has_pending_address_change=AsyncMock(return_value=False),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record(phase=ProvisioningPhase.COMMITTED)),
         async_clear_committed=AsyncMock(),
@@ -810,6 +816,7 @@ async def test_restart_after_marker_removal_commits_only_exact_owned_runtime(
     )
     entry.add_to_hass(hass)
     journal = Mock(
+        async_has_pending_address_change=AsyncMock(return_value=False),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record()),
         async_complete_commit=AsyncMock(),
@@ -869,6 +876,7 @@ async def test_restart_after_scene_normalization_finishes_remaining_marker(
     )
     entry.add_to_hass(hass)
     journal = Mock(
+        async_has_pending_address_change=AsyncMock(return_value=False),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record()),
         async_complete_commit=AsyncMock(),
@@ -922,6 +930,7 @@ async def test_markerless_restart_force_saves_before_journal_commit(
     )
     entry.add_to_hass(hass)
     journal = Mock(
+        async_has_pending_address_change=AsyncMock(return_value=False),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record()),
         async_complete_commit=AsyncMock(),
@@ -1181,6 +1190,7 @@ async def test_cancelled_ownership_flush_settles_without_clearing_journal(
     )
     entry.add_to_hass(hass)
     journal = Mock(
+        async_has_pending_address_change=AsyncMock(return_value=False),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record()),
         async_complete_commit=AsyncMock(),
@@ -1285,6 +1295,7 @@ async def test_pending_handoff_mismatch_fails_closed_without_clearing_journal(
     )
     entry.add_to_hass(hass)
     journal = Mock(
+        async_has_pending_address_change=AsyncMock(return_value=False),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record()),
         async_complete_commit=AsyncMock(),
@@ -1326,6 +1337,7 @@ async def test_pending_handoff_rejects_different_journaled_broker(
         data={**entry.data, CONF_MQTT_HOST: "different-broker.example.com"},
     )
     journal = Mock(
+        async_has_pending_address_change=AsyncMock(return_value=False),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record()),
         async_complete_commit=AsyncMock(),
@@ -1371,6 +1383,7 @@ async def test_pending_handoff_accepts_guidance_only_broker_kind_correction(
         },
     )
     journal = Mock(
+        async_has_pending_address_change=AsyncMock(return_value=False),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record()),
         async_complete_commit=AsyncMock(),
@@ -1415,6 +1428,7 @@ async def test_startup_without_stored_owner_invokes_recorded_recovery_before_set
     )
     entry.add_to_hass(hass)
     journal = Mock(
+        async_has_pending_address_change=AsyncMock(return_value=False),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(side_effect=[_pending_record(), None]),
         async_complete_commit=AsyncMock(),
@@ -1457,6 +1471,7 @@ async def test_unreachable_stale_recovery_does_not_hold_healthy_runtime_offline(
     )
     entry.add_to_hass(hass)
     journal = Mock(
+        async_has_pending_address_change=AsyncMock(return_value=False),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record(phase=ProvisioningPhase.ACTIVATED)),
     )
@@ -1519,6 +1534,7 @@ async def test_finished_background_recovery_is_retried_after_entry_update(
         return state["record"]
 
     journal = Mock(
+        async_has_pending_address_change=AsyncMock(return_value=False),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(side_effect=load_record),
     )
@@ -1578,7 +1594,9 @@ async def test_stale_allocator_hint_does_not_wait_for_storage_before_healthy_run
     )
     entry.add_to_hass(hass)
     journal = Mock(
-        async_retained_records=AsyncMock(return_value=()), async_load=AsyncMock(return_value=None)
+        async_has_pending_address_change=AsyncMock(return_value=False),
+        async_retained_records=AsyncMock(return_value=()),
+        async_load=AsyncMock(return_value=None),
     )
     persisted = AsyncMock(side_effect=OSError("storage is slow"))
     fleet = FleetManager(hass, entry)
@@ -1636,6 +1654,7 @@ async def test_startup_preserves_owned_journal_when_any_domain_competitor_surviv
     entry.add_to_hass(hass)
     competitor.add_to_hass(hass)
     journal = Mock(
+        async_has_pending_address_change=AsyncMock(return_value=False),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record(phase=phase)),
         async_clear_committed=AsyncMock(),
@@ -1675,6 +1694,7 @@ async def test_empty_fleet_with_legacy_competitor_reports_without_orphan_recover
     entry.add_to_hass(hass)
     legacy.add_to_hass(hass)
     journal = Mock(
+        async_has_pending_address_change=AsyncMock(return_value=False),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record(phase=ProvisioningPhase.STAGED)),
     )
@@ -1717,6 +1737,7 @@ async def test_hard_restart_empty_fleet_schedules_orphan_recovery(
     entry = _empty_fleet_entry()
     entry.add_to_hass(hass)
     journal = Mock(
+        async_has_pending_address_change=AsyncMock(return_value=False),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record(phase=phase)),
     )
@@ -1756,6 +1777,7 @@ async def test_live_subentry_flow_prevents_reload_from_rolling_back_staged_panel
     entry = _empty_fleet_entry()
     entry.add_to_hass(hass)
     journal = Mock(
+        async_has_pending_address_change=AsyncMock(return_value=False),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record(phase=ProvisioningPhase.STAGED)),
     )
@@ -1803,6 +1825,7 @@ async def test_active_flow_context_prevents_pre_storage_rollback(
 ) -> None:
     """An unrelated fleet update cannot roll back a flow awaiting HA persistence."""
     journal = Mock(
+        async_has_pending_address_change=AsyncMock(return_value=False),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record()),
     )
@@ -1851,6 +1874,7 @@ async def test_actual_ha_remove_recovers_exact_removed_sole_owner(
     entry = _pending_owner_entry()
     entry.add_to_hass(hass)
     journal = Mock(
+        async_has_pending_address_change=AsyncMock(return_value=False),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record()),
     )
@@ -1892,6 +1916,7 @@ async def test_actual_ha_remove_recovers_exact_empty_fleet_before_subentry(
     entry = _empty_fleet_entry()
     entry.add_to_hass(hass)
     journal = Mock(
+        async_has_pending_address_change=AsyncMock(return_value=False),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record(phase=phase)),
     )
@@ -1950,6 +1975,7 @@ async def test_actual_ha_remove_recovers_pre_subentry_panel_from_nonempty_single
     )
     entry.add_to_hass(hass)
     journal = Mock(
+        async_has_pending_address_change=AsyncMock(return_value=False),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record(phase=phase)),
     )
@@ -1997,6 +2023,7 @@ async def test_actual_ha_remove_preserves_unowned_pre_subentry_committed_phase(
     )
     entry.add_to_hass(hass)
     journal = Mock(
+        async_has_pending_address_change=AsyncMock(return_value=False),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record(phase=ProvisioningPhase.COMMITTED)),
         async_clear_committed=AsyncMock(),
@@ -2036,6 +2063,7 @@ async def test_actual_ha_remove_clears_committed_exact_owner_without_panel_netwo
     entry = _pending_owner_entry()
     entry.add_to_hass(hass)
     journal = Mock(
+        async_has_pending_address_change=AsyncMock(return_value=False),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record(phase=ProvisioningPhase.COMMITTED)),
         async_clear_committed=AsyncMock(),
@@ -2095,6 +2123,7 @@ async def test_removed_entry_wrong_handoff_phase_preserves_journal_and_reports_r
     """Removal stays fail-closed but never leaves the retained root secret silent."""
     entry = _pending_owner_entry()
     journal = Mock(
+        async_has_pending_address_change=AsyncMock(return_value=False),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record(phase=ProvisioningPhase.VERIFYING)),
     )
@@ -2128,6 +2157,7 @@ async def test_removed_entry_wrong_broker_preserves_journal_and_reports_repair(
         data={**entry.data, CONF_MQTT_HOST: "different-broker.example.com"},
     )
     journal = Mock(
+        async_has_pending_address_change=AsyncMock(return_value=False),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record()),
     )
@@ -2157,6 +2187,7 @@ async def test_actual_ha_remove_aborts_owned_flow_and_settles_pending_journal(
     entry = _pending_owner_entry()
     entry.add_to_hass(hass)
     journal = Mock(
+        async_has_pending_address_change=AsyncMock(return_value=False),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record()),
     )
@@ -2206,6 +2237,7 @@ async def test_actual_ha_remove_does_not_abort_unrelated_active_flow(
     entry = _pending_owner_entry()
     entry.add_to_hass(hass)
     journal = Mock(
+        async_has_pending_address_change=AsyncMock(return_value=False),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record()),
     )
@@ -2264,6 +2296,7 @@ async def test_removed_empty_fleet_with_legacy_competitor_preserves_journal(
     removed.add_to_hass(hass)
     legacy.add_to_hass(hass)
     journal = Mock(
+        async_has_pending_address_change=AsyncMock(return_value=False),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record(phase=ProvisioningPhase.STAGED)),
         async_clear_committed=AsyncMock(),
@@ -2305,6 +2338,7 @@ async def test_removed_committed_owner_with_legacy_competitor_preserves_journal(
     removed.add_to_hass(hass)
     legacy.add_to_hass(hass)
     journal = Mock(
+        async_has_pending_address_change=AsyncMock(return_value=False),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record(phase=ProvisioningPhase.COMMITTED)),
         async_clear_committed=AsyncMock(),
@@ -2346,6 +2380,7 @@ async def test_actual_ha_remove_preserves_another_exact_persisted_owner(
     removed.add_to_hass(hass)
     survivor.add_to_hass(hass)
     journal = Mock(
+        async_has_pending_address_change=AsyncMock(return_value=False),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record()),
     )
@@ -2371,6 +2406,7 @@ async def test_actual_ha_remove_drains_recovery_before_propagating_cancellation(
     entry = _pending_owner_entry()
     entry.add_to_hass(hass)
     journal = Mock(
+        async_has_pending_address_change=AsyncMock(return_value=False),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record()),
     )
@@ -2418,6 +2454,7 @@ async def test_actual_ha_remove_recovery_failure_keeps_one_redacted_issue(
     entry = _pending_owner_entry()
     entry.add_to_hass(hass)
     journal = Mock(
+        async_has_pending_address_change=AsyncMock(return_value=False),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record()),
         async_complete_rollback=AsyncMock(),
@@ -3402,6 +3439,7 @@ async def test_rebind_rechecks_global_provisioning_journal_after_identity_wait(
     fleet = FleetManager(hass, entry)
     candidate = HostIdentity(_OTHER_PUBLIC_KEY, _OTHER_FINGERPRINT)
     journal = Mock(
+        async_has_pending_address_change=AsyncMock(return_value=False),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(side_effect=[None, _pending_record()]),
     )
@@ -3462,6 +3500,7 @@ async def test_rebind_active_journal_blocks_before_identity_network(
     fleet = FleetManager(hass, entry)
     candidate = HostIdentity(_OTHER_PUBLIC_KEY, _OTHER_FINGERPRINT)
     journal = Mock(
+        async_has_pending_address_change=AsyncMock(return_value=False),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record()),
     )
@@ -3525,6 +3564,7 @@ async def test_rebind_unreadable_journal_blocks_before_identity_network(
     candidate = HostIdentity(_OTHER_PUBLIC_KEY, _OTHER_FINGERPRINT)
     private_failure = "journal-backend-private-detail"
     journal = Mock(
+        async_has_pending_address_change=AsyncMock(return_value=False),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(side_effect=OSError(private_failure)),
     )
@@ -5090,6 +5130,7 @@ async def test_failed_pending_panel_start_is_not_published_and_schedules_retry(
         return current_record
 
     journal = Mock(
+        async_has_pending_address_change=AsyncMock(return_value=False),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(side_effect=load_record),
         async_complete_commit=AsyncMock(),
@@ -5180,6 +5221,7 @@ async def test_successful_live_handoff_advances_priority_and_reloads_parent_once
         current_record = None
 
     journal = Mock(
+        async_has_pending_address_change=AsyncMock(return_value=False),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(side_effect=load_record),
         async_complete_commit=AsyncMock(side_effect=complete_commit),
@@ -5264,6 +5306,7 @@ async def test_live_commit_failure_schedules_one_reload_with_markerless_owner(
         current_record = None
 
     journal = Mock(
+        async_has_pending_address_change=AsyncMock(return_value=False),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(side_effect=load_record),
         async_complete_commit=AsyncMock(side_effect=complete_commit),

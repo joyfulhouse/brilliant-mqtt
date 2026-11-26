@@ -823,7 +823,7 @@
   "issues": {
     "address_change_incomplete": {
       "title": "Brilliant panel address change incomplete",
-      "description": "Re-run Change network address for {panel}. Open the panel's Reconfigure menu and verify its current network address again (use Connection for a legacy panel). The interrupted change is kept until this succeeds."
+      "description": "Re-run Change network address for {panel}. Open the panel's Reconfigure menu and verify its current network address again (use Connection for a legacy panel). If prompted, enter the panel's current login. You can also use Repair SSH credentials if the login changed (use Connection for a legacy panel). The interrupted change is kept until this succeeds."
     },
     "needs_attention": {
       "title": "Brilliant panel needs attention",

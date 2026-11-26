@@ -1888,11 +1888,15 @@ class PanelManager:
             )
             if operation == "rollback":
                 await provisioner.async_rollback(
-                    transaction, credential_resolver=credential_resolver
+                    transaction,
+                    credential_resolver=credential_resolver,
+                    config_owner=(owner_entry_id, owner_subentry_id),
                 )
             elif operation == "finalize":
                 await provisioner.async_finalize(
-                    transaction, credential_resolver=credential_resolver
+                    transaction,
+                    credential_resolver=credential_resolver,
+                    config_owner=(owner_entry_id, owner_subentry_id),
                 )
             else:
                 raise _CanaryOperationError("invalid_canary_operation")

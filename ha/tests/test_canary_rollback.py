@@ -1113,6 +1113,7 @@ async def test_owned_managed_update_schedules_restart_recovery(
     assert recorded is not None
     recorded = replace(recorded, phase=phase)
     journal = Mock(
+        async_has_pending_address_change=AsyncMock(return_value=False),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=recorded),
     )

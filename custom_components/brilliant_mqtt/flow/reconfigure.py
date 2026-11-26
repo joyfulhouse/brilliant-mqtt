@@ -191,18 +191,23 @@ class LegacyPanelReconfigureFlow(_Base):
 
         if CONF_HOST in updates and host_key == data.get(DATA_SSH_HOST_KEY):
             try:
-                await ProvisioningJournal(self.hass).async_adopt_verified_host(
-                    entry_id=entry.entry_id,
-                    subentry_id=None,
-                    slug=panel,
-                    public_key=host_key,
-                    fingerprint=validated_public_key_fingerprint(host_key),
-                    host=host,
-                    expected_host=str(data[CONF_HOST]),
-                    expected_password=str(data[CONF_ROOT_PASSWORD]),
-                    root_password=password,
-                    repair_pending=True,
+                journal = ProvisioningJournal(self.hass)
+                needs_adoption = await journal.async_has_address_records(
+                    slug=panel, public_key=host_key
                 )
+                if needs_adoption:
+                    await journal.async_adopt_verified_host(
+                        entry_id=entry.entry_id,
+                        subentry_id=None,
+                        slug=panel,
+                        public_key=host_key,
+                        fingerprint=validated_public_key_fingerprint(host_key),
+                        host=host,
+                        expected_host=str(data[CONF_HOST]),
+                        expected_password=str(data[CONF_ROOT_PASSWORD]),
+                        root_password=password,
+                        repair_pending=True,
+                    )
             except ProvisioningJournalError:
                 return {"base": "cannot_apply"}, None
         new_data: dict[str, Any] = {**entry.data, **updates, DATA_SSH_HOST_KEY: host_key}

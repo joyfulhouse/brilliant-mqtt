@@ -738,6 +738,7 @@ class _Journal(Protocol):
         state: str,
         *,
         evidence: str | None = None,
+        config_owner: tuple[str, str | None] | None = None,
     ) -> None: ...
     async def async_begin_restore(self, transaction_id: UUID, root_password: str) -> None: ...
     async def async_remove_retained(self, transaction_id: UUID) -> None: ...
@@ -2393,6 +2394,7 @@ class PanelProvisioner:
         transaction_id: UUID,
         *,
         credential_resolver: Callable[[StoredPanelRequest], Awaitable[str | None]] | None = None,
+        config_owner: tuple[str, str | None] | None = None,
     ) -> None:
         """Persist operator intent before asking the existing runner to execute it."""
         async with self._lock:
@@ -2405,15 +2407,21 @@ class PanelProvisioner:
             password = await self._resolve_credential(
                 retained.record.panel_request, credential_resolver
             )
-            await self._journal.async_retained_state(transaction_id, "restore_requested")
+            await self._journal.async_retained_state(
+                transaction_id, "restore_requested", config_owner=config_owner
+            )
             await self._journal.async_begin_restore(transaction_id, password)
-        await self.async_recover()
+            expected = await self._journal.async_load()
+            if expected is None:
+                raise PanelProvisioningError("provisioning_recovery_required")
+        await self.async_recover(expected_record=expected)
 
     async def async_finalize(
         self,
         transaction_id: UUID,
         *,
         credential_resolver: Callable[[StoredPanelRequest], Awaitable[str | None]] | None = None,
+        config_owner: tuple[str, str | None] | None = None,
     ) -> None:
         """Explicit intentional loss of the rollback guarantee, with durable intent."""
         async with self._lock:
@@ -2427,7 +2435,9 @@ class PanelProvisioner:
             password = await self._resolve_credential(
                 retained.record.panel_request, credential_resolver
             )
-            await self._journal.async_retained_state(transaction_id, "finalizing")
+            await self._journal.async_retained_state(
+                transaction_id, "finalizing", config_owner=config_owner
+            )
             await self._async_finalize(retained, password=password)
 
     async def _async_assert_ownerless(self, expected: RetainedRollback) -> None:

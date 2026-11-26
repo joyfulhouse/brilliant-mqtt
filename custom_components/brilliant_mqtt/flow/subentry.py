@@ -388,6 +388,19 @@ class PanelSubentryFlow(ConfigSubentryFlow, _PanelOnboardingMixin):
                     host=host,
                     root_password=current.root_password,
                 )
+                if failure is not None and failure.code == "panel_authentication_failed":
+                    from ..provisioning_journal import ProvisioningJournal, ProvisioningJournalError
+
+                    try:
+                        pending = await ProvisioningJournal(
+                            self.hass
+                        ).async_has_pending_address_change(
+                            slug=current.panel, public_key=current.ssh_host_key
+                        )
+                    except ProvisioningJournalError:
+                        pending = False
+                    if pending:
+                        return await self.async_step_repair_credentials()
                 if failure is None:
                     target = self._reconfigure_target()
                     if target is None:
@@ -433,7 +446,7 @@ class PanelSubentryFlow(ConfigSubentryFlow, _PanelOnboardingMixin):
                 errors = dict(error.errors)
             else:
                 password = normalized[CONF_ROOT_PASSWORD]
-                host = normalized.get(CONF_HOST, current.host)
+                host = normalized.get(CONF_HOST, self._reconfigure_host or current.host)
                 failure = await self._async_verify_existing_panel(
                     current,
                     host=host,

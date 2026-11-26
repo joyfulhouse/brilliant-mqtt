@@ -564,6 +564,7 @@ class _FakeJournal:
         state: str,
         *,
         evidence: str | None = None,
+        config_owner: tuple[str, str | None] | None = None,
     ) -> None:
         pass
 

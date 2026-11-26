@@ -659,8 +659,22 @@ async def _async_rollback_credential(
     subentry_id: str | None = None,
 ) -> str | None:
     """Resolve the login only from a current, exactly matching config owner."""
-    if await ProvisioningJournal(hass).async_has_pending_address_change(request):
+    journal = ProvisioningJournal(hass)
+    if await journal.async_has_pending_address_change(
+        slug=request.slug, public_key=request.public_key
+    ):
         return None
+    for retained in await journal.async_retained_records():
+        stored = retained.record.panel_request
+        if (
+            stored.slug == request.slug
+            and stored.public_key == request.public_key
+            and stored.fingerprint == request.fingerprint
+            and retained.config_owner is not None
+        ):
+            if entry_id is not None and (entry_id, subentry_id) != retained.config_owner:
+                return None
+            entry_id, subentry_id = retained.config_owner
     matches: list[str] = []
     for entry in hass.config_entries.async_entries(DOMAIN):
         if entry_id is not None and entry.entry_id != entry_id:
@@ -712,7 +726,9 @@ async def _async_authorize_recorded_recovery(
     expected_entry: ConfigEntry[Any] | None = None,
 ) -> None:
     """Prove current operation authority before using recorded panel credentials."""
-    if await ProvisioningJournal(hass).async_has_pending_address_change(record.panel_request):
+    if await ProvisioningJournal(hass).async_has_pending_address_change(
+        slug=record.panel_request.slug, public_key=record.panel_request.public_key
+    ):
         raise PanelProvisioningError("provisioning_recovery_required")
     try:
         if record.operation is ProvisioningOperation.UPDATE:
@@ -749,6 +765,15 @@ async def _async_authorize_recorded_recovery(
                 raise PanelProvisioningError("rollback_credentials_unavailable") from None
             if retained is None or retained.compensation_password(record) is None:
                 raise PanelProvisioningError("rollback_credentials_unavailable")
+            if retained.config_owner is not None:
+                password = await _async_rollback_credential(
+                    hass,
+                    record.panel_request,
+                    entry_id=retained.config_owner[0],
+                    subentry_id=retained.config_owner[1],
+                )
+                if password is None or password != record.panel_request.root_password:
+                    raise PanelProvisioningError("rollback_credentials_unavailable")
         else:
             raise EntryDataError("provisioning_ownership_mismatch")
     except EntryDataError:
@@ -1364,6 +1389,11 @@ class FleetManager:
         try:
             record = await journal.async_load()
             for retained in await journal.async_retained_records():
+                if await journal.async_has_pending_address_change(
+                    slug=retained.record.panel_request.slug,
+                    public_key=retained.record.panel_request.public_key,
+                ):
+                    continue
                 password = retained.compensation_password(record)
                 if retained.state == "restore_requested" and (
                     record is None or password is not None
@@ -1389,6 +1419,10 @@ class FleetManager:
                 "Provisioning recovery state is temporarily unavailable"
             ) from None
 
+        if record is not None and await journal.async_has_pending_address_change(
+            slug=record.panel_request.slug, public_key=record.panel_request.public_key
+        ):
+            return
         if record is None:
             self._assert_no_orphaned_handoff()
             await self._async_persist_parent_normalization(None)
