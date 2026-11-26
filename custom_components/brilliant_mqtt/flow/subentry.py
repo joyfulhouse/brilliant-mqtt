@@ -297,8 +297,14 @@ class PanelSubentryFlow(ConfigSubentryFlow, _PanelOnboardingMixin):
         """
         from ..provisioning_journal import ProvisioningJournal, ProvisioningJournalError
 
+        target = self._reconfigure_target()
+        if target is None or target[2] != panel:
+            return "parent_changed"
+        entry, subentry, _current = target
         try:
             await ProvisioningJournal(self.hass).async_adopt_verified_host(
+                entry_id=entry.entry_id,
+                subentry_id=subentry.subentry_id,
                 slug=panel.panel,
                 public_key=panel.ssh_host_key,
                 fingerprint=panel.identity_fingerprint,

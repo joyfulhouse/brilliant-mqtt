@@ -1617,6 +1617,8 @@ class ProvisioningJournal:
     async def async_adopt_verified_host(
         self,
         *,
+        entry_id: str,
+        subentry_id: str | None,
         slug: str,
         public_key: str,
         fingerprint: str,
@@ -1655,6 +1657,8 @@ class ProvisioningJournal:
                     fingerprint=fingerprint,
                     host=host,
                     root_password=root_password,
+                    entry_id=entry_id,
+                    subentry_id=subentry_id,
                 ),
             )
             if owner is None:
@@ -1877,7 +1881,7 @@ class ProvisioningJournal:
                 await self._async_save(record)
             elif record.phase is not ProvisioningPhase.COMMITTED:
                 raise ProvisioningJournalError("invalid_journal_transition")
-            await self._async_remove()
+            await self._async_persist(None, self._coordinator.pending_owner)
             return record
 
     async def async_clear_committed(
@@ -1889,7 +1893,7 @@ class ProvisioningJournal:
             record = await self._async_current(transaction_id)
             if record.phase is not ProvisioningPhase.COMMITTED:
                 raise ProvisioningJournalError("invalid_journal_transition")
-            await self._async_remove()
+            await self._async_persist(None, self._coordinator.pending_owner)
             return record
 
     async def async_complete_rollback(
@@ -1908,7 +1912,7 @@ class ProvisioningJournal:
                 await self._async_save(record)
             elif record.phase is not ProvisioningPhase.ROLLED_BACK:
                 raise ProvisioningJournalError("invalid_journal_transition")
-            await self._async_remove()
+            await self._async_persist(None, self._coordinator.pending_owner)
             return record
 
     async def async_complete_cleanup(self, transaction_id: UUID) -> None:
@@ -1917,7 +1921,7 @@ class ProvisioningJournal:
             record = await self._async_current(transaction_id)
             if record.phase is not ProvisioningPhase.STAGED:
                 raise ProvisioningJournalError("invalid_journal_transition")
-            await self._async_remove()
+            await self._async_persist(None, self._coordinator.pending_owner)
 
     async def async_complete_absent_rollback(self, transaction_id: UUID) -> None:
         """An exact first-install undo has no predecessor MQTT session to verify."""
@@ -1930,7 +1934,7 @@ class ProvisioningJournal:
                 raise ProvisioningJournalError("invalid_journal_transition")
             if record.prior_snapshot.baseline is not None:
                 await self._async_retained_state(transaction_id, "restored")
-            await self._async_remove()
+            await self._async_persist(None, self._coordinator.pending_owner)
 
     async def async_diagnostics(self) -> dict[str, object]:
         """Expose allowlisted transaction identity and errors, never recovery secrets."""
@@ -2026,9 +2030,13 @@ class ProvisioningJournal:
                         fingerprint=pending.fingerprint,
                     )
                 ):
-                    # Retiring a removed owner's intent must not discard its
-                    # baseline or prevent recovery of another configured panel.
-                    await self._async_persist(self._coordinator.record, None)
+                    from .fleet_manager import async_wait_config_owner_removed
+
+                    self._hass.config_entries._async_schedule_save()
+                    if await async_wait_config_owner_removed(
+                        self._hass, pending.entry_id, pending.subentry_id
+                    ):
+                        await self._async_persist(self._coordinator.record, None)
                     return
             if require_owner:
                 raise ProvisioningJournalError("journal_save_failed")
@@ -2100,6 +2108,9 @@ class ProvisioningJournal:
             data.get(CONF_HOST) == pending.host
             and data.get(CONF_ROOT_PASSWORD) == pending.root_password
         ):
+            # HA consumes a failed delayed write. Replaying an unchanged RAM
+            # owner must schedule a new save before polling for disk proof.
+            self._hass.config_entries._async_schedule_save()
             return
         updated = {**data, CONF_HOST: pending.host, CONF_ROOT_PASSWORD: pending.root_password}
         try:

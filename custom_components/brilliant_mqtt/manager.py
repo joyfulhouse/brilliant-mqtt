@@ -1821,6 +1821,11 @@ class PanelManager:
 
         try:
             transaction = UUID(name)
+            store = self.store
+            if not isinstance(store, (FleetPanelStore, LegacyPanelStore)):
+                raise _CanaryOperationError("baseline_owner_mismatch")
+            owner_entry_id = store.entry.entry_id
+            owner_subentry_id = store.subentry_id
             journal = ProvisioningJournal(self.hass)
             adopted = False
             for _attempt in range(2):
@@ -1846,6 +1851,8 @@ class PanelManager:
                 # must not retarget a newer verified address.
                 try:
                     await journal.async_adopt_verified_host(
+                        entry_id=owner_entry_id,
+                        subentry_id=owner_subentry_id,
                         slug=self.panel,
                         public_key=pinned_key,
                         fingerprint=fingerprint,

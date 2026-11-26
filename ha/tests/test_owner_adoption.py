@@ -4,22 +4,28 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
 import pytest
+from homeassistant import config_entries
 from homeassistant.const import CONF_NAME
 from homeassistant.core import HomeAssistant
+from homeassistant.util.file import WriteError
 
 from custom_components.brilliant_mqtt import fleet_manager, panel_ops
 from custom_components.brilliant_mqtt.const import CONF_HOST, CONF_ROOT_PASSWORD
 from custom_components.brilliant_mqtt.flow import gateway
 from custom_components.brilliant_mqtt.provisioning_journal import (
+    _JOURNAL_COORDINATOR_KEY,
     JOURNAL_STORAGE_KEY,
     ProvisioningJournal,
     ProvisioningJournalError,
+    ProvisioningPhase,
 )
 from tests.fakes import FakeShell
 from tests.test_address_baseline_host import (
@@ -195,6 +201,8 @@ async def test_removed_owner_intent_does_not_block_another_panel(
         )
         with pytest.raises(ProvisioningJournalError):
             await ProvisioningJournal(hass).async_adopt_verified_host(
+                entry_id=entry.entry_id,
+                subentry_id=first.subentry_id,
                 slug="office",
                 public_key=_PUBLIC_KEY,
                 fingerprint=_FINGERPRINT,
@@ -214,6 +222,8 @@ async def test_removed_owner_intent_does_not_block_another_panel(
         provisioner.async_rollback.assert_awaited_once_with(other.transaction_id)
     else:
         await ProvisioningJournal(hass).async_adopt_verified_host(
+            entry_id=entry.entry_id,
+            subentry_id=second.subentry_id,
             slug="kitchen",
             public_key=_OTHER_PUBLIC_KEY,
             fingerprint=_OTHER_FINGERPRINT,
@@ -285,3 +295,179 @@ async def test_canary_dispatch_serializes_with_verified_repair(
         await fleet_manager._async_authorize_recorded_recovery(hass, active)
     else:
         assert await ProvisioningJournal(hass).async_retained(record.transaction_id) is None
+
+
+async def test_failed_core_write_is_rescheduled_on_replay(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    entry, panel = _fleet(hass)
+    store = hass.config_entries._store
+    await store.async_save(hass.config_entries._data_to_save())
+    await ProvisioningJournal(hass).async_create(_managed_record(host=_OLD_HOST))
+    monkeypatch.setattr(config_entries, "SAVE_DELAY", 0.01)
+    monkeypatch.setattr(fleet_manager, "_CONFIG_ENTRY_PERSISTENCE_TIMEOUT_SECONDS", 0.4)
+    monkeypatch.setattr(fleet_manager, "_CONFIG_ENTRY_PERSISTENCE_POLL_SECONDS", 0.01)
+    with monkeypatch.context() as fault:
+        failure = AsyncMock(side_effect=WriteError("test core write failure"))
+        fault.setattr(store, "_async_write_data", failure)
+        result = await _change(
+            hass,
+            entry,
+            panel,
+            **{
+                CONF_HOST: _NEW_HOST,
+                CONF_ROOT_PASSWORD: "verified-login",
+            },
+        )
+        assert result["errors"]["base"] == "journal_failed"
+        failure.assert_awaited()
+    assert store._data is None
+    loaded = await ProvisioningJournal(hass).async_load()
+    assert loaded is not None
+    await fleet_manager._async_authorize_recorded_recovery(hass, loaded)
+    assert "pending_owner" not in _storage_data(hass, JOURNAL_STORAGE_KEY)
+
+
+async def test_unflushed_owner_removal_preserves_recovery_intent(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    entry, panel = _fleet(hass)
+    await hass.config_entries._store.async_save(hass.config_entries._data_to_save())
+    record = _baseline_record(host=_OLD_HOST)
+    await _arm_soak(hass, record)
+    monkeypatch.setattr(config_entries, "SAVE_DELAY", 60)
+    monkeypatch.setattr(fleet_manager, "_CONFIG_ENTRY_PERSISTENCE_TIMEOUT_SECONDS", 0.05)
+    result = await _change(
+        hass,
+        entry,
+        panel,
+        **{
+            CONF_HOST: _NEW_HOST,
+            CONF_ROOT_PASSWORD: "verified-new-login",
+        },
+    )
+    assert result["errors"]["base"] == "journal_failed"
+    hass.config_entries.async_remove_subentry(entry, panel.subentry_id)
+    assert await ProvisioningJournal(hass).async_load() is None
+    assert "pending_owner" in _storage_data(hass, JOURNAL_STORAGE_KEY)
+    disk = _storage_data(hass, "core.config_entries")["entries"][0]["subentries"][0]
+    restored = config_entries.ConfigSubentry(
+        data=MappingProxyType(disk["data"]),
+        subentry_id=disk["subentry_id"],
+        subentry_type=disk["subentry_type"],
+        title=disk["title"],
+        unique_id=disk["unique_id"],
+    )
+    monkeypatch.setattr(config_entries, "SAVE_DELAY", 0.01)
+    monkeypatch.setattr(fleet_manager, "_CONFIG_ENTRY_PERSISTENCE_TIMEOUT_SECONDS", 1.0)
+    # A cold HA restart also replaces the core Store's in-memory delay state.
+    hass.config_entries._store = config_entries.ConfigEntryStore(hass)
+    hass.config_entries.async_add_subentry(entry, restored)
+    hass.data.pop(_JOURNAL_COORDINATOR_KEY)
+    await ProvisioningJournal(hass).async_load()
+    retained = await ProvisioningJournal(hass).async_retained(record.transaction_id)
+    assert retained is not None
+    assert (
+        await fleet_manager._async_rollback_credential(hass, retained.record.panel_request)
+        == "verified-new-login"
+    )
+
+
+async def test_queued_repair_refuses_replacement_subentry(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    entry, panel = _fleet(hass)
+    form = await _start_panel_reconfigure_step(hass, entry, panel, "repair_credentials")
+    entered = asyncio.Event()
+    original = ProvisioningJournal.async_adopt_verified_host
+
+    async def queued(journal: ProvisioningJournal, **kwargs: Any) -> None:
+        entered.set()
+        await original(journal, **kwargs)
+
+    monkeypatch.setattr(ProvisioningJournal, "async_adopt_verified_host", queued)
+    async with fleet_manager._shared_ssh_lock(hass):
+        changing = asyncio.create_task(
+            hass.config_entries.subentries.async_configure(
+                form["flow_id"], {CONF_HOST: _NEW_HOST, CONF_ROOT_PASSWORD: "old-flow-login"}
+            )
+        )
+        await asyncio.wait_for(entered.wait(), 5)
+        hass.config_entries.async_remove_subentry(entry, panel.subentry_id)
+        added = config_entries.ConfigSubentry(
+            data=MappingProxyType(dict(panel.data)),
+            subentry_id=uuid4().hex,
+            subentry_type=panel.subentry_type,
+            title=panel.title,
+            unique_id=panel.unique_id,
+        )
+        hass.config_entries.async_add_subentry(entry, added)
+    result = await changing
+    assert result["reason"] == "parent_changed"
+    assert added.data == panel.data
+
+
+async def test_other_panel_handoff_preserves_pending_owner(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    entry, office = _fleet(hass)
+    kitchen = _subentry(
+        slug="kitchen",
+        subentry_id="panel-kitchen",
+        public_key=_OTHER_PUBLIC_KEY,
+        fingerprint=_OTHER_FINGERPRINT,
+        priority=2,
+    )
+    hass.config_entries.async_add_subentry(entry, kitchen)
+    await hass.config_entries._store.async_save(hass.config_entries._data_to_save())
+    journal = ProvisioningJournal(hass)
+    office_record = _baseline_record(host=_OLD_HOST)
+    await _arm_soak(hass, office_record)
+    other = _baseline_record(
+        host=kitchen.data[CONF_HOST],
+        slug="kitchen",
+        public_key=_OTHER_PUBLIC_KEY,
+        fingerprint=_OTHER_FINGERPRINT,
+        transaction_id=uuid4(),
+    )
+    other = replace(
+        other,
+        fleet_profile=_managed_record(host=_OLD_HOST).fleet_profile,
+        panel_request=replace(other.panel_request, root_password=kitchen.data[CONF_ROOT_PASSWORD]),
+    )
+    await journal.async_create(other)
+    for phase in (
+        ProvisioningPhase.ACTIVATION_PENDING,
+        ProvisioningPhase.ACTIVATED,
+        ProvisioningPhase.VERIFYING,
+        ProvisioningPhase.PENDING_CONFIG_COMMIT,
+    ):
+        await journal.async_transition(other.transaction_id, phase)
+    runtime = fleet_manager.FleetManager(hass, entry)
+    runtime._panels[kitchen.subentry_id] = _manager(hass, entry, kitchen)
+    runtime._runtime_owned_panel_ids.add(kitchen.subentry_id)
+    await runtime._async_prepare_provisioning()
+    assert runtime._pending_handoff is not None
+    with monkeypatch.context() as fault:
+        fault.setattr(
+            hass.config_entries, "async_update_subentry", Mock(side_effect=OSError("test update"))
+        )
+        result = await _change(
+            hass,
+            entry,
+            office,
+            **{
+                CONF_HOST: _NEW_HOST,
+                CONF_ROOT_PASSWORD: "verified-office-login",
+            },
+        )
+        assert result["errors"]["base"] == "journal_failed"
+    assert await runtime._async_complete_pending_handoff()
+    hass.data.pop(_JOURNAL_COORDINATOR_KEY)
+    assert await ProvisioningJournal(hass).async_load() is None
+    retained = await ProvisioningJournal(hass).async_retained(office_record.transaction_id)
+    assert retained is not None
+    assert (
+        await fleet_manager._async_rollback_credential(hass, retained.record.panel_request)
+        == "verified-office-login"
+    )

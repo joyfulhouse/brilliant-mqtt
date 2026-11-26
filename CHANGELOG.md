@@ -123,7 +123,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   configuration is proven on disk, including after cancellation. Address and
   credential repairs serialize with canary rollback/finalization, preserve
   concurrent renames, and bind interrupted changes to the original config
-  owner so removing it cannot block another panel's retained baseline. Refs #259.
+  owner so removing it cannot block another panel's retained baseline once
+  removal is durable. Completing another panel's transaction preserves that
+  intent, and replay retries a failed HA configuration save. A queued repair
+  cannot retarget a replacement subentry. Refs #259.
 
 ## [0.12.2] - 2026-11-17
 
