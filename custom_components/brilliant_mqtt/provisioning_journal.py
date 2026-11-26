@@ -1040,6 +1040,7 @@ class _PendingOwner:
     root_password: str = field(repr=False)
     entry_id: str | None = None
     subentry_id: str | None = None
+    expected_host: str | None = None
 
     def __post_init__(self) -> None:
         identity_failed = False
@@ -1047,6 +1048,8 @@ class _PendingOwner:
         try:
             identity = HostIdentity(self.public_key, self.fingerprint)
             known_hosts_line(self.host, identity.public_key)
+            if self.expected_host is not None:
+                known_hosts_line(self.expected_host, identity.public_key)
         except (PanelIdentityError, TypeError, ValueError):
             identity_failed = True
         if identity_failed or identity is None:
@@ -1076,11 +1079,13 @@ class _PendingOwner:
         }
         if self.entry_id is not None:
             result.update(entry_id=self.entry_id, subentry_id=self.subentry_id)
+        if self.expected_host is not None:
+            result["expected_host"] = self.expected_host
         return result
 
     @classmethod
     def _from_storage(cls, raw: object) -> Self:
-        if not isinstance(raw, dict) or frozenset(raw) not in {
+        if not isinstance(raw, dict) or frozenset(raw) - {"expected_host"} not in {
             _PENDING_OWNER_KEYS,
             _BOUND_PENDING_OWNER_KEYS,
         }:
@@ -1096,6 +1101,7 @@ class _PendingOwner:
             subentry_id=(
                 _string(value["subentry_id"]) if value.get("subentry_id") is not None else None
             ),
+            expected_host=_string(value["expected_host"]) if "expected_host" in value else None,
         )
 
 
@@ -1107,7 +1113,15 @@ def _pending_secrets(
     if record is not None:
         found.extend(_storage_secrets(record))
     if pending is not None:
-        found.extend((pending.root_password, pending.host, pending.public_key, pending.fingerprint))
+        found.extend(
+            (
+                pending.root_password,
+                pending.host,
+                pending.public_key,
+                pending.fingerprint,
+                pending.expected_host or "",
+            )
+        )
     return tuple(item for item in found if item)
 
 
@@ -1713,6 +1727,7 @@ class ProvisioningJournal:
                 root_password=root_password,
                 entry_id=entry.entry_id,
                 subentry_id=subentry.subentry_id if subentry is not None else None,
+                expected_host=expected_host if subentry is None else None,
             )
             retained = await self._async_retained_load()
             # No active journal or retained row belongs to this panel. The
@@ -2098,6 +2113,26 @@ class ProvisioningJournal:
                     await self._async_persist(self._coordinator.record, None)
             return
         active = self._coordinator.record
+        legacy_replay = (
+            not require_owner
+            and owner[1] is None
+            and not (
+                active is not None
+                and _same_verified_panel(
+                    active.panel_request,
+                    slug=pending.slug,
+                    public_key=pending.public_key,
+                    fingerprint=pending.fingerprint,
+                )
+            )
+        )
+        expected_host = pending.expected_host or pending.host
+        if legacy_replay:
+            # Old canary intents recorded the owner's existing host. Never
+            # replay over a later address already committed to core storage.
+            if await self._async_stored_legacy_host(owner[0], pending) != expected_host:
+                await self._async_persist(active, None)
+                return
         if active is not None and _same_verified_panel(
             active.panel_request,
             slug=pending.slug,
@@ -2133,7 +2168,9 @@ class ProvisioningJournal:
                     pending.fingerprint,
                 ),
             )
-        self._update_config_owner(owner, pending)
+        self._update_config_owner(
+            owner, pending, expected_host=expected_host if legacy_replay else None
+        )
         from .fleet_manager import ConfigEntryPersistenceError, async_wait_config_entry_persisted
 
         entry, subentry, _data = owner
@@ -2151,15 +2188,51 @@ class ProvisioningJournal:
             pending.slug,
         )
 
+    async def _async_stored_legacy_host(
+        self,
+        entry: ConfigEntry[Any],
+        pending: _PendingOwner,
+    ) -> str:
+        core_store = self._hass.config_entries._store
+        store = Store(
+            self._hass,
+            core_store.version,
+            core_store.key,
+            minor_version=core_store.minor_version,
+        )
+        try:
+            async with asyncio.timeout(_STORE_LOAD_TIMEOUT_SECONDS):
+                saved = await store.async_load()
+        except Exception:
+            raise ProvisioningJournalError("journal_save_failed") from None
+        rows = saved.get("entries") if saved is not None else None
+        if not isinstance(rows, list):
+            raise ProvisioningJournalError("journal_save_failed")
+        owners = [
+            row
+            for row in rows
+            if isinstance(row, Mapping) and row.get("entry_id") == entry.entry_id
+        ]
+        if len(owners) != 1 or owners[0].get("domain") != DOMAIN:
+            raise ProvisioningJournalError("journal_save_failed")
+        data = owners[0].get("data")
+        if not isinstance(data, Mapping) or not _config_owner_matches(data, pending):
+            raise ProvisioningJournalError("journal_save_failed")
+        return _string(data.get(CONF_HOST))
+
     def _update_config_owner(
         self,
         owner: tuple[ConfigEntry[Any], ConfigSubentry | None, Mapping[str, Any]],
         pending: _PendingOwner,
+        *,
+        expected_host: str | None = None,
     ) -> None:
         current = _matching_config_owner(self._hass, pending)
         if current is None or current[:2] != owner[:2]:
             raise ProvisioningJournalError("owner_changed")
         entry, subentry, data = current
+        if expected_host is not None and data.get(CONF_HOST) not in {expected_host, pending.host}:
+            raise ProvisioningJournalError("owner_changed")
         if (
             data.get(CONF_HOST) == pending.host
             and data.get(CONF_ROOT_PASSWORD) == pending.root_password

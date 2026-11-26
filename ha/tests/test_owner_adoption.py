@@ -56,13 +56,63 @@ from tests.test_config_flow import (
     _PUBLIC_KEY,
     _fleet_entry,
     _identity,
+    _open_legacy_reconfigure_step,
     _start_panel_reconfigure_step,
     _subentry,
+    _submit_legacy_reconfigure,
 )
 from tests.test_init import ENTRY_DATA
 from tests.test_manager import _legacy_manager
 
 pytestmark = pytest.mark.usefixtures("durable_journal")
+
+
+@pytest.mark.parametrize("later_edit", [False, True])
+@pytest.mark.parametrize("old_format", [False, True])
+async def test_legacy_replay_preserves_later_saved_address(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch, later_edit: bool, old_format: bool
+) -> None:
+    monkeypatch.setattr(config_entries, "SAVE_DELAY", 0.01)
+    entry, manager = _legacy_runtime(hass, host=_NEW_HOST, public_key=_PUBLIC_KEY)
+    await hass.config_entries._store.async_save(hass.config_entries._data_to_save())
+    record = _baseline_record(host=_OLD_HOST)
+    await _arm_soak(hass, record)
+    with monkeypatch.context() as fault:
+        fault.setattr(
+            ProvisioningJournal,
+            "_async_retained_save",
+            AsyncMock(side_effect=ProvisioningJournalError("journal_save_failed")),
+        )
+        with pytest.raises(HomeAssistantError, match="journal_save_failed"):
+            await manager.async_canary_operation("finalize", str(record.transaction_id))
+    if old_format:
+        journal = ProvisioningJournal(hass)
+        saved = await journal._store.async_load()
+        assert saved is not None
+        saved["pending_owner"].pop("expected_host")
+        await journal._store.async_save(saved)
+    expected_host = _NEW_HOST
+    if later_edit:
+        expected_host = "later-office.example"
+        form = await _open_legacy_reconfigure_step(hass, entry, "reconfigure_connection")
+        result = await _submit_legacy_reconfigure(
+            hass,
+            form,
+            {CONF_HOST: expected_host, CONF_ROOT_PASSWORD: ""},
+            AsyncMock(return_value=_PUBLIC_KEY),
+        )
+        assert result["reason"] == "reconfigure_successful"
+        await hass.config_entries._store.async_save(hass.config_entries._data_to_save())
+    assert entry.data[CONF_HOST] == expected_host
+    assert await ProvisioningJournal(hass).async_load() is None
+    assert entry.data[CONF_HOST] == expected_host
+    retained = await ProvisioningJournal(hass).async_retained(record.transaction_id)
+    assert retained is not None
+    assert retained.record.panel_request.host == (_OLD_HOST if later_edit else _NEW_HOST)
+    assert retained.state == "soak"
+    assert not await hass.async_add_executor_job(
+        Path(hass.config.path(".storage", JOURNAL_STORAGE_KEY)).exists
+    )
 
 
 @pytest.mark.parametrize("durable_removal", [False, True])
