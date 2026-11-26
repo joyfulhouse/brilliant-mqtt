@@ -18,10 +18,12 @@ unjournaled legacy key types and slugs. Address moves cannot change slug/pin.
 
 Change network address, Repair SSH credentials, and legacy Connection call this
 service after current-request verification. Candidate connections check the
-stored key before login/writes; no address-move TOFU. Unjournaled legacy endpoint
-replacement requires an explicit choice: discover the key without login, confirm
-its fingerprint, then connect pinned to it. Recheck no active/retained/pending
-record under the lock before login/writes; transfer no baseline or old intent.
+stored key before login/writes; no address-move TOFU. Under the operation lock,
+refuse a candidate key/identity owned by another fleet subentry or legacy entry,
+including key-only entries and supported legacy key types, before login/writes.
+Different-key legacy endpoint replacement is unsupported in v1: preserve config
+and evidence/typed repair; return `host_key_changed`. Remove guidance suggesting
+Connection can accept a new key. Same-key legacy changes remain supported.
 Canaries never adopt: report typed `baseline_owner_mismatch` or
 `address_change_incomplete`. Re-running the verified form repairs stranded
 baselines, including same-address submissions.
@@ -50,16 +52,17 @@ fields into fresh config. No stale full-data saves; no lock waits for a reload.
    consumed failed save. Wait for bounded proof in real `core.config_entries`
    of the exact owner, resulting connection and commit ID, checking live
    ownership before/after each read. Equality in RAM is insufficient.
+   Fleet, legacy and migration schemas accept an optional canonical UUID commit
+   ID as owner metadata, never panel settings. Absence gives no proof for a new
+   commit. Migration copies no commit ID into its destination entries.
 5. Re-read/validate all affected records and the exact live/durable config.
    Only then atomically remove this intent and read back the envelope. This
-   removal is the commit point. Report success only after it is proven. Request
-   runtime reconciliation explicitly, even for a same-value retry. Proven
-   removal enqueues this idempotent notification and reconciles repair issues
-   before propagating cancellation; neither waits for recovery under the lock.
-   If the runtime is absent or HA is stopping, normal startup consumes committed
-   state. Other enqueue failures report a retryable error and retain the repair;
-   a fresh form retries notification even with no remaining pending intent.
-   The committed tuple is never undone for a notification failure.
+   removal is the commit point. Before success or cancellation propagation,
+   enqueue idempotent runtime reconciliation and reconcile issues, even on a
+   same-value retry. Never wait for recovery under the lock. Absent runtimes or
+   stopping HA use normal startup; other enqueue failures return a retryable
+   error and retain the repair. A fresh form retries notification without an
+   intent. Never undo the committed tuple for notification failure.
 
 Errors, timeouts, drift and cancellation after step 2 retain intent and fail the
 request. Shielded writes settle/read back before unlocking. Never compensate
@@ -67,11 +70,10 @@ with an older tuple. Reconcile issues against durable intent state.
 
 ## Reload, recovery, and isolation
 
-`PanelConnectionOwner` supplies the single connection-resolution/admission
-reader used by startup, background recovery, named finalize/rollback, onboarding
-compensation, and removal recovery (including INSTALL/UPGRADE). It reads pending
-state before returning connection data, under the operation lock at dispatch.
-It never applies, retries, or retires an intent during passive loading.
+The owner's single admission reader gates startup, background/named recovery,
+onboarding compensation and removal (including INSTALL/UPGRADE). Under the
+operation lock, check pending state before dispatching connection data.
+Passive loading never applies, retries or retires intents.
 
 | Interruption | Reload behavior |
 | --- | --- |
@@ -81,54 +83,60 @@ It never applies, retries, or retires an intent during passive loading.
 | Proven intent removal | Committed config and normal checks. |
 | Later edit, removal/replacement or re-pin | Preserve evidence; never replay, overwrite or transfer. |
 
-All incomplete states yield one typed `address_change_incomplete` repair per
-original owner: **re-run Change network address** (legacy: **Connection**).
-If the saved login fails, Change network address routes to the current-login
-form while retaining the entered host; only successful fresh verification can
-complete the commit. Missing owners leave an actionable diagnostic with the
-same code and preserved evidence; recreating an owner never inherits it.
+Incomplete moves yield one `address_change_incomplete` repair per original
+owner: **re-run Change network address** (legacy: **Connection**). Failed saved
+login routes to the current-login form, retaining the entered host. Only fresh
+verification completes commit. Missing owners retain the diagnostic/evidence;
+recreating an owner never inherits it.
 
 Fleet setup defers only records whose owner cannot currently be resolved,
 including a named intent bound to a removed owner. It still constructs healthy
 sibling runtimes. Background recovery skips deferred retained finalizations;
 explicit rollback processes its named transaction, not unrelated finalizations.
 
-Named rollback uses a transaction-scoped journal view backed by optional
-`recovery_record` in its retained row. Phase/error/evidence/completion writes
-touch only that row; login is omitted on disk and resolved from the bound live
-owner before dispatch. Cold reload resumes kitchen's scoped rollback without
-replacing office's active record. An existing same-transaction active rollback
-continues in place with a bound retained marker; never duplicate it. Finalize
-uses its own retained marker, without an unrelated-active-slot veto. All execute
-under the operation lock; new provisioning still requires the single free slot.
+Before writing any named marker, apply this admission matrix:
 
-Named rollback/finalize persist the original owner IDs with their intent and
-check them on continuation and cold recovery. A queued request cannot borrow
-a replacement owner's login. An explicit operation re-reads the named record
-under the operation lock after an intervening verified change: it executes the
-fresh authorized record or returns a retryable typed error, never silent success
-from the background worker's stale-record comparison.
+| Active slot | Named rollback | Named finalize |
+| --- | --- | --- |
+| Empty or different transaction | Retained scoped record | Own retained marker |
+| Same transaction, ROLLBACK | Continue active record in place | Refuse |
+| Same transaction, any other operation | Refuse | Refuse |
 
-Old named ROLLBACK/restore-requested/finalizing markers lack owner IDs:
-defer them, preserve evidence, report the existing recovery repair, start
-siblings. Never infer past authority from lookalike config. A new explicit
-named request binds its selected current owner under the operation lock;
-an address mismatch first requires the verified form. Passive old soak rows
-remain usable. Existing independently proven onboarding/ownerless authority
-keeps its separate recovery path, subject to the pending-connection gate.
-Pending connection commits always need fresh form verification.
+Refusal is typed `provisioning_recovery_required`, with no marker write or new
+authority. In v1, the existing active path alone settles same-transaction
+updates/installs/upgrades; no competing scoped rollback or handoff can be added.
+A scoped journal view stores optional `recovery_record` in its retained row;
+phase/error/evidence/completion writes touch only that row. Omit login on disk;
+resolve it from the bound live owner before dispatch. Cold reload resumes
+kitchen without replacing office's active record. All execution uses the
+operation lock; new provisioning still requires the single free slot.
+
+Named intents persist original owner IDs; check them on continuation/cold
+recovery. Never borrow replacement-owner login. Explicit requests re-read under
+the operation lock after intervening changes: execute the fresh authorized
+record or return a typed retryable error, never background-style silent success.
+
+Defer old unbound named ROLLBACK/restore-requested/finalizing markers with the
+existing recovery repair; start siblings. Never infer past authority from
+lookalike config. A new explicit named request binds the selected current owner
+under lock; address mismatch requires the verified form first. Old soak rows
+remain usable. Independently proven onboarding/ownerless authority keeps its
+separate path, subject to the pending gate.
+
+Migration preflight and locked execution both refuse a participating panel
+with pending address intent, including pending-only envelopes. Check owner IDs
+and slug/key associations; preserve its original entry and Connection repair.
+Migration becomes eligible again after verified repair. No intent is migrated.
 
 ## Scope and verification
 
-No automatic replay, fleet/journal-backed pin changes, slug changes, baseline
-deletion, new panel process, polling, extra provisioning slot or private HA
-forced-save API. Use existing bounded disk proof. Read old record-only envelopes
-and retained rows without scoped recovery; unbound markers need explicit
-authorization. No unmerged #260 format migration. Invalid storage retains
-existing refusal rules.
+No automatic replay, pin/slug changes, baseline deletion, new panel process,
+polling, extra provisioning slot or private HA forced-save API. Read old
+record-only envelopes/retained rows; no unmerged #260 format migration.
+Invalid storage retains existing refusal rules.
 
-TDD reuses S2/S8 repros: delayed saves/cold loads, later edits, combined repair,
-replacement owners, removal, sibling startup/rollback with an occupied slot,
-same-value retry plus final-removal cancellation, legacy formats/key types/slugs.
-Exercise production readers/setup behind offline fakes. Local static/focused
-gates and CI full suites are required; live panel validation remains outstanding.
+TDD reuses S2/S8 crash/concurrency repros against production readers/setup and
+offline fakes. Include legacy compatibility, same-value cancellation/wakeup,
+occupied-slot sibling rollback, same-transaction refusal/single authority,
+in-place rollback, migration refusal and marker schemas. Local static/focused
+gates and CI full suites are required. Live validation remains outstanding.
