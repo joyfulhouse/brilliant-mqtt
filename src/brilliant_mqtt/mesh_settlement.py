@@ -303,7 +303,7 @@ class MeshSettlement:
             ):
                 self._metadata = event.metadata
         elif isinstance(event, RequestPublication):
-            self._touch(effects)
+            self._touch(effects, force=True)
         elif isinstance(event, RetireAbsent):
             tracked = (
                 self._phase in (Phase.ISSUING, Phase.UNRESOLVED, Phase.INCONCLUSIVE, Phase.ACCEPTED)
@@ -435,10 +435,10 @@ class MeshSettlement:
             and all(name in _PRIMARY for name, _ in targets)
         )
 
-    def _touch(self, effects: list[Effect]) -> None:
+    def _touch(self, effects: list[Effect], *, force: bool = False) -> None:
         self._revision += 1
         self._ordinary_debt = self._revision
-        effects.append(WakePublication(self))
+        effects.append(WakePublication(self, force=force))
 
     def _end_window(self, effects: list[Effect]) -> None:
         effects.append(RevokeEffects(self, self._window_identity))
@@ -785,7 +785,10 @@ class MeshSettlement:
             return
         if token.terminal is not None:
             self._terminal = None
-        if token.revision == self._ordinary_debt:
+        # A terminal override may hide ordinary state already present at minting.
+        if token.revision == self._ordinary_debt and (
+            token.terminal is None or token.terminal.reason == self._status
+        ):
             self._ordinary_debt = None
         if self._ordinary_debt is not None:
             effects.append(WakePublication(self))

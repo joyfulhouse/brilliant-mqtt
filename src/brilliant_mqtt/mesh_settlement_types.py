@@ -295,6 +295,7 @@ class RevokeEffects:
 @dataclass(frozen=True)
 class WakePublication:
     owner: MeshSettlement
+    force: bool = False
 
 
 Event = (

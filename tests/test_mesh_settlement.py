@@ -36,6 +36,7 @@ from brilliant_mqtt.mesh_settlement_types import (
     ScopeUnknown,
     SeedBinding,
     Source,
+    WakePublication,
     WorkerCancelled,
 )
 from brilliant_mqtt.model import DeviceKind, PrimitiveCapture, PrimitiveField
@@ -456,6 +457,45 @@ def test_unconfirmed_terminal_render_never_borrows_known_ordinary_primary() -> N
     assert slot.render(84)["state"] == "ON"
     assert slot.render(84, token=token)["state"] is None
     assert slot.render(84, token=token)["mesh_write_status"] == "unconfirmed"
+
+
+@pytest.mark.parametrize("reason", ["unconfirmed", "contradicted"])
+def test_terminal_ack_preserves_idle_debt_created_before_attempt(reason: str) -> None:
+    slot, _ = accepted()
+    if reason == "unconfirmed":
+        expire(slot, 5, 83)
+    else:
+        observe(slot, 5, 83, on="0")
+    observe(slot, 6, 84, on="1")
+    assert slot.render(84)["mesh_write_status"] == "idle"
+    revision = slot.view.ordinary_debt
+    token = slot.publication_token(object())
+    assert token is not None
+    assert slot.render(84, token=token)["mesh_write_status"] == reason
+    slot.dispatch(PublishStarted(env(slot, 7, 85), token))
+
+    effects = slot.dispatch(PublishAccepted(env(slot, 8, 86), token))
+
+    assert slot.view.terminal is None
+    assert slot.view.ordinary_debt == revision
+    assert any(isinstance(effect, WakePublication) for effect in effects)
+    ordinary = slot.publication_token(token.client_session)
+    assert ordinary is not None and ordinary.terminal is None
+    assert slot.render(86, token=ordinary)["state"] == "ON"
+    slot.dispatch(PublishStarted(env(slot, 9, 87), ordinary))
+    slot.dispatch(PublishAccepted(env(slot, 10, 88), ordinary))
+    assert slot.publication_token(token.client_session) is None
+
+
+def test_terminal_ack_clears_matching_ordinary_render() -> None:
+    slot, _ = accepted()
+    expire(slot, 5, 83)
+    token = slot.publication_token(object())
+    assert token is not None
+    assert slot.render(83, token=token) == slot.render(83)
+    slot.dispatch(PublishStarted(env(slot, 6, 84), token))
+    assert slot.dispatch(PublishAccepted(env(slot, 7, 85), token)) == ()
+    assert slot.publication_token(token.client_session) is None
 
 
 def test_successful_idle_expiry_also_revokes_old_window_child() -> None:

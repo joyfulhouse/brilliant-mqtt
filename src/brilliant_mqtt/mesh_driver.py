@@ -19,6 +19,7 @@ from brilliant_mqtt.mesh_settlement_types import (
     PublishAccepted,
     PublishFailed,
     PublishStarted,
+    RequestPublication,
     RevokeEffects,
     WakePublication,
     WindowToken,
@@ -90,10 +91,16 @@ class MeshDriver:
         return lane
 
     def wake(self, owner: MeshSettlement, *, force: bool = False) -> None:
+        if force:
+            if not self.registry.live(owner):
+                return
+            envelope = self.registry.reserve(owner, "reconcile")
+            if envelope is not None and self.registry.live(owner):
+                self.registry.dispatch(owner, RequestPublication(envelope))
+            return
         if not self.registry.live(owner, publication=True):
             return
         lane = self._lane(owner)
-        lane.force |= force
         lane.idle.clear()
         lane.wake.set()
         if lane.worker is None:
@@ -149,6 +156,7 @@ class MeshDriver:
                         name=f"mesh-expiry-{owner.metadata.peripheral_id}",
                     )
             elif isinstance(effect, WakePublication):
+                lane.force |= effect.force
                 self.wake(owner)
 
     @staticmethod
