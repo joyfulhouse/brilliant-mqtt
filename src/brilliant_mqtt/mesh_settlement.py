@@ -199,7 +199,7 @@ class MeshSettlement:
         )
 
     def publication_token(self, client_session: object) -> PublicationToken | None:
-        """Describe latest debt; PublishStarted registers the worker's exact attempt."""
+        """Mint once per attempt; carry this exact fresh object through start/result."""
         if self._phase is Phase.INACTIVE or (
             self._terminal is None and self._ordinary_debt is None
         ):
@@ -519,6 +519,7 @@ class MeshSettlement:
             else capture.reported
         )
         changed = False
+        admitted_score: PrimitiveField | None = None
         present: set[str] = set()
         for field in capture.fields:
             name = field.name
@@ -528,19 +529,17 @@ class MeshSettlement:
             reliable = capture.reliable and name in reported
             if not reliable:
                 continue
-            changed |= self._merge(name, field, event.envelope, effects, seed=seed)
+            merged = self._merge(name, field, event.envelope, effects, seed=seed)
+            changed |= merged
+            if merged and name == "motion_score":
+                admitted_score = field
         removed = capture.removed if capture.reliable else frozenset()
         if capture.complete and capture.reliable:
             removed = removed | (self._supported - present)
         for name in removed & self._supported:
             changed |= self._merge(name, None, event.envelope, effects, seed=seed)
-        if (
-            capture.reliable
-            and "motion_score" in reported
-            and self._watermarks.get("motion_score") == event.envelope.sequence
-            and "motion_score" in self._fields
-        ):
-            self._motion_score(self._fields["motion_score"], event.envelope.captured_at)
+        if admitted_score is not None:
+            self._motion_score(admitted_score, event.envelope.captured_at)
         if changed:
             self._touch(effects)
 
@@ -687,7 +686,7 @@ class MeshSettlement:
         self, event: PublishAccepted | PublishFailed, effects: list[Effect]
     ) -> None:
         token = event.token
-        if token != self._in_flight:
+        if token is not self._in_flight:
             return
         self._in_flight = None
         if not isinstance(event, PublishAccepted) or not self._publication_current(token):

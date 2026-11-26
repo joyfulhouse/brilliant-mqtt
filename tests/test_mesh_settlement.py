@@ -599,8 +599,10 @@ def test_old_ordinary_ack_cannot_clear_new_debt_and_failed_publish_keeps_debt() 
     slot.dispatch(PublishStarted(env(slot, 5, 4), current))
     slot.dispatch(PublishFailed(env(slot, 6, 5), current))
     assert slot.view.ordinary_debt == debt
-    slot.dispatch(PublishStarted(env(slot, 7, 6), current))
-    slot.dispatch(PublishAccepted(env(slot, 8, 7), current))
+    retry = slot.publication_token(object())
+    assert retry is not None and retry is not current
+    slot.dispatch(PublishStarted(env(slot, 7, 6), retry))
+    slot.dispatch(PublishAccepted(env(slot, 8, 7), retry))
     assert slot.view.ordinary_debt is None
     observe(slot, 9, 8, power="123")
     newer = slot.view.ordinary_debt
@@ -843,8 +845,8 @@ def test_superseded_physical_completion_preserves_current_intent_render_and_debt
     second = begin(slot, seq=6, at=8, targets=targets)
     before = slot.view
     document = slot.render(8)
-    session = object()
-    token = slot.publication_token(session)
+    token = slot.publication_token(object())
+    assert token is not None
     assert before.phase is Phase.ISSUING
     assert before.status == "superseded"
     assert document["state"] == "ON"
@@ -855,7 +857,7 @@ def test_superseded_physical_completion_preserves_current_intent_render_and_debt
 
     assert slot.view == replace(before, completion_hold=None)
     assert slot.render(9) == document
-    assert slot.publication_token(session) == token
+    assert slot.render(9, token=token) == document
     assert effects == ()
     issue(slot, second, seq=8, at=10)
     issued = slot.view
@@ -904,3 +906,80 @@ def test_aux_replay_ignores_copied_mirror_but_yields_to_actual_native_report(
     native = slot.materialize(4).variables["enable_motion_score"]
     assert native.value == expected and native.timestamp_ms == 1234
     assert dict(slot.view.watermarks)["enable_motion_score"] == 5
+
+
+@pytest.mark.parametrize("terminal", [False, True])
+@pytest.mark.parametrize("stale_result", [PublishFailed, PublishAccepted])
+def test_old_publication_result_cannot_consume_fresh_retry_attempt(
+    terminal: bool,
+    stale_result: type[PublishFailed] | type[PublishAccepted],
+) -> None:
+    if terminal:
+        slot, _ = accepted()
+        observe(slot, 5, 4, on="0")
+    else:
+        slot = owner()
+    session = object()
+    first = slot.publication_token(session)
+    assert first is not None
+    slot.dispatch(PublishStarted(env(slot, 6, 5), first))
+    slot.dispatch(PublishFailed(env(slot, 7, 6), first))
+    second = slot.publication_token(session)
+    assert second is not None and second is not first
+    assert second != first
+    slot.dispatch(PublishStarted(env(slot, 8, 7), second))
+    before = slot.view
+    assert before.in_flight is second
+    assert (before.terminal is not None) is terminal
+
+    effects = slot.dispatch(stale_result(env(slot, 7, 6), first))
+
+    assert effects == ()
+    assert slot.view == before
+    assert slot.view.in_flight is second
+    slot.dispatch(PublishStarted(env(slot, 6, 5), first))
+    assert slot.view == before
+    if terminal:
+        observe(slot, 9, 8, power="100")
+    eligible_debt = slot.view.ordinary_debt if terminal else None
+    slot.dispatch(PublishAccepted(env(slot, 10, 9), second))
+    assert slot.view.in_flight is None
+    assert slot.view.ordinary_debt == eligible_debt and slot.view.terminal is None
+    observe(slot, 11, 10, power="123")
+    newer = slot.view
+    slot.dispatch(PublishAccepted(env(slot, 9, 8), second))
+    slot.dispatch(PublishFailed(env(slot, 7, 6), first))
+    assert slot.view == newer
+
+
+@pytest.mark.parametrize(("score", "threshold"), [("50", "40"), ("99", "50")])
+def test_duplicate_score_cannot_rederive_motion_after_threshold_changes(
+    score: str,
+    threshold: str,
+) -> None:
+    slot = owner()
+    observe(slot, 2, 1, movement_detected="0", enable_motion_score="1", motion_high_threshold="100")
+    original = Observe(
+        env(slot, 3, 2),
+        PrimitiveCapture(
+            (PrimitiveField("motion_score", score),),
+            complete=False,
+            reported=frozenset(("motion_score",)),
+        ),
+    )
+    slot.dispatch(original)
+    observe(slot, 4, 3, motion_high_threshold=threshold)
+    before = slot.view
+    document = slot.render(3)
+    assert document["motion"] is False
+    assert before.last_hot is None
+
+    assert slot.dispatch(original) == ()
+
+    assert slot.render(3) == document
+    assert slot.view == before
+    observe(slot, 5, 4, motion_score=score)
+    assert slot.render(4)["motion"] is True
+    assert slot.view.last_hot == 4
+    assert slot.view.revision > before.revision
+    assert slot.view.ordinary_debt == slot.view.revision

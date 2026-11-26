@@ -71,8 +71,10 @@ class TerminalObligation:
     reason: str
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class PublicationToken:
+    """One fresh publication attempt; workers retain this exact object reference."""
+
     owner: MeshSettlement
     generation: int
     command_id: int
