@@ -631,6 +631,7 @@ class RpcBusAdapter:
         self._mesh_failed = False
         self._mesh_fatal = False
         self._mesh_write_guard: Callable[[AdmissionTicket, str], bool] | None = None
+        self._mesh_preparing: set[AdmissionTicket] = set()
         self._mesh_creation_floor = 0
         self._privacy_revocation: CaptureProvenance | None = None
         self._field_eras: dict[tuple[str, str, str], int] = {}
@@ -808,6 +809,28 @@ class RpcBusAdapter:
         for admission in tuple(self._write_admissions.values()):
             if admission.device_id == "ble_mesh" and not admission.issued:
                 self._cancel_waiting(admission.ticket)
+        for ticket in tuple(self._mesh_preparing):
+            if ticket.issued_at is None:
+                self._cancel_waiting(ticket)
+
+    def register_mesh_write_operation(
+        self, ticket: AdmissionTicket, peripheral_id: str
+    ) -> Callable[[], None]:
+        """Track the actual resident ticket before its preparation can await."""
+        if ticket._owner is not None or ticket.settled or ticket in self._mesh_preparing:
+            raise TicketAdoptionError("resident operation ticket is already in use")
+        ticket._owner = self
+        self._mesh_preparing.add(ticket)
+        ticket._cancel_waiting = lambda: self._cancel_waiting(ticket)
+        if not self._mesh_eligible(ticket, peripheral_id):
+            self._refuse_mesh_ticket(ticket)
+
+        def remove() -> None:
+            self._mesh_preparing.discard(ticket)
+            if ticket not in self._write_admissions:
+                ticket._cancel_waiting = None
+
+        return remove
 
     def register_mesh_write_guard(
         self, guard: Callable[[AdmissionTicket, str], bool]
@@ -944,8 +967,11 @@ class RpcBusAdapter:
         self._fail_mesh(error)
 
     def _fail_mesh(self, error: Exception) -> None:
+        if self._mesh_failed:
+            return
         self._mesh_failed = True
         self._mesh_fatal = True
+        self.revoke_mesh_waiting()
         logger.error("MESH_SINK_FAILED %s", type(error).__name__)
 
     def register_mesh_sink(
@@ -1902,6 +1928,8 @@ class RpcBusAdapter:
     def _cancel_waiting(self, ticket: AdmissionTicket) -> None:
         admission = self._write_admissions.pop(ticket, None)
         ticket._cancel_waiting = None
+        if admission is None and ticket in self._mesh_preparing and ticket.issued_at is None:
+            self._refuse_mesh_ticket(ticket)
         if admission is not None and not admission.issued and admission.task is not None:
             admission.tombstoned = True
             if admission.device_id == "ble_mesh":
@@ -1931,7 +1959,17 @@ class RpcBusAdapter:
         ticket = AdmissionTicket() if ticket is None else ticket
         admission = self._write_admissions.get(ticket)
         values = {s.name: s.value for s in sets}
-        if admission is None and (ticket._owner is not None or ticket.settled):
+        if (
+            ticket in self._mesh_preparing
+            and ticket.issued_at is None
+            and isinstance(ticket.outcome, WriteCancelled)
+        ):
+            raise WriteCancelled()
+        if admission is None and (
+            ticket.settled
+            or ticket._owner is not None
+            and not (ticket._owner is self and ticket in self._mesh_preparing)
+        ):
             raise TicketAdoptionError("admission ticket belongs to another or completed write")
         if admission is not None and (
             admission.session != self._session
@@ -2204,6 +2242,8 @@ class RpcBusAdapter:
         finish on their own: they stay strongly referenced in _write_tasks and
         their done-callback (_settle_write) still consumes any exception.
         """
+        self.revoke_mesh_waiting()
+        self._mesh_preparing.clear()
         admissions = tuple(self._write_admissions.values())
         for admission in admissions:
             admission.ticket._cancel_waiting = None

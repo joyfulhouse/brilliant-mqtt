@@ -457,6 +457,7 @@ class MeshRegistry:
     def _generation(self, boundary: CaptureProvenance) -> None:
         if boundary.source_generation != self.bus.capture_generation:
             return
+        self.bus.revoke_mesh_waiting()
         for pid, binding in tuple(self._bindings.items()):
             old = binding.owner
             if old.generation == boundary.source_generation:

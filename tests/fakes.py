@@ -98,6 +98,7 @@ class FakeBus:
         self._clock = clock
         self._mesh_sinks: list[MeshSink] = []
         self._mesh_guard: Callable[[AdmissionTicket, str], bool] | None = None
+        self._mesh_preparing: set[AdmissionTicket] = set()
         self._mesh_floor = 0
         self._mesh_open = True
         self._mesh_fatal = False
@@ -130,14 +131,45 @@ class FakeBus:
         )
 
     def fail_mesh(self, error: Exception) -> None:
+        if not self._mesh_open:
+            return
         self._mesh_fatal, self._mesh_open = True, False
+        self.revoke_mesh_waiting()
 
     def consume_mesh_fatal(self) -> bool:
         fatal, self._mesh_fatal = self._mesh_fatal, False
         return fatal
 
     def revoke_mesh_waiting(self) -> None:
-        pass
+        for ticket in self._mesh_preparing:
+            if ticket.issued_at is None:
+                ticket.mark_settled(WriteCancelled())
+
+    def register_mesh_write_operation(
+        self, ticket: AdmissionTicket, peripheral_id: str
+    ) -> Callable[[], None]:
+        if ticket._owner is not None or ticket.settled:
+            raise TicketAdoptionError("resident operation ticket is already in use")
+        ticket._owner = self
+        self._mesh_preparing.add(ticket)
+
+        def cancel_waiting() -> None:
+            if ticket.issued_at is None:
+                ticket.mark_settled(WriteCancelled())
+
+        ticket._cancel_waiting = cancel_waiting
+        if (
+            not self._mesh_open
+            or self._mesh_guard is not None
+            and not self._mesh_guard(ticket, peripheral_id)
+        ):
+            ticket.mark_settled(WriteCancelled())
+
+        def remove() -> None:
+            self._mesh_preparing.discard(ticket)
+            ticket._cancel_waiting = None
+
+        return remove
 
     def register_mesh_sink(
         self,

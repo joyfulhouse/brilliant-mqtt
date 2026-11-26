@@ -35,10 +35,10 @@ import json
 import logging
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from brilliant_mqtt.commands import VarSet
 from brilliant_mqtt.desired_state import atomic_write_json
@@ -46,6 +46,7 @@ from brilliant_mqtt.discovery import availability_topic, device_block, state_top
 from brilliant_mqtt.model import BrilliantDevice
 from brilliant_mqtt.protocols import (
     BusClient,
+    MeshBusClient,
     MqttClient,
     VirtualPeripheralHostProtocol,
     VirtualPeripheralSpec,
@@ -304,6 +305,7 @@ class VirtualSliderState:
     event_seq: int = 0
     original_slider_config: str | None = None
     binding_ready: bool = False
+    binding_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -774,8 +776,9 @@ class VirtualSliderController:
                 await host.start()
                 self._hosts[sid] = host
 
-                st.binding_ready = await self._apply_slider_binding(spec, st.mode)
-                self._save_state_if_changed()
+                async with st.binding_lock:
+                    st.binding_ready = await self._apply_slider_binding(spec, st.mode)
+                    self._save_state_if_changed()
 
                 await self._publish_discovery(spec)
                 await self._subscribe_commands(spec)
@@ -797,8 +800,12 @@ class VirtualSliderController:
             st = self._states[sid]
             if spec.config_device_id != "ble_mesh" or st.binding_ready:
                 continue
-            st.binding_ready = await self._apply_slider_binding(spec, st.mode)
-            await self._publish_state(sid)
+            async with st.binding_lock:
+                if st.binding_ready or not self._is_mesh_leader():
+                    continue
+                st.binding_ready = await self._apply_slider_binding(spec, st.mode)
+                self._save_state_if_changed()
+                await self._publish_state(sid)
         self._save_state_if_changed()
 
     async def shutdown(self) -> None:
@@ -820,9 +827,33 @@ class VirtualSliderController:
     async def _apply_slider_binding(
         self, spec: VirtualSliderSpec, mode: SliderMode, *, ticket: AdmissionTicket | None = None
     ) -> bool:
+        own_ticket = ticket is None
+        ticket = AdmissionTicket() if ticket is None else ticket
+        remove = self._track_binding_write(spec, ticket) if own_ticket else lambda: None
+        try:
+            return await self._write_slider_binding(spec, mode, ticket)
+        except asyncio.CancelledError:
+            ticket.cancel_waiting()
+            raise
+        finally:
+            remove()
+
+    def _track_binding_write(
+        self, spec: VirtualSliderSpec, ticket: AdmissionTicket
+    ) -> Callable[[], None]:
+        if spec.config_device_id != "ble_mesh":
+            return lambda: None
+        return cast(MeshBusClient, self._bus).register_mesh_write_operation(
+            ticket, spec.config_peripheral_id
+        )
+
+    async def _write_slider_binding(
+        self, spec: VirtualSliderSpec, mode: SliderMode, ticket: AdmissionTicket
+    ) -> bool:
         """Write ``CapTouchSliderConfig`` to the target peripheral after backing up original."""
         st = self._states[spec.slider_id]
-        ticket = AdmissionTicket() if ticket is None else ticket
+        if ticket.issued_at is None and ticket.settled:
+            return False
         if spec.config_device_id == "ble_mesh" and not self._is_mesh_leader():
             ticket.mark_settled(WriteCancelled())
             return False
@@ -842,6 +873,9 @@ class VirtualSliderController:
             )
         except Exception:
             current_dev = None
+
+        if ticket.issued_at is None and ticket.settled:
+            return False
 
         if current_dev is not None and spec.config_var_name in current_dev.variables:
             current_b64 = current_dev.variables[spec.config_var_name].value
@@ -1020,19 +1054,27 @@ class VirtualSliderController:
         st = self._states[slider_id]
         spec = self._specs[slider_id]
         ticket = AdmissionTicket()
-        if not await self._apply_slider_binding(spec, new_mode, ticket=ticket):
-            if (
-                spec.config_device_id != "ble_mesh"
-                or ticket.issued_at is not None
-                or not isinstance(ticket.outcome, WriteCancelled)
-            ):
-                st.binding_ready = False
-            await self._publish_state(slider_id)
-            return
-        st.binding_ready = True
-        st.mode = new_mode
-        self._save_state_if_changed()
-        await self._publish_state(slider_id, event=None)
+        remove = self._track_binding_write(spec, ticket)
+        try:
+            async with st.binding_lock:
+                if not await self._apply_slider_binding(spec, new_mode, ticket=ticket):
+                    if (
+                        spec.config_device_id != "ble_mesh"
+                        or ticket.issued_at is not None
+                        or not isinstance(ticket.outcome, WriteCancelled)
+                    ):
+                        st.binding_ready = False
+                    await self._publish_state(slider_id)
+                    return
+                st.binding_ready = True
+                st.mode = new_mode
+                self._save_state_if_changed()
+                await self._publish_state(slider_id, event=None)
+        except asyncio.CancelledError:
+            ticket.cancel_waiting()
+            raise
+        finally:
+            remove()
 
     async def _handle_brightness_command(self, slider_id: str, payload: str) -> None:
         try:
