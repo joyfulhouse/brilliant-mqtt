@@ -145,6 +145,7 @@ class CommandAdmission:
 
     ticket: AdmissionTicket = field(default_factory=AdmissionTicket)
     try_supersede: Callable[[str], bool] | None = None
+    mesh_owner: object | None = None
 
 
 command_admission: ContextVar[CommandAdmission | None] = ContextVar(

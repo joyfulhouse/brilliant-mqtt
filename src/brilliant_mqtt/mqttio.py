@@ -89,6 +89,7 @@ class _InboundMessage:
     retained: bool
     command_cbs: tuple[Callable[[str, str], Awaitable[None]], ...]
     message_cbs: tuple[Callable[[str, str, bool], Awaitable[None]], ...]
+    mesh_owner: object | None = None
 
 
 @dataclass(slots=True)
@@ -142,6 +143,7 @@ class _LaneQueue:
                             pending.retained != message.retained
                             or pending.command_cbs != message.command_cbs
                             or pending.message_cbs != message.message_cbs
+                            or pending.mesh_owner is not message.mesh_owner
                         ):
                             break
                         payload = _coalesce_payload(message.topic, pending.payload, message.payload)
@@ -254,6 +256,7 @@ class _TopicDispatcher:
                 and previous.command_cbs == message.command_cbs
                 and previous.message_cbs == message.message_cbs
                 and previous.retained == message.retained
+                and previous.mesh_owner is message.mesh_owner
                 and admission.try_supersede is not None
             ):
                 # Fold the per-field merge (later value wins) so a partial
@@ -544,7 +547,7 @@ class _TopicDispatcher:
     async def _run_worker(self, lane: str, queue: _LaneQueue) -> None:
         while True:
             message = await queue.get()
-            admission = CommandAdmission()
+            admission = CommandAdmission(mesh_owner=message.mesh_owner)
             token = command_admission.set(admission)
             try:
                 while True:
@@ -679,6 +682,25 @@ class _TransportOverloadLatch:
         return overloaded
 
 
+class _StampedMessage(aiomqtt.Message):
+    """The MQTT transport treats the lifetime reference as opaque data."""
+
+    mesh_owner: object | None = None
+
+
+def _stamp_message(item: aiomqtt.Message, owner: object | None) -> _StampedMessage:
+    stamped = _StampedMessage(
+        topic=item.topic,
+        payload=item.payload,
+        qos=item.qos,
+        retain=item.retain,
+        mid=item.mid,
+        properties=item.properties,
+    )
+    stamped.mesh_owner = owner
+    return stamped
+
+
 class _BoundedTransportQueue(asyncio.Queue[aiomqtt.Message]):
     """aiomqtt incoming-message queue bounded by count AND payload bytes (#90).
 
@@ -703,20 +725,24 @@ class _BoundedTransportQueue(asyncio.Queue[aiomqtt.Message]):
         max_bytes: int,
         overload: _TransportOverloadLatch,
         diagnostics: ResponseDiagnostics | None = None,
+        owner_for_topic: Callable[[str], object | None] | None = None,
     ) -> None:
         super().__init__(maxsize)
         self._diagnostics = diagnostics
         self._max_bytes = max_bytes
         self._overload = overload
         self._queued_bytes = 0
+        self._owner_for_topic = owner_for_topic
 
     @property
     def queued_bytes(self) -> int:
         return self._queued_bytes
 
     def put_nowait(self, item: aiomqtt.Message) -> None:
-        item_bytes = _message_bytes(item)
         topic = str(item.topic)
+        owner = self._owner_for_topic(topic) if self._owner_for_topic is not None else None
+        item = _stamp_message(item, owner)
+        item_bytes = _message_bytes(item)
         if _is_latest_wins_topic(topic):
             for index in range(len(self._queue) - 1, -1, -1):
                 pending = self._queue[index]
@@ -727,7 +753,11 @@ class _BoundedTransportQueue(asyncio.Queue[aiomqtt.Message]):
                 ):
                     break
                 if str(pending.topic) == topic:
-                    if pending.retain != item.retain or pending.qos != item.qos:
+                    if (
+                        pending.retain != item.retain
+                        or pending.qos != item.qos
+                        or getattr(pending, "mesh_owner", None) is not owner
+                    ):
                         break
                     payload = _coalesce_payload(topic, pending.payload, item.payload)
                     if payload is None:
@@ -740,6 +770,7 @@ class _BoundedTransportQueue(asyncio.Queue[aiomqtt.Message]):
                         mid=item.mid,
                         properties=item.properties,
                     )
+                    item = _stamp_message(item, owner)
                     item_bytes = _message_bytes(item)
                     if item_bytes > self._max_bytes:
                         # A single latest-wins payload too big to EVER fit the
@@ -792,6 +823,7 @@ class _BoundedTransportQueue(asyncio.Queue[aiomqtt.Message]):
 def _transport_queue_type(
     overload: _TransportOverloadLatch,
     diagnostics: ResponseDiagnostics | None = None,
+    owner_for_topic: Callable[[str], object | None] | None = None,
 ) -> type[asyncio.Queue[aiomqtt.Message]]:
     """Bind one adapter's overload latch into aiomqtt's ``queue_type`` hook.
 
@@ -806,6 +838,7 @@ def _transport_queue_type(
                 max_bytes=_TRANSPORT_QUEUE_MAX_BYTES,
                 overload=overload,
                 diagnostics=diagnostics,
+                owner_for_topic=owner_for_topic,
             )
 
     return _AdapterTransportQueue
@@ -854,6 +887,7 @@ class AioMqttAdapter:
         diagnostics: ResponseDiagnostics | None = None,
     ) -> None:
         self._settings = settings
+        self._mesh_owner_resolver: Callable[[str], object | None] | None = None
         self._diagnostics = diagnostics
         # Multiple consumers (panel bridge + mesh publisher) each register a
         # command callback on this one shared connection — fan out to all.
@@ -902,7 +936,9 @@ class AioMqttAdapter:
             # Bound the inbound transport backlog upstream of the command lanes
             # (#90): a custom queue enforcing a count AND payload-byte budget,
             # observably tripping on overload instead of aiomqtt's silent drop.
-            queue_type=_transport_queue_type(self._transport_overload, diagnostics),
+            queue_type=_transport_queue_type(
+                self._transport_overload, diagnostics, self._mesh_owner_for_topic
+            ),
             max_queued_incoming_messages=_TRANSPORT_QUEUE_MAXSIZE,
             will=will,
             tls_context=build_tls_context(settings),
@@ -1030,6 +1066,7 @@ class AioMqttAdapter:
                         retained=bool(message.retain),
                         command_cbs=command_cbs,
                         message_cbs=message_cbs,
+                        mesh_owner=getattr(message, "mesh_owner", None),
                     ),
                     latest_wins=_is_latest_wins_topic(topic),
                 )
@@ -1267,6 +1304,13 @@ class AioMqttAdapter:
 
     def on_command(self, cb: Callable[[str, str], Awaitable[None]]) -> None:
         self._command_cbs.append(cb)
+
+    def set_mesh_owner_resolver(self, resolver: Callable[[str], object | None]) -> None:
+        self._mesh_owner_resolver = resolver
+
+    def _mesh_owner_for_topic(self, topic: str) -> object | None:
+        resolver = self._mesh_owner_resolver
+        return None if resolver is None else resolver(topic)
 
     def on_message(self, cb: Callable[[str, str, bool], Awaitable[None]]) -> None:
         self._message_cbs.append(cb)
