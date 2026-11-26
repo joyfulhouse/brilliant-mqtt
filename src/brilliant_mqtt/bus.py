@@ -27,10 +27,22 @@ from typing import Any, NamedTuple
 
 from brilliant_mqtt.commands import VarSet
 from brilliant_mqtt.diagnostics import ResponseDiagnostics, WriteOutcome
+from brilliant_mqtt.mesh_ingress import (
+    MeshCapture,
+    MeshGeneration,
+    MeshIngress,
+    MeshInventory,
+    MeshPeripheralAbsent,
+    MeshScopeUnknown,
+    MeshSink,
+)
+from brilliant_mqtt.mesh_settlement_types import MeshMetadata
 from brilliant_mqtt.model import (
     BrilliantDevice,
     CaptureProvenance,
     DeviceKind,
+    PrimitiveCapture,
+    PrimitiveField,
     Variable,
     kind_for_peripheral_type,
 )
@@ -275,6 +287,69 @@ class _PeripheralSnapshot(NamedTuple):
     variables: Mapping[str, _VarSnapshot]
 
 
+@dataclass(frozen=True)
+class _PeripheralMask:
+    peripheral_id: str
+    reported: frozenset[str] = frozenset()
+    removed: frozenset[str] = frozenset()
+    deleted: bool = False
+    reliable: bool = True
+
+
+@dataclass(frozen=True)
+class _NotificationDevice:
+    id: str
+    peripherals: Any
+    masks: tuple[_PeripheralMask, ...] | None
+    deleted: bool
+
+
+def _notification_masks(notification: Any) -> tuple[_PeripheralMask, ...] | None:
+    """Copy only names/deletion flags, never unvalidated delta values."""
+    modified = getattr(notification, "modified_peripherals", None)
+    if not isinstance(modified, (list, tuple)):
+        return None
+    result: list[_PeripheralMask] = []
+    seen: set[str] = set()
+    for peripheral in modified:
+        pid = getattr(peripheral, "peripheral_id", None)
+        if not isinstance(pid, str) or not pid or pid in seen:
+            return None
+        seen.add(pid)
+        if getattr(peripheral, "deleted", False) is True:
+            result.append(_PeripheralMask(pid, deleted=True))
+            continue
+        variables = getattr(peripheral, "modified_variables", None)
+        deleted_variables = getattr(peripheral, "deleted_variables", ())
+        if not isinstance(variables, (list, tuple)) or not isinstance(
+            deleted_variables, (list, tuple)
+        ):
+            result.append(_PeripheralMask(pid, reliable=False))
+            continue
+        reported: set[str] = set()
+        removed: set[str] = set()
+        reliable = True
+        for variable in variables:
+            name = getattr(variable, "variable_name", None)
+            if not isinstance(name, str) or not name or name in reported or name in removed:
+                reliable = False
+                break
+            if getattr(variable, "deletion", False) is True:
+                removed.add(name)
+            else:
+                reported.add(name)
+        for variable in deleted_variables:
+            name = getattr(variable, "variable_name", None)
+            if not isinstance(name, str) or not name or name in reported:
+                reliable = False
+                break
+            removed.add(name)
+        result.append(
+            _PeripheralMask(pid, frozenset(reported), frozenset(removed), reliable=reliable)
+        )
+    return tuple(result)
+
+
 class _PendingPeripheral:
     """One peripheral's immutable snapshot plus a write-once normalized memo.
 
@@ -305,7 +380,7 @@ class _PendingPeripheral:
         self.normalized: BrilliantDevice | None = None
 
 
-def _snapshot_peripheral(raw: Any) -> _PeripheralSnapshot:
+def _snapshot_peripheral(raw: Any, names: frozenset[str] | None = None) -> _PeripheralSnapshot:
     """Copy a raw bus Peripheral into an immutable primitive snapshot.
 
     Runs SYNCHRONOUSLY inside :meth:`RpcBusAdapter._dispatch_raw_device` (no
@@ -323,7 +398,11 @@ def _snapshot_peripheral(raw: Any) -> _PeripheralSnapshot:
             bool(raw_var.externally_settable),
             _coerce_timestamp(getattr(raw_var, "timestamp", None)),
         )
-        for var_name, raw_var in dict(raw.variables).items()
+        for var_name, raw_var in (
+            raw.variables.items()
+            if names is None
+            else ((name, raw.variables[name]) for name in names if name in raw.variables)
+        )
     }
     return _PeripheralSnapshot(
         int(raw.peripheral_type),
@@ -465,7 +544,14 @@ def _make_observer_class(base: Any) -> Any:
                 if self._device_ids and updated.id not in self._device_ids:
                     # Not a device we bridge (own panel or configured extra).
                     return
-                self._dispatch(updated)
+                self._dispatch(
+                    _NotificationDevice(
+                        updated.id,
+                        getattr(updated, "peripherals", None),
+                        _notification_masks(notification),
+                        getattr(notification, "deleted", False) is True,
+                    )
+                )
             except Exception:
                 # Broad by design: a raise here would kill the bus receive loop.
                 logger.exception("handle_notification failed; ignoring notification")
@@ -518,6 +604,10 @@ class RpcBusAdapter:
         # starts a new incomparable source generation.
         self._capture_generation = 0
         self._capture_sequence = 0
+        self._capture_source = secrets.token_hex(16)
+        self._mesh_sinks: list[MeshSink] = []
+        self._mesh_failed = False
+        self._mesh_fatal = False
         self._privacy_revocation: CaptureProvenance | None = None
         self._field_eras: dict[tuple[str, str, str], int] = {}
         # Multiple consumers (panel bridge + mesh publisher) may each register
@@ -627,9 +717,134 @@ class RpcBusAdapter:
 
     def _advance_capture_generation(self) -> None:
         self._capture_generation += 1
-        self._capture_sequence = 0
         self._privacy_revocation = None
         self._field_eras.clear()
+
+    @property
+    def capture_source(self) -> str:
+        return self._capture_source
+
+    @property
+    def mesh_admission_open(self) -> bool:
+        return not self._mesh_failed and not self._shutting_down
+
+    def consume_mesh_fatal(self) -> bool:
+        failed = self._mesh_fatal
+        self._mesh_fatal = False
+        return failed
+
+    def _fail_mesh(self, error: Exception) -> None:
+        self._mesh_failed = True
+        self._mesh_fatal = True
+        logger.error("MESH_SINK_FAILED %s", type(error).__name__)
+
+    def register_mesh_sink(
+        self,
+        callback: Callable[[MeshIngress], None],
+        *,
+        want_fields: Callable[[str], frozenset[str] | None],
+        want_inventory: Callable[[], bool] = lambda: True,
+    ) -> Callable[[], None]:
+        """Install a live loop-owned scope; returned removal is idempotent."""
+        sink = MeshSink(callback, want_fields, want_inventory)
+        self._mesh_sinks.append(sink)
+
+        def remove() -> None:
+            if sink in self._mesh_sinks:
+                self._mesh_sinks.remove(sink)
+
+        return remove
+
+    def _mesh_deliver(self, event: MeshIngress, sinks: Iterable[MeshSink]) -> None:
+        if not self.mesh_admission_open:
+            return
+        try:
+            for sink in tuple(sinks):
+                if sink in self._mesh_sinks:
+                    sink.callback(event)
+        except Exception as error:
+            self._fail_mesh(error)
+
+    def _mesh_control(self, event: MeshIngress) -> None:
+        try:
+            sinks = tuple(sink for sink in self._mesh_sinks if sink.want_inventory())
+        except Exception as error:
+            self._fail_mesh(error)
+            return
+        self._mesh_deliver(event, sinks)
+
+    def _mesh_fields(self, peripheral_id: str) -> tuple[tuple[MeshSink, frozenset[str]], ...]:
+        if not self.mesh_admission_open:
+            return ()
+        try:
+            return tuple(
+                (sink, fields)
+                for sink in tuple(self._mesh_sinks)
+                if (fields := sink.want_fields(peripheral_id)) is not None
+            )
+        except Exception as error:
+            self._fail_mesh(error)
+            return ()
+
+    def _mesh_capture(
+        self,
+        peripheral_id: str,
+        snapshot: _PeripheralSnapshot,
+        boundary: CaptureProvenance,
+        scopes: tuple[tuple[MeshSink, frozenset[str]], ...],
+        *,
+        complete: bool,
+        mask: _PeripheralMask | None = None,
+    ) -> None:
+        reliable = complete or (
+            mask is not None
+            and mask.reliable
+            and mask.reported <= snapshot.variables.keys()
+            and not mask.removed.intersection(snapshot.variables)
+        )
+        display = snapshot.variables.get("display_name")
+        name = str(display.value) if display is not None and display.value else None
+        metadata = MeshMetadata(
+            "ble_mesh",
+            peripheral_id,
+            name or _resolve_name({}, snapshot, peripheral_id),
+            kind_for_peripheral_type(snapshot.peripheral_type),
+            snapshot.peripheral_type,
+        )
+        for sink, fields in scopes:
+            values = tuple(
+                PrimitiveField(
+                    field_name,
+                    str(variable.value),
+                    variable.externally_settable,
+                    variable.timestamp
+                    if isinstance(variable.timestamp, int)
+                    and not isinstance(variable.timestamp, bool)
+                    else int(variable.timestamp)
+                    if isinstance(variable.timestamp, float) and math.isfinite(variable.timestamp)
+                    else None,
+                )
+                for field_name, variable in snapshot.variables.items()
+                if field_name in fields and variable.value is not None
+            )
+            self._mesh_deliver(
+                MeshCapture(
+                    boundary,
+                    metadata,
+                    PrimitiveCapture(
+                        values,
+                        complete=complete,
+                        reliable=reliable,
+                        reported=mask.reported.intersection(fields)
+                        if reliable and mask
+                        else frozenset(),
+                        removed=mask.removed.intersection(fields)
+                        if reliable and mask
+                        else frozenset(),
+                    ),
+                ),
+                (sink,),
+            )
 
     @property
     def capture_generation(self) -> int:
@@ -672,9 +887,15 @@ class RpcBusAdapter:
         if previous is None or boundary.sequence > previous.sequence:
             self._privacy_revocation = boundary
 
-    def _next_capture_provenance(self) -> CaptureProvenance:
+    def _next_capture_provenance(self, origin: str = "capture") -> CaptureProvenance:
         self._capture_sequence += 1
-        return CaptureProvenance(self._capture_generation, self._capture_sequence)
+        return CaptureProvenance(
+            self._capture_generation,
+            self._capture_sequence,
+            incarnation=self._capture_source,
+            origin=origin,
+            captured_at=self._clock(),
+        )
 
     def _field_capture(
         self,
@@ -685,6 +906,8 @@ class RpcBusAdapter:
         *,
         complete: bool = False,
     ) -> CaptureProvenance:
+        if device_id == "ble_mesh":
+            return boundary
         fields = set(names)
         if complete:
             fields.update(
@@ -859,6 +1082,9 @@ class RpcBusAdapter:
             for cb, coalesce_pushes, want_device in cbs
             if want_device is None or want_device(device_id)
         ]
+        if device_id == "ble_mesh" and self._mesh_sinks:
+            self._dispatch_mesh_push(raw_device, admitted, session)
+            return
         if not admitted and device_id != self._own_device_id:
             return
         # Same defensive access as get_all(): a peripheral-less housekeeping
@@ -879,7 +1105,7 @@ class RpcBusAdapter:
         # BrilliantDevice so a push delivered to several callbacks (the panel
         # bridge AND the lossless scene bridge on the own device) is normalized
         # at most once total — like main, which shared one BrilliantDevice.
-        capture_provenance = self._next_capture_provenance()
+        capture_provenance = self._next_capture_provenance("push")
         raw_peripherals = dict(peripherals)
         hardware_count = sum(
             kind_for_peripheral_type(int(raw.peripheral_type)) is DeviceKind.HARDWARE
@@ -916,6 +1142,53 @@ class RpcBusAdapter:
             task = asyncio.ensure_future(self._drain_pushes(key, cb, session))
             self._push_tasks[key] = task
             self._track_task(task)
+
+    def _dispatch_mesh_push(
+        self,
+        raw_device: Any,
+        admitted: list[tuple[Callable[[BrilliantDevice], Awaitable[None]], bool]],
+        session: int,
+    ) -> None:
+        boundary = self._next_capture_provenance("push")
+        if getattr(raw_device, "deleted", False) is True:
+            self._mesh_control(MeshInventory(boundary, frozenset()))
+            return
+        peripherals = getattr(raw_device, "peripherals", None)
+        masks: tuple[_PeripheralMask, ...] | None = getattr(raw_device, "masks", None)
+        if peripherals is None:
+            return
+        candidates = (
+            tuple((mask.peripheral_id, mask) for mask in masks)
+            if masks is not None
+            else tuple((pid, None) for pid in peripherals)
+        )
+        holders: list[_PendingPeripheral] = []
+        for pid, mask in candidates:
+            if mask is not None and mask.deleted:
+                if pid not in peripherals:
+                    self._mesh_control(MeshPeripheralAbsent(boundary, pid))
+                continue
+            scopes = self._mesh_fields(pid)
+            if not scopes or pid not in peripherals:
+                continue
+            fields = frozenset().union(*(names for _, names in scopes))
+            snapshot = _snapshot_peripheral(peripherals[pid], fields | {"display_name"})
+            self._mesh_capture(pid, snapshot, boundary, scopes, complete=False, mask=mask)
+            holders.append(_PendingPeripheral(pid, snapshot, boundary, 0))
+        if not self.mesh_admission_open:
+            return
+        for cb, coalesce in admitted:
+            if not holders:
+                continue
+            key = ("ble_mesh" if coalesce else None, cb)
+            pending = self._pending_pushes.setdefault(key, deque())
+            if coalesce:
+                pending.clear()
+            pending.append(("ble_mesh", tuple(holders)))
+            if key not in self._push_tasks:
+                task = asyncio.ensure_future(self._drain_pushes(key, cb, session))
+                self._push_tasks[key] = task
+                self._track_task(task)
 
     async def _drain_pushes(
         self,
@@ -1050,6 +1323,7 @@ class RpcBusAdapter:
             return
         logger.warning("bus processor reconnected; re-subscribing and re-reconciling")
         self._advance_capture_generation()
+        self._mesh_control(MeshGeneration(self._next_capture_provenance("lifecycle")))
         self._note_push()
         self._note_reconnect()
         self._spawn(self._after_reconnect(session))
@@ -1106,15 +1380,37 @@ class RpcBusAdapter:
         devices: list[BrilliantDevice] = []
         device_ids = (own_id, *self._extra_device_ids) if include_extras else (own_id,)
         for device_id in device_ids:
-            boundary = self._next_capture_provenance()
+            boundary = self._next_capture_provenance("read")
             raw_device = await asyncio.wait_for(
                 obs.get_device(device_id),
                 timeout=_READ_DEADLINE_S,
             )
+            boundary = replace(boundary, completed_at=self._clock())
             if raw_device is None or getattr(raw_device, "peripherals", None) is None:
+                if device_id == "ble_mesh":
+                    self._mesh_control(MeshScopeUnknown(boundary))
                 self._capture_privacy_revocation(device_id, boundary, ())
                 label = "own device" if device_id == own_id else "extra device"
                 logger.warning("%s id=%s not returned by get_device()", label, device_id)
+                continue
+            if device_id == "ble_mesh" and self._mesh_sinks:
+                self._mesh_control(MeshInventory(boundary, frozenset(raw_device.peripherals)))
+                for pid in raw_device.peripherals:
+                    scopes = self._mesh_fields(pid)
+                    if not scopes:
+                        continue
+                    fields = frozenset().union(*(names for _, names in scopes))
+                    snapshot = _snapshot_peripheral(
+                        raw_device.peripherals[pid], fields | {"display_name"}
+                    )
+                    self._mesh_capture(pid, snapshot, boundary, scopes, complete=True)
+                    if self.mesh_admission_open:
+                        devices.append(
+                            replace(
+                                normalize_peripheral(device_id, pid, snapshot),
+                                capture_provenance=boundary,
+                            )
+                        )
                 continue
             raw_peripherals = dict(raw_device.peripherals)
             self._capture_privacy_revocation(device_id, boundary, raw_peripherals.values())
@@ -1136,10 +1432,23 @@ class RpcBusAdapter:
     async def get_peripheral(self, device_id: str, peripheral_id: str) -> BrilliantDevice | None:
         """Return one normalized peripheral via an on-demand scoped read."""
         obs, _ = self._require_started()
-        boundary = self._next_capture_provenance()
+        boundary = self._next_capture_provenance("read")
         raw = await obs.get_peripheral(device_id, peripheral_id)
+        boundary = replace(boundary, completed_at=self._clock())
         if raw is None:
+            if device_id == "ble_mesh":
+                self._mesh_control(MeshPeripheralAbsent(boundary, peripheral_id))
             return None
+        if device_id == "ble_mesh" and self._mesh_sinks:
+            scopes = self._mesh_fields(peripheral_id)
+            if not scopes:
+                return None
+            fields = frozenset().union(*(names for _, names in scopes))
+            snapshot = _snapshot_peripheral(raw, fields | {"display_name"})
+            self._mesh_capture(peripheral_id, snapshot, boundary, scopes, complete=True)
+            if not self.mesh_admission_open:
+                return None
+            raw = snapshot
         return replace(
             normalize_peripheral(device_id, peripheral_id, raw),
             capture_provenance=self._field_capture(
@@ -1394,10 +1703,11 @@ class RpcBusAdapter:
             try:
                 admission.issued = True
                 try:
-                    for name in admission.values:
-                        key = (admission.device_id, admission.peripheral_id, name)
-                        self._field_eras[key] = self._field_eras.get(key, 0) + 1
-                    boundary = self._next_capture_provenance()
+                    if admission.device_id != "ble_mesh":
+                        for name in admission.values:
+                            key = (admission.device_id, admission.peripheral_id, name)
+                            self._field_eras[key] = self._field_eras.get(key, 0) + 1
+                    boundary = self._next_capture_provenance("issue")
                     admission.ticket.mark_issued(
                         replace(
                             self._field_capture(

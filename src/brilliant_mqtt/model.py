@@ -91,6 +91,10 @@ class CaptureProvenance:
     sequence: int
     field_eras: tuple[tuple[str, int], ...] = ()
     issued_values: tuple[tuple[str, str], ...] = ()
+    incarnation: str = ""
+    origin: str = ""
+    captured_at: float = 0.0
+    completed_at: float | None = None
 
 
 @dataclass(frozen=True)
