@@ -187,3 +187,45 @@ async def test_prestart_worker_cancellation_releases_old_lanes(
     finally:
         registry.close()
         await driver.shutdown()
+
+
+async def test_failed_forced_same_payload_is_repaired_by_next_capture(
+    registry_rig: tuple[MeshRegistry, _RawDevice],
+) -> None:
+    registry, _ = registry_rig
+    adapter = cast(RpcBusAdapter, registry.bus)
+
+    class Intermittent(FakeMqtt):
+        def __init__(self) -> None:
+            super().__init__()
+            self.attempts = 0
+
+        async def publish(
+            self, topic: str, payload: str, retain: bool = False, qos: int = 0
+        ) -> None:
+            self.attempts += 1
+            if self.attempts == 2:
+                raise RuntimeError("forced repair failed")
+            await super().publish(topic, payload, retain, qos)
+
+    mqtt = Intermittent()
+    driver = MeshDriver(registry, mqtt, panel="mesh")
+    try:
+        registry.acquire()
+        await adapter.get_all()
+        owner = registry.current("load")
+        assert owner is not None
+        await driver.flush(owner)
+        envelope = registry.reserve(owner, "reconcile")
+        assert envelope is not None
+        registry.dispatch(owner, RequestPublication(envelope))
+        await driver.flush(owner, force=True)
+        await turns()
+        assert mqtt.attempts == 2
+        await adapter.get_all()
+        await driver.flush(owner)
+        assert mqtt.attempts == 3
+        assert len(mqtt.published) == 2
+    finally:
+        registry.close()
+        await driver.shutdown()

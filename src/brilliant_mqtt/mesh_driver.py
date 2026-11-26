@@ -273,6 +273,7 @@ class MeshDriver:
                 state_topic(self.panel, owner.metadata.peripheral_id), payload, retain=True
             )
         except BaseException as error:
+            lane.last_fields = None
             result = self.registry.reserve(owner, "publish_failed")
             if result is not None:
                 self.registry.dispatch(owner, PublishFailed(result, token))
