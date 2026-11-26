@@ -93,6 +93,7 @@ class BrilliantMqttFleetOptionsFlow(OptionsFlow):
         self._defaults_expected: dict[str, Any] | None = None
         self._hue_ca_expected: tuple[object, ...] | None = None
         self._abort_idle_panel_flows = False
+        self._offered_idle_panel_flow_ids: frozenset[str] = frozenset()
 
     def _exact_registered_entry(self) -> ConfigEntry[Any] | None:
         """Resolve the still-registered singleton owner for every commit boundary."""
@@ -345,7 +346,13 @@ class BrilliantMqttFleetOptionsFlow(OptionsFlow):
                     return self.async_abort(
                         reason="broker_change_blocked_by_add_panel_flow",
                     )
-                if flows and not self._abort_idle_panel_flows:
+                current_flow_ids = frozenset(flow.flow_id for flow in flows)
+                if flows and (
+                    not self._abort_idle_panel_flows
+                    or not current_flow_ids <= self._offered_idle_panel_flow_ids
+                ):
+                    self._abort_idle_panel_flows = False
+                    self._offered_idle_panel_flow_ids = current_flow_ids
                     return self._show_idle_panel_flow_form()
                 if flows:
                     for flow in flows:

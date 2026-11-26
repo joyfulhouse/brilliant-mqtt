@@ -3125,6 +3125,89 @@ async def test_idle_add_panel_flow_can_be_aborted_before_broker_update(
     assert not hass.config_entries.subentries.async_progress(include_uninitialized=True)
 
 
+@pytest.mark.parametrize("replace_first", [False, True])
+async def test_idle_panel_abort_consent_reprompts_for_added_or_replacement_flow(
+    hass: HomeAssistant,
+    replace_first: bool,
+) -> None:
+    """Consent for the offered flow cannot discard a different user's later form."""
+    entry = _fleet_entry(hass)
+    original_data = dict(entry.data)
+    options_flow_id = await _prepare_fleet_broker_commit(hass, entry)
+    manager = hass.config_entries.subentries
+    first = await manager.async_init(
+        (entry.entry_id, SUBENTRY_TYPE_PANEL), context={"source": "user"}
+    )
+    with patch.object(ProvisioningJournal, "async_load", AsyncMock(return_value=None)):
+        offered = await hass.config_entries.options.async_configure(options_flow_id)
+        assert offered["step_id"] == "broker_abort_idle_panel_flow"
+        if replace_first:
+            manager.async_abort(first["flow_id"])
+        second = await manager.async_init(
+            (entry.entry_id, SUBENTRY_TYPE_PANEL), context={"source": "user"}
+        )
+        result = await hass.config_entries.options.async_configure(
+            options_flow_id, {"confirm_abort_idle_panel_flow": True}
+        )
+
+        assert result["type"] is FlowResultType.FORM
+        assert result["step_id"] == "broker_abort_idle_panel_flow"
+        assert entry.data == original_data
+        assert second["flow_id"] in manager._progress
+        assert (first["flow_id"] in manager._progress) is (not replace_first)
+
+        confirmed = await hass.config_entries.options.async_configure(
+            options_flow_id, {"confirm_abort_idle_panel_flow": True}
+        )
+
+    assert confirmed["type"] is FlowResultType.ABORT
+    assert confirmed["reason"] == "reconfigure_successful"
+    assert entry.data[CONF_MQTT_HOST] == "replacement-broker.iot.example"
+    assert not manager.async_progress(include_uninitialized=True)
+
+
+@pytest.mark.parametrize(
+    ("blocker", "reason"),
+    [
+        ("busy", "broker_change_blocked_by_add_panel_flow"),
+        ("journal", "broker_change_blocked_by_active_journal"),
+        ("unreadable", "broker_change_blocked_by_journal_read_error"),
+    ],
+)
+async def test_idle_panel_abort_confirmation_rechecks_provisioning_guards(
+    hass: HomeAssistant,
+    blocker: str,
+    reason: str,
+) -> None:
+    entry = _fleet_entry(hass)
+    original_data = dict(entry.data)
+    options_flow_id = await _prepare_fleet_broker_commit(hass, entry)
+    manager = hass.config_entries.subentries
+    add_flow = await manager.async_init(
+        (entry.entry_id, SUBENTRY_TYPE_PANEL), context={"source": "user"}
+    )
+    with patch.object(
+        ProvisioningJournal, "async_load", AsyncMock(return_value=None)
+    ) as load_journal:
+        offered = await hass.config_entries.options.async_configure(options_flow_id)
+        assert offered["step_id"] == "broker_abort_idle_panel_flow"
+        if blocker == "busy":
+            handler = manager._progress[add_flow["flow_id"]]
+            cast(dict[str, Any], handler.context)[PROVISIONING_STARTED_CONTEXT] = True
+        elif blocker == "journal":
+            load_journal.return_value = object()
+        else:
+            load_journal.side_effect = RuntimeError("journal storage unavailable")
+        result = await hass.config_entries.options.async_configure(
+            options_flow_id, {"confirm_abort_idle_panel_flow": True}
+        )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == reason
+    assert entry.data == original_data
+    assert add_flow["flow_id"] in manager._progress
+
+
 async def test_started_add_panel_flow_cannot_be_aborted_for_broker_update(
     hass: HomeAssistant,
 ) -> None:
