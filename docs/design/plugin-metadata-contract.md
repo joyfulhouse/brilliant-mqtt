@@ -32,6 +32,9 @@ must prove the named entry is a regular file in the verified inventory.
 Origin comparisons use scheme, host and effective port tuples, preserving
 bracketed IPv6 URL syntax and treating implicit HTTPS port 443 as explicit 443.
 An origin grant cannot contain a path other than `/`, or a query.
+Literal fragment delimiters are refused even when the fragment is empty;
+origin grants also refuse empty query delimiters. Artifact query strings and
+an encoded `%23` path character remain valid syntax.
 
 Compatibility requires nonempty architecture and firmware-profile lists;
 architectures are `armv7l` or `aarch64`, Python is `3.10`, and manager/bridge
@@ -119,6 +122,12 @@ dependencies and canonical resolved paths. They come from reviewed firmware
 qualification, never manifest/catalog claims. A qualified profile must supply
 all external-supervisor edges and resolve filesystem links before constructing
 these records. This slice does not discover a real panel topology.
+Paths describe mutation scope, not every runtime file a service reads or
+executes. The vendor UI tree `/data/switch-ui` is immutable to plugins; an
+independently qualified UI unit stop can still use reviewed unit/config paths
+without altering or staging the vendor executable. The verified mandatory
+`gangbox_peripherals` and `faceplate_peripheral` process names are protected;
+test wrappers using service suffixes do not claim such stock units exist.
 
 The guard checks each replacement's identity and symbolic target, resolves its
 aliases and full dependency closure, and also protects every prerequisite of
@@ -143,6 +152,9 @@ instance families, applicable hyphen-prefix drop-ins, and `.d`, `.wants`,
 `.requires` and `.upholds` directories. Owners of those namespaces enter the
 protected closure before their prerequisites are considered, until it stops
 growing. Symbolic replacement targets use the same protected names.
+Discovered canonical identities and aliases also join the closure when they
+match protected template/instance families, before their prerequisites are
+expanded. An unrelated template instance is not protected by that rule.
 No replacement path beneath `/var/brilliant-mqtt` is permitted in this slice;
 future plugin-owned release storage is not a stock replacement target.
 

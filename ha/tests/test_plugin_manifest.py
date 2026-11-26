@@ -713,3 +713,125 @@ def test_dynamic_protected_unit_names_also_protect_symbolic_targets(target: str)
     )
     with pytest.raises(PluginValidationError):
         parse_manifest(encoded(document), qualified)
+
+
+@pytest.mark.parametrize("prerequisite", [False, True])
+def test_protected_template_alias_instances_and_their_prerequisites_are_protected(
+    prerequisite: bool,
+) -> None:
+    identity = "optional.service" if prerequisite else "bus@instance.service"
+    document = manifest_document()
+    document["replaces"] = [replacement(identity)]
+    allowed = Replacement("optional", "systemd", identity, "fake_stock")
+    nodes = [
+        UnitTopology("message_bus@.service", aliases=("bus@.service",)),
+        UnitTopology("bus@instance.service"),
+    ]
+    if prerequisite:
+        nodes[1] = UnitTopology("bus@instance.service", dependencies=("optional.service",))
+        nodes.append(UnitTopology("optional.service"))
+    with pytest.raises(PluginValidationError):
+        parse_manifest(
+            encoded(document),
+            policy(replacement_allowlist=frozenset({allowed}), topology=tuple(nodes)),
+        )
+
+
+@pytest.mark.parametrize("stem", ["gangbox_peripherals", "faceplate_peripheral"])
+@pytest.mark.parametrize("use", ["identity", "symbolic_target", "prerequisite"])
+def test_verified_physical_core_process_names_cannot_be_allowlisted(stem: str, use: str) -> None:
+    identity = f"{stem}.service" if use == "identity" else "optional.service"
+    target = stem if use == "symbolic_target" else "optional"
+    document = manifest_document()
+    document["replaces"] = [{**replacement(identity), "target": target}]
+    allowed = Replacement(target, "systemd", identity, "fake_stock")
+    nodes = [UnitTopology(identity)]
+    if use == "prerequisite":
+        nodes.append(UnitTopology(f"{stem}.service", dependencies=("optional.service",)))
+    with pytest.raises(PluginValidationError):
+        parse_manifest(
+            encoded(document),
+            policy(replacement_allowlist=frozenset({allowed}), topology=tuple(nodes)),
+        )
+
+
+@pytest.mark.parametrize("prerequisite", [False, True])
+def test_vendor_ui_binary_mutation_scope_and_its_prerequisites_are_protected(
+    prerequisite: bool,
+) -> None:
+    document = manifest_document()
+    document["replaces"] = [replacement()]
+    allowed = Replacement("optional", "systemd", "optional.service", "fake_stock")
+    nodes = [UnitTopology("optional.service", paths=("/data/switch-ui/switch-ui",))]
+    if prerequisite:
+        nodes = [
+            UnitTopology("optional.service"),
+            UnitTopology(
+                "generic.service",
+                paths=("/data/switch-ui/switch-ui",),
+                dependencies=("optional.service",),
+            ),
+        ]
+    with pytest.raises(PluginValidationError):
+        parse_manifest(
+            encoded(document),
+            policy(replacement_allowlist=frozenset({allowed}), topology=tuple(nodes)),
+        )
+
+
+def test_artifact_url_with_empty_fragment_delimiter_is_refused() -> None:
+    document = manifest_document()
+    document["artifact"]["url"] += "#"
+    with pytest.raises(PluginValidationError):
+        parse_manifest(encoded(document), policy())
+
+
+def test_reviewed_origin_with_empty_query_delimiter_is_refused() -> None:
+    document = manifest_document()
+    malformed_origin = replace(policy(), origins=frozenset({"https://example.invalid:443?"}))
+    with pytest.raises(PluginValidationError):
+        parse_manifest(encoded(document), malformed_origin)
+
+
+def test_unrelated_template_instance_remains_eligible() -> None:
+    identity = "plugin_alias@instance.service"
+    document = manifest_document()
+    document["replaces"] = [replacement(identity)]
+    allowed = Replacement("optional", "systemd", identity, "fake_stock")
+    qualified = policy(
+        replacement_allowlist=frozenset({allowed}),
+        topology=(
+            UnitTopology("message_bus@.service", aliases=("bus@.service",)),
+            UnitTopology("plugin@.service", aliases=("plugin_alias@.service",)),
+            UnitTopology(identity),
+        ),
+    )
+    assert parse_manifest(encoded(document), qualified).replaces == (allowed,)
+
+
+# Art/voice names below are fake test wrappers; firmware runs vassals, not these units.
+@pytest.mark.parametrize("identity", ["switch_ui_app.service", "art.service", "voice.service"])
+def test_fake_optional_unit_control_does_not_imply_vendor_binary_mutation(identity: str) -> None:
+    document = manifest_document()
+    document["replaces"] = [replacement(identity)]
+    allowed = Replacement("optional", "systemd", identity, "fake_stock")
+    qualified = policy(
+        replacement_allowlist=frozenset({allowed}),
+        topology=(
+            UnitTopology(
+                identity,
+                paths=(
+                    f"/etc/systemd/system/{identity}",
+                    f"/etc/systemd/system/{identity}.d/reviewed.conf",
+                ),
+            ),
+        ),
+    )
+    assert parse_manifest(encoded(document), qualified).replaces == (allowed,)
+
+
+@pytest.mark.parametrize("path", ["demo.tar.gz?release=1", "demo%23release.tar.gz"])
+def test_artifact_query_or_encoded_fragment_character_is_not_a_fragment(path: str) -> None:
+    document = manifest_document()
+    document["artifact"]["url"] = "https://example.invalid/" + path
+    assert parse_manifest(encoded(document), policy()).id == "demo"

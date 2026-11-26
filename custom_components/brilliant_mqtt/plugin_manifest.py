@@ -28,6 +28,8 @@ _PROTECTED_STEMS = frozenset(
         "monitor",
         "wifi",
         "hardware",
+        "gangbox_peripherals",
+        "faceplate_peripheral",
         "control_notification",
         "config_peripherals",
         "object_store_peripheral",
@@ -45,6 +47,7 @@ _PROTECTED_STEMS = frozenset(
 )
 _PROTECTED_PATHS = (
     "/data/switch-embedded",
+    "/data/switch-ui",
     "/var/run/brilliant",
     "/var/run/brilliant-mqtt",
     "/run/brilliant",
@@ -257,10 +260,10 @@ def _https_origin(value: str, *, origin_only: bool = False) -> tuple[str, str, i
             or port == 0
             or parsed.username is not None
             or parsed.password is not None
-            or parsed.fragment
+            or "#" in value
             or "\\" in value
             or any(char.isspace() for char in value)
-            or (origin_only and (parsed.path not in ("", "/") or parsed.query))
+            or (origin_only and (parsed.path not in ("", "/") or "?" in value))
         ):
             _fail()
     except ValueError:
@@ -400,6 +403,9 @@ def guard_protected_core(manifest: PluginManifest, policy: ValidationPolicy) -> 
             if profile_node.identity in protected:
                 continue
             touches_core = any(
+                _protected_unit(name, frozenset(protected))
+                for name in (profile_node.identity, *profile_node.aliases)
+            ) or any(
                 _paths_overlap(path, protected_path)
                 for path in profile_node.paths
                 for protected_path in protected_profile_paths
