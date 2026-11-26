@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,7 @@ import pytest
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import json as json_util
+from homeassistant.helpers.storage import Store as HomeAssistantStore
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.brilliant_mqtt import fleet_manager, panel_ops
@@ -86,11 +88,15 @@ def durable_journal(
     hass: HomeAssistant,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
+) -> Iterator[None]:
     """Persist the provisioning journal the way a real Home Assistant store does."""
     hass.config.config_dir = str(tmp_path / "ha-config")
 
-    async def write(store: Store, data: dict[str, object]) -> None:
+    async def write(store: HomeAssistantStore[Any], data: dict[str, Any]) -> None:
+        if "data_func" in data:
+            data = {**data, "data": data["data_func"]()}
+            del data["data_func"]
+
         def persist() -> None:
             Path(store.path).parent.mkdir(parents=True, exist_ok=True)
             json_util.save_json(store.path, data, private=True, atomic_writes=True)
@@ -102,6 +108,16 @@ def durable_journal(
 
     monkeypatch.setattr(Store, "_async_write_data", write)
     monkeypatch.setattr(Store, "async_remove", remove)
+    original = HomeAssistantStore._async_write_data
+
+    async def write_core(store: HomeAssistantStore[Any], data: dict[str, Any]) -> None:
+        if store.key == "core.config_entries":
+            await write(store, data)
+        else:
+            await original(store, data)
+
+    with patch.object(HomeAssistantStore, "_async_write_data", write_core):
+        yield
 
 
 def _baseline_record(

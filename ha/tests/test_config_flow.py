@@ -175,6 +175,7 @@ def _prove_config_entry_persistence(monkeypatch: pytest.MonkeyPatch) -> None:
         "_async_wait_config_entry_persisted",
         AsyncMock(),
     )
+    monkeypatch.setattr(fleet_manager, "async_wait_config_entry_persisted", AsyncMock())
 
 
 def _identity(*, other: bool = False) -> HostIdentity:

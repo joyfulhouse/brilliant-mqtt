@@ -119,6 +119,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   baseline, and panel configuration stay on one owner. A stale canary or an
   older repair cannot overwrite a newer verified host or password. Retained
   baselines stay password-free.
+- Verified owner changes retain their recovery intent until Home Assistant's
+  configuration is proven on disk, including after cancellation. Address and
+  credential repairs serialize with canary rollback/finalization, preserve
+  concurrent renames, and bind interrupted changes to the original config
+  owner so removing it cannot block another panel's retained baseline. Refs #259.
 
 ## [0.12.2] - 2026-11-17
 

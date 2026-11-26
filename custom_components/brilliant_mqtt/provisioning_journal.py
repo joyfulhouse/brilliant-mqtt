@@ -1016,6 +1016,7 @@ class ProvisioningRecord:
 
 
 _PENDING_OWNER_KEYS = frozenset({"slug", "public_key", "fingerprint", "host", "root_password"})
+_BOUND_PENDING_OWNER_KEYS = _PENDING_OWNER_KEYS | {"entry_id", "subentry_id"}
 _JOURNAL_ENVELOPE_KEYS = (
     frozenset({"record"}),
     frozenset({"record", "pending_owner"}),
@@ -1032,6 +1033,8 @@ class _PendingOwner:
     fingerprint: str
     host: str
     root_password: str = field(repr=False)
+    entry_id: str | None = None
+    subentry_id: str | None = None
 
     def __post_init__(self) -> None:
         identity_failed = False
@@ -1048,28 +1051,46 @@ class _PendingOwner:
         object.__setattr__(self, "public_key", identity.public_key)
         object.__setattr__(self, "fingerprint", identity.fingerprint)
         object.__setattr__(self, "root_password", _secret_text(self.root_password))
+        if self.entry_id is not None:
+            _string(self.entry_id)
+        if self.subentry_id is not None:
+            if self.entry_id is None:
+                raise _invalid()
+            _string(self.subentry_id)
 
     def __repr__(self) -> str:
         return "_PendingOwner(<redacted>)"
 
     def _to_storage(self) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             "slug": self.slug,
             "public_key": self.public_key,
             "fingerprint": self.fingerprint,
             "host": self.host,
             "root_password": self.root_password,
         }
+        if self.entry_id is not None:
+            result.update(entry_id=self.entry_id, subentry_id=self.subentry_id)
+        return result
 
     @classmethod
     def _from_storage(cls, raw: object) -> Self:
-        value = _exact_keys(raw, _PENDING_OWNER_KEYS)
+        if not isinstance(raw, dict) or frozenset(raw) not in {
+            _PENDING_OWNER_KEYS,
+            _BOUND_PENDING_OWNER_KEYS,
+        }:
+            raise _invalid()
+        value = raw
         return cls(
             slug=_string(value["slug"]),
             public_key=_string(value["public_key"]),
             fingerprint=_string(value["fingerprint"]),
             host=_string(value["host"]),
             root_password=_string(value["root_password"]),
+            entry_id=_string(value["entry_id"]) if "entry_id" in value else None,
+            subentry_id=(
+                _string(value["subentry_id"]) if value.get("subentry_id") is not None else None
+            ),
         )
 
 
@@ -1412,6 +1433,8 @@ def _matching_config_owner(
     """Return the single configuration owner of this verified panel, if it is unique."""
     matches: list[tuple[ConfigEntry[Any], ConfigSubentry | None, Mapping[str, Any]]] = []
     for entry in hass.config_entries.async_entries(DOMAIN):
+        if pending.entry_id is not None and entry.entry_id != pending.entry_id:
+            continue
         panel_subentries = [
             subentry
             for subentry in entry.subentries.values()
@@ -1419,9 +1442,11 @@ def _matching_config_owner(
         ]
         if panel_subentries:
             for subentry in panel_subentries:
+                if pending.entry_id is not None and subentry.subentry_id != pending.subentry_id:
+                    continue
                 if _config_owner_matches(subentry.data, pending):
                     matches.append((entry, subentry, subentry.data))
-        elif _config_owner_matches(entry.data, pending):
+        elif pending.subentry_id is None and _config_owner_matches(entry.data, pending):
             matches.append((entry, None, entry.data))
     if len(matches) != 1:
         return None
@@ -1613,7 +1638,11 @@ class ProvisioningJournal:
         journal, the retained store, and the configuration owner is finished
         by the next load.
         """
-        async with self._coordinator.lock:
+        from .fleet_manager import _shared_ssh_lock
+
+        # Provisioners take this same lock before resolving credentials or
+        # publishing operator intent. Always acquire it before the journal lock.
+        async with _shared_ssh_lock(self._hass), self._coordinator.lock:
             await self._async_reload()
             await self._async_apply_pending_owner(require_owner=False)
             if self._coordinator.pending_owner is not None:
@@ -1630,7 +1659,7 @@ class ProvisioningJournal:
             )
             if owner is None:
                 raise ProvisioningJournalError("owner_changed")
-            _entry, _subentry, data = owner
+            entry, subentry, data = owner
             if (
                 data.get(CONF_HOST) != expected_host
                 or data.get(CONF_ROOT_PASSWORD) != expected_password
@@ -1642,6 +1671,8 @@ class ProvisioningJournal:
                 fingerprint=fingerprint,
                 host=host,
                 root_password=root_password,
+                entry_id=entry.entry_id,
+                subentry_id=subentry.subentry_id if subentry is not None else None,
             )
             retained = await self._async_retained_load()
             # No active journal or retained row belongs to this panel. The
@@ -1981,6 +2012,24 @@ class ProvisioningJournal:
             return
         owner = _matching_config_owner(self._hass, pending)
         if owner is None:
+            if pending.entry_id is not None:
+                entry = self._hass.config_entries.async_get_entry(pending.entry_id)
+                removed = entry is None or (
+                    pending.subentry_id is not None and pending.subentry_id not in entry.subentries
+                )
+                if removed and not (
+                    self._coordinator.record is not None
+                    and _same_verified_panel(
+                        self._coordinator.record.panel_request,
+                        slug=pending.slug,
+                        public_key=pending.public_key,
+                        fingerprint=pending.fingerprint,
+                    )
+                ):
+                    # Retiring a removed owner's intent must not discard its
+                    # baseline or prevent recovery of another configured panel.
+                    await self._async_persist(self._coordinator.record, None)
+                    return
             if require_owner:
                 raise ProvisioningJournalError("journal_save_failed")
             return
@@ -2021,6 +2070,17 @@ class ProvisioningJournal:
                 ),
             )
         self._update_config_owner(owner, pending)
+        from .fleet_manager import ConfigEntryPersistenceError, async_wait_config_entry_persisted
+
+        entry, subentry, _data = owner
+        try:
+            await async_wait_config_entry_persisted(
+                self._hass,
+                entry,
+                subentry_id=subentry.subentry_id if subentry is not None else None,
+            )
+        except ConfigEntryPersistenceError:
+            raise ProvisioningJournalError("journal_save_failed") from None
         await self._async_persist(self._coordinator.record, None)
         _LOGGER.info(
             "Retargeted provisioning records for panel %s after a verified address change",
@@ -2032,7 +2092,10 @@ class ProvisioningJournal:
         owner: tuple[ConfigEntry[Any], ConfigSubentry | None, Mapping[str, Any]],
         pending: _PendingOwner,
     ) -> None:
-        entry, subentry, data = owner
+        current = _matching_config_owner(self._hass, pending)
+        if current is None or current[:2] != owner[:2]:
+            raise ProvisioningJournalError("owner_changed")
+        entry, subentry, data = current
         if (
             data.get(CONF_HOST) == pending.host
             and data.get(CONF_ROOT_PASSWORD) == pending.root_password
