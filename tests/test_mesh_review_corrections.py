@@ -15,11 +15,22 @@ if TYPE_CHECKING:
 
 import pytest
 
+from brilliant_mqtt.bridge import Bridge
+from brilliant_mqtt.bus import RpcBusAdapter
 from brilliant_mqtt.mesh_routing import TopicRepair
-from tests.fakes import _RawDevice, _RawPeripheral, _RawVariable
+from tests.fakes import (
+    FakeClock,
+    FakeMqtt,
+    FakeSleeper,
+    _RawDevice,
+    _RawPeripheral,
+    _RawVariable,
+    _StartHarness,
+)
 from tests.mesh_regression_support import Rig, turns
 from tests.test_bridge import MESH_STATE_TOPIC, _mesh_states
 from tests.test_mesh_bridge_integration import Connected, connected
+from tests.test_mesh_bus_ingress import delta
 from tests.test_mesh_capacity_routing import CountOnlyInventory
 from tests.test_mesh_settlement_regressions import (
     rig,
@@ -29,6 +40,36 @@ from tests.test_mesh_settlement_regressions import (
 )
 
 __all__ = ["connected", "rig"]
+
+
+@pytest.fixture
+async def cold_connected(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[Connected]:
+    clock, sleeper = FakeClock(), FakeSleeper()
+    harness = _StartHarness(monkeypatch, gated_writes=True)
+    adapter = RpcBusAdapter(extra_device_ids=("ble_mesh",), clock=clock)
+    await adapter.start()
+    raw = _RawDevice("ble_mesh", {})
+
+    async def get_device(device_id: str) -> _RawDevice:
+        return raw if device_id == "ble_mesh" else _RawDevice(device_id, {})
+
+    monkeypatch.setattr(harness.observers[0], "get_device", get_device, raising=False)
+    mqtt = FakeMqtt()
+    bridge = Bridge(
+        adapter,
+        mqtt,
+        "mesh",
+        include=lambda device_id: device_id == "ble_mesh",
+        clock=clock,
+        wall_clock=lambda: 1000 + clock(),
+        sleep=sleeper,
+    )
+    try:
+        yield Connected(bridge, adapter, mqtt, harness, clock, raw, sleeper)
+    finally:
+        harness.write_release.set()
+        await bridge.withdraw()
+        await adapter.shutdown()
 
 
 def states(rig: Connected, pid: str = "load") -> list[dict[str, object]]:
@@ -137,6 +178,122 @@ async def test_authoritative_unknown_id_absence_fences_delayed_first_sighting(
     assert registry.current("new") is not None
     assert "brilliant/mesh/new/set" in rig.bridge._subscribed
     assert states(rig, "new")[-1]["state"] == "ON"
+
+
+@pytest.mark.parametrize("boundary", ["push_deletion", "scoped_absence", "empty_inventory"])
+@pytest.mark.parametrize("recovery", ["inventory", "explicit_creation"])
+async def test_cold_unbound_absence_blocks_mqtt_native_admission_and_recovers_after_cleanup(
+    cold_connected: Connected, monkeypatch: pytest.MonkeyPatch, boundary: str, recovery: str
+) -> None:
+    rig = cold_connected
+    registry = rig.bridge.mesh_registry
+    assert registry is not None and not registry.owners and not registry.inventory_ready
+    assert rig.raw.peripherals == {}
+    pid = "deleted-load"
+    topic = f"brilliant/mesh/{pid}/set"
+    peripheral = _RawPeripheral("1")
+    peripheral.peripheral_type = 27
+    snapshot = _RawDevice("ble_mesh", {pid: peripheral})
+    observer = rig.harness.observers[0]
+    native = observer.request_set_variables_in_peripheral
+    issued: list[tuple[str, str, dict[str, str]]] = []
+    read_device = observer.get_device
+    device_reads: list[str] = []
+
+    async def record_read(device_id: str) -> _RawDevice:
+        device_reads.append(device_id)
+        result = await read_device(device_id)
+        assert isinstance(result, _RawDevice)
+        return result
+
+    async def record_native(peripheral_id: str, values: dict[str, str], *, device_id: str) -> str:
+        issued.append((device_id, peripheral_id, dict(values)))
+        result = await native(peripheral_id, values, device_id=device_id)
+        assert isinstance(result, str)
+        return result
+
+    monkeypatch.setattr(observer, "request_set_variables_in_peripheral", record_native)
+    monkeypatch.setattr(observer, "get_device", record_read)
+    async with delayed_poll(rig, monkeypatch, snapshot, cold=True):
+        assert registry.enabled and not registry.owners and not registry.inventory_ready
+        if boundary == "push_deletion":
+            await observer.handle_notification(
+                SimpleNamespace(
+                    updated_device=rig.raw,
+                    deleted=False,
+                    modified_peripherals=[delta(pid, deleted=True)],
+                )
+            )
+        elif boundary == "scoped_absence":
+
+            async def absent(device_id: str, peripheral_id: str) -> None:
+                return None
+
+            monkeypatch.setattr(observer, "get_peripheral", absent, raising=False)
+            assert await rig.adapter.get_peripheral("ble_mesh", pid) is None
+        else:
+            assert await rig.adapter.get_all() == []
+        assert not registry.owners
+    rig.harness.write_release.set()
+    await rig.mqtt.inject(topic, '{"state":"OFF"}')
+    print(
+        {
+            "boundary": boundary,
+            "recovery": recovery,
+            "owners": len(registry.owners),
+            "command_route": topic in rig.bridge._by_cmd_topic,
+            "native": issued,
+        }
+    )
+    assert (len(registry.owners), topic in rig.bridge._by_cmd_topic, issued) == (0, False, [])
+    assert topic not in rig.bridge._subscribed
+    assert rig.bridge._resolve_mesh_owner(topic) is None
+    assert rig.harness.write_starts == []
+    assert not states(rig, pid)
+
+    async def create() -> None:
+        assert rig.raw.peripherals is not None
+        rig.raw.peripherals[pid] = peripheral
+        offset = len(device_reads)
+        if recovery == "inventory":
+            await rig.bridge.poll_once()
+        else:
+            await observer.handle_notification(
+                SimpleNamespace(
+                    updated_device=rig.raw,
+                    deleted=False,
+                    modified_peripherals=[delta(pid, "on")],
+                )
+            )
+            await turns()
+        assert device_reads[offset:] == (
+            ["own-device", "ble_mesh"] if recovery == "inventory" else []
+        )
+
+    await create()
+    owner = registry.current(pid)
+    assert owner is not None
+    assert topic in rig.bridge._subscribed and rig.bridge._resolve_mesh_owner(topic) is owner
+    assert states(rig, pid)[-1]["state"] == "ON"
+    await rig.mqtt.inject(topic, '{"state":"OFF"}')
+    assert issued == [("ble_mesh", pid, {"on": "0"})]
+    assert rig.harness.write_starts == ["ble_mesh"]
+
+    # Completed removal must also permit a genuinely new owner and native write.
+    assert rig.raw.peripherals is not None
+    del rig.raw.peripherals[pid]
+    await rig.bridge.poll_once()
+    assert registry.current(pid) is None and not registry.retired
+    assert topic not in rig.bridge._subscribed and topic not in rig.bridge._by_cmd_topic
+    await rig.mqtt.inject(topic, '{"state":"OFF"}')
+    assert len(issued) == 1
+    await create()
+    successor = registry.current(pid)
+    assert successor is not None and successor is not owner
+    assert rig.bridge._resolve_mesh_owner(topic) is successor
+    await rig.mqtt.inject(topic, '{"state":"OFF"}')
+    assert issued == [("ble_mesh", pid, {"on": "0"})] * 2
+    assert rig.harness.write_starts == ["ble_mesh"] * 2
 
 
 @pytest.mark.parametrize("cold", [False, True], ids=["known_topology", "cold_acquisition"])

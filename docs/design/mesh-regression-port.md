@@ -493,8 +493,8 @@ Earlier fixture-signature and typing corrections are not semantic RED claims.
 The additional routing-index churn assertions are postimplementation supporting
 proof. No baseline XML/log or original reviewer probe was overwritten.
 
-The correction focused selection passes **1,895 cases across 63 files**,
-including **24 correction cases**, and the exact historical selection again
+The consolidated correction focused selection passes **1,901 cases across 63 files**,
+including **30 correction cases**, and the exact historical selection again
 passes **148 cases**. The seven unchanged reviewer runtime probes pass; an
 external wrapper around the two unchanged sensitivity probes requires their
 invalid sequences to raise an assertion. Healthy stable pushes perform zero
@@ -514,6 +514,31 @@ These boundaries now advance the existing creation/inventory ordering and hold
 readiness offline until a later complete inventory. Known topology/routes and
 unshadowed auxiliary merges survive; transport exceptions contribute no floor.
 Both unchanged controller runtime probes pass alongside the original seven.
+
+Kimi's final round-one review independently confirmed the unknown-ID absence
+finding at HIGH severity: an owner resurrected from a pre-deletion read admitted
+an actual native OFF write from MQTT during cold acquisition. Six additional
+permanent schedules begin with no owners and no completed initial inventory,
+then interleave deletion, scoped None or complete empty inventory before the
+first read returns. Each sends MQTT OFF and requires zero owners, command
+routes, subscriptions and native writes. Later inventory and explicit creation
+both restore actual native admission. Each schedule also completes removal,
+rejects another absent-owner command and proves a new successor can issue a
+native command after reappearance. Existing hot known-owner auxiliary merges
+remain covered. Read counters require zero native reads for explicit creation
+and only the ordinary own-device/mesh pair for inventory recovery. These
+schedules require no further production change.
+
+The six schedules all fail semantically against a separate `git archive`
+export of `ace2edb` source, recording the resurrected owner/route and actual
+native `on=0` issue in `pr297-r1-cold-native-red.log`. They pass against the
+corrected source in `pr297-r1-cold-native-green.log`; the imported frozen-source
+path is recorded in `pr297-r1-cold-source-proof.log`. The immutable review
+checkout is untouched. Kimi's unchanged original native reproduction also
+passes with zero owner/route/native write. Root source and payload remain
+byte-identical to the first correction commit; this follow-up adds only test
+and documentation coverage. Final gate and payload-index evidence for the
+consolidated commit is recorded separately under the `pr297-r1-kimi-*` prefix.
 
 The correction connected-schedule run passes 150 cases. Its 40-load resource
 proof preserves 4,040 captures, zero native normalization/Variable allocation,
