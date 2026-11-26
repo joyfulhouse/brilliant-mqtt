@@ -134,7 +134,10 @@ class LegacyPanelReconfigureFlow(_Base):
 
         if not isinstance(entry.data.get(DATA_SSH_HOST_KEY), str):
             return {"base": "host_key_changed"}, None
-        owner = PanelConnectionOwner(self.hass, entry)
+        try:
+            owner = PanelConnectionOwner(self.hass, entry)
+        except ConnectionOwnershipError as error:
+            return {"base": error.code}, None
         async with _shared_ssh_lock(self.hass):
             try:
                 owner.assert_current()
@@ -255,7 +258,9 @@ class LegacyPanelReconfigureFlow(_Base):
                 return {"base": "cannot_apply"}, None
         owner.assert_current()
         if CONF_HOST in updates or CONF_ROOT_PASSWORD in updates:
-            if host_key != owner.owner.public_key:
+            from ..connection_owner import canonical_connection_key
+
+            if canonical_connection_key(host_key) != owner.owner.public_key:
                 return {"base": "host_key_changed"}, None
             await owner.async_commit(host=host, password=password)
             return {}, self.async_abort(reason="reconfigure_successful")
@@ -304,9 +309,8 @@ class LegacyPanelReconfigureFlow(_Base):
             return self.async_abort(reason=self._reconfigure_unavailable())
         errors: dict[str, str] = {}
         if user_input is not None:
-            # Reject control chars on the RAW input first, THEN strip benign
-            # surrounding whitespace — otherwise a stray trailing space would read
-            # as a "different" host and downgrade the pinned check to a fresh TOFU.
+            # Reject control chars before normalizing outer whitespace. The stored
+            # pin remains mandatory for every address, including a changed host.
             errors = control_char_errors(
                 user_input,
                 (CONF_HOST, CONF_ROOT_PASSWORD),

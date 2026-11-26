@@ -1231,6 +1231,31 @@ class RetainedRollback:
             return None
         return current.panel_request.root_password
 
+    def matches_active_rollback(self, current: ProvisioningRecord | None) -> bool:
+        """Recognize already published named work by its complete passive provenance."""
+        if (
+            current is None
+            or current.operation is not ProvisioningOperation.ROLLBACK
+            or current.phase
+            not in {ProvisioningPhase.ROLLBACK_PENDING, ProvisioningPhase.ROLLED_BACK}
+            or self.state != "restore_requested"
+            or self.recovery_record is not None
+            or self.record.panel_request.bound_owner is None
+        ):
+            return False
+        return (
+            replace(
+                current,
+                operation=self.record.operation,
+                phase=self.record.phase,
+                last_error=self.record.last_error,
+                panel_request=replace(
+                    current.panel_request, root_password=self.record.panel_request.root_password
+                ),
+            )
+            == self.record
+        )
+
     def _to_storage(self) -> dict[str, object]:
         record = self.record._to_storage()
         request = self.record.panel_request._to_storage()
@@ -1735,7 +1760,13 @@ class ProvisioningJournal:
         async with self._coordinator.lock:
             records = await self._async_retained_load()
             key = str(expected.record.transaction_id)
-            if records.get(key) != expected or expected.recovery_record is not None:
+            if (
+                records.get(key) != expected
+                or expected.recovery_record is not None
+                or expected.state
+                not in {"armed", "soak", "restore_requested", "restored", "rollback_failed"}
+                or expected.finalization_origin is not None
+            ):
                 raise ProvisioningJournalError("invalid_journal_transition")
             await self._async_reload()
             active = self._coordinator.record

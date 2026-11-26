@@ -1032,7 +1032,13 @@ async def _async_recover_removed_entry(
         )
     except asyncio.CancelledError:
         raise
-    except Exception:
+    except Exception as error:
+        if (
+            isinstance(error, (ProvisioningJournalError, PanelProvisioningError))
+            and error.code == "address_change_incomplete"
+        ):
+            await async_reconcile_connection_issues(hass)
+            return
         if record is not None:
             await _ProvisioningRepairReporter(hass).async_report_rollback_failure(
                 record.transaction_id,
@@ -1416,15 +1422,7 @@ class FleetManager:
                     await self._async_prepare_provisioning_locked()
                 yield
             return
-        while True:
-            await self._ssh_lock.acquire()
-            if not self._lifecycle_lock.locked():
-                await self._lifecycle_lock.acquire()
-                break
-            # An existing lifecycle may still need SSH to complete its handoff.
-            self._ssh_lock.release()
-            async with self._lifecycle_lock:
-                pass
+        await self._async_acquire_operation_lifecycle()
         try:
             try:
                 if not self._shutting_down:
@@ -1434,6 +1432,22 @@ class FleetManager:
             yield
         finally:
             self._lifecycle_lock.release()
+
+    async def _async_acquire_operation_lifecycle(self) -> None:
+        """Acquire both locks without holding SSH while an existing lifecycle drains."""
+        while True:
+            await self._ssh_lock.acquire()
+            try:
+                if not self._lifecycle_lock.locked():
+                    await self._lifecycle_lock.acquire()
+                    return
+            except BaseException:
+                self._ssh_lock.release()
+                raise
+            # An existing lifecycle may still need SSH to complete its handoff.
+            self._ssh_lock.release()
+            async with self._lifecycle_lock:
+                pass
 
     async def _async_prepare_provisioning_locked(self) -> None:
         """Bind cheap handoffs now and schedule orphan network recovery separately."""
@@ -1482,6 +1496,8 @@ class FleetManager:
                     else:
                         self._async_schedule_background_recovery(retained.recovery_record)
                     continue
+                if retained.matches_active_rollback(record):
+                    continue
                 if (
                     retained.state in {"restore_requested", "finalizing"}
                     and retained.finalization_origin is None
@@ -1509,7 +1525,12 @@ class FleetManager:
                 elif (
                     retained.state == "finalizing"
                     and retained.finalization_origin is None
-                    and record is None
+                    and (
+                        record is None
+                        or record.panel_request.public_key
+                        != retained.record.panel_request.public_key
+                        and record.panel_request.slug != retained.record.panel_request.slug
+                    )
                 ):
                     self._async_schedule_background_recovery(retained.record)
         except asyncio.CancelledError:
@@ -2178,7 +2199,8 @@ class FleetManager:
                             tuple(manager for _panel_id, manager in removed)
                         )
                     )
-                entry_reload_required = await self._async_complete_pending_handoff()
+                handoff_reload_required = await self._async_complete_pending_handoff()
+                entry_reload_required = bool(staged) or handoff_reload_required
             except asyncio.CancelledError:
                 if control_plane_reload_attempt is not None and not self._shutting_down:
                     self._async_schedule_reload_once()
@@ -2336,7 +2358,8 @@ class FleetManager:
         candidate: HostIdentity,
     ) -> None:
         """Durably replace one explicitly verified panel identity."""
-        async with self._ssh_lock, self._lifecycle_lock:
+        await self._async_acquire_operation_lifecycle()
+        try:
             await self._async_assert_rebind_journal_clear()
             fleet, manager, subentry = self._rebind_snapshot(subentry_id, expected)
             if await _async_duplicate_fingerprint(
@@ -2450,6 +2473,9 @@ class FleetManager:
                     "new_fingerprint": rebound.identity_fingerprint,
                 },
             )
+        finally:
+            self._lifecycle_lock.release()
+            self._ssh_lock.release()
 
     async def async_panel_added(self, subentry_id: str) -> None:
         """Reconcile a newly persisted panel subentry."""

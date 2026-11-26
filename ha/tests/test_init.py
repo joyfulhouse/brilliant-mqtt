@@ -105,7 +105,9 @@ ENTRY_DATA = {
     CONF_MQTT_PORT: 1883,
     CONF_MQTT_USERNAME: "brilliant",
     CONF_MQTT_PASSWORD: "mqttpass",
-    DATA_SSH_HOST_KEY: "ssh-ed25519 PINNED",
+    DATA_SSH_HOST_KEY: (
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKIykuTed7zNwJwn20eCelcKcHKJ9c/pGFfvulRWazuC"
+    ),
 }
 
 

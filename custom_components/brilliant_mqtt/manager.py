@@ -652,8 +652,9 @@ class PanelManager:
         """Return architecture-appropriate recovery without unsafe fleet advice."""
         if isinstance(self.store, LegacyPanelStore):
             return (
-                "panel SSH host key changed — open Reconfigure to re-pin, or "
-                "enable 'Trust host-key changes' in options"
+                "panel SSH host key changed — verify the address and physical panel; "
+                "for an intended replacement, remove and re-add the verified legacy panel. "
+                "Connection accepts only the existing key"
             )
         return (
             "panel SSH host key changed — verify the configured address; for a "
@@ -703,10 +704,10 @@ class PanelManager:
 
         if not isinstance(self.store, (FleetPanelStore, LegacyPanelStore)):
             raise PanelOpError("invalid_panel_configuration_store")
-        owner = PanelConnectionOwner(
-            self.hass, self.store.entry, getattr(self.store, "subentry", None)
-        )
         try:
+            owner = PanelConnectionOwner(
+                self.hass, self.store.entry, getattr(self.store, "subentry", None)
+            )
             await owner.journal.async_assert_connection_available(owner=owner.owner)
             owner.assert_current()
         except (ProvisioningJournalError, ConnectionOwnershipError) as error:

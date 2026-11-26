@@ -108,7 +108,7 @@ def isolated_manager_canary_dependency(
 
 
 # The key an unpinned re-pin connect captures (mirrors the rotated server key).
-REPIN_NEW_KEY = "ssh-ed25519 NEWKEY"
+REPIN_NEW_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIG/koBYdTnHujqIpcXlQkQqzGBoZJ6Y4rm22iGIdAu4B"
 
 
 @dataclass
@@ -289,7 +289,7 @@ def installed_voice_entry(hass: HomeAssistant) -> MockConfigEntry:
         CONF_MQTT_USERNAME: "brilliant",
         CONF_MQTT_PASSWORD: "mqttpass",
         CONF_MESH_PRIORITY: 0,
-        DATA_SSH_HOST_KEY: "ssh-ed25519 STORED",
+        DATA_SSH_HOST_KEY: ENTRY_DATA[DATA_SSH_HOST_KEY],
         CONF_COMPONENTS: {COMPONENT_BRIDGE: True, COMPONENT_VOICE: True},
         CONF_VOICE_WAKE_WORD: "okay_nabu",
         CONF_VOICE_HA_HOST: "",

@@ -315,7 +315,7 @@ def _legacy_entry() -> MockConfigEntry:
             CONF_ENTRY_KIND: ENTRY_KIND_LEGACY_PENDING_CONSOLIDATION,
             CONF_HOST: "legacy.example.com",
             CONF_ROOT_PASSWORD: "legacy-secret",
-            CONF_SSH_HOST_KEY: "ssh-ed25519 AAAA-legacy",
+            CONF_SSH_HOST_KEY: _OFFICE_PUBLIC_KEY,
             CONF_PANEL: "legacy",
             CONF_MESH_PRIORITY: 1,
             CONF_MQTT_HOST: "mqtt.example.com",

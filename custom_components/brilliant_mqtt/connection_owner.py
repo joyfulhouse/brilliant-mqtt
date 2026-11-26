@@ -24,6 +24,7 @@ from .const import (
     DOMAIN,
 )
 from .provisioning_journal import ProvisioningJournal, ProvisioningJournalError, StoredPanelRequest
+from .shell import PanelIdentityError, canonical_legacy_public_key
 
 CONNECTION_COMMIT_ID = "connection_commit_id"
 
@@ -36,13 +37,21 @@ class ConnectionOwnershipError(ValueError):
         super().__init__(code)
 
 
+def canonical_connection_key(value: object) -> str:
+    """Treat only already-valid legacy formatting as the same pinned key."""
+    try:
+        return canonical_legacy_public_key(value)
+    except PanelIdentityError:
+        raise ConnectionOwnershipError("host_key_changed") from None
+
+
 def connection(data: Mapping[str, Any]) -> PanelConnection:
     """Read one complete connection, never mixing config with journal fields."""
     return PanelConnection(
         str(data[CONF_HOST]),
         str(data.get(CONF_SSH_USERNAME, "root")),
         str(data[CONF_ROOT_PASSWORD]),
-        str(data[CONF_SSH_HOST_KEY]),
+        canonical_connection_key(data.get(CONF_SSH_HOST_KEY)),
     )
 
 
@@ -94,7 +103,7 @@ class PanelConnectionOwner:
             entry.entry_id,
             None if subentry is None else subentry.subentry_id,
             str(data[CONF_PANEL]),
-            str(data[CONF_SSH_HOST_KEY]),
+            canonical_connection_key(data.get(CONF_SSH_HOST_KEY)),
         )
         self.prior = connection(data)
         self.journal = ProvisioningJournal(hass)
@@ -111,7 +120,7 @@ class PanelConnectionOwner:
             data = current.data
         if (
             data.get(CONF_PANEL) != self.owner.slug
-            or data.get(CONF_SSH_HOST_KEY) != self.owner.public_key
+            or canonical_connection_key(data.get(CONF_SSH_HOST_KEY)) != self.owner.public_key
         ):
             raise ConnectionOwnershipError("baseline_owner_mismatch")
         return data
@@ -375,17 +384,25 @@ async def async_resolve_panel_owner(hass: HomeAssistant, request: StoredPanelReq
             else [(None, entry.data)]
         )
         for subentry_id, data in candidates:
-            owner = PanelOwner(
-                entry.entry_id,
-                subentry_id,
-                str(data.get(CONF_PANEL, "unknown")),
-                str(data.get(CONF_SSH_HOST_KEY, "unknown")),
-            )
+            if bound is not None and (entry.entry_id, subentry_id) != (
+                bound.entry_id,
+                bound.subentry_id,
+            ):
+                continue
+            try:
+                owner = PanelOwner(
+                    entry.entry_id,
+                    subentry_id,
+                    str(data.get(CONF_PANEL, "unknown")),
+                    canonical_connection_key(data.get(CONF_SSH_HOST_KEY)),
+                )
+            except ValueError:
+                continue
             if bound is not None and bound != owner:
                 continue
             if (
                 data.get(CONF_PANEL) == request.slug
-                and data.get(CONF_SSH_HOST_KEY) == request.public_key
+                and owner.public_key == request.public_key
                 and data.get(CONF_HOST) == request.host
             ):
                 matches.append(owner)

@@ -1959,6 +1959,8 @@ class PanelProvisioner:
                     and retained.record.panel_request.bound_owner is not None
                 ):
                     await self._async_assert_named_live(retained.record.panel_request)
+                if retained.state == "finalizing" and retained.finalization_origin is None:
+                    await self._async_assert_finalize_available(retained)
             except (PanelProvisioningError, ProvisioningJournalError):
                 continue
             if retained.state == "finalizing":
@@ -2555,6 +2557,8 @@ class PanelProvisioner:
         if retained is None:
             raise PanelProvisioningError("baseline_incomplete")
         await self._async_admit_connection(retained.record.panel_request)
+        if retained.state == "finalizing":
+            raise PanelProvisioningError("provisioning_recovery_required")
         if (
             retained.recovery_record is not None
             and current is not None
@@ -2784,9 +2788,16 @@ class PanelProvisioner:
         await self._journal.async_remove_retained(marked.record.transaction_id)
         await self._repair_reporter.async_clear_rollback_failure(marked.record.transaction_id)
 
-    async def _async_finalize(self, retained: RetainedRollback) -> None:
+    async def _async_assert_finalize_available(self, retained: RetainedRollback) -> None:
+        """Refuse scoped or same-panel active work before any finalization contact."""
         if retained.recovery_record is not None:
             raise PanelProvisioningError("provisioning_recovery_required")
+        current = await self._journal.async_load()
+        if current is not None and self._same_panel(current, retained.record):
+            raise PanelProvisioningError("provisioning_recovery_required")
+
+    async def _async_finalize(self, retained: RetainedRollback) -> None:
+        await self._async_assert_finalize_available(retained)
         request = retained.record.panel_request
         password = await self._resolve_credential(request)
         shell = self._shell_factory(request.host, password, request.public_key)
