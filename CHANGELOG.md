@@ -169,6 +169,9 @@ existing panel code.
   with no new upstream event-reflection runtime in this release.
 - The component-plugin and stock-service replacement design is documentation
   only; this release does not implement a plugin system (#288, Refs #283).
+- Added the [serialized mesh-write settlement design](docs/design/mesh-write-settlement.md),
+  with observation, completion and publication ownership rules and regression
+  requirements. This release does not implement that design (#287, Refs #225).
 
 ## [0.12.2] - 2026-11-17
 
