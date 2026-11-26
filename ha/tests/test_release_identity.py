@@ -21,6 +21,10 @@ from tests.fakes import FakeShell
 from tests.test_components import _bridge_data
 from tests.test_manager import _fleet_panel_manager
 
+PACKAGED_PAYLOAD_DIR = (
+    Path(__file__).resolve().parents[2] / "custom_components/brilliant_mqtt/agent_payload"
+)
+
 
 def _identity(digest: str = "a" * 64, ordinal: int | None = 9) -> dict[str, object]:
     return {
@@ -407,12 +411,16 @@ async def test_pre_ordinal_admission_applies_to_each_changed_component(payload_d
     assert audits[0]["components"] == ["bridge", "bus_watchdog", "wifi_watchdog"]
 
 
-async def test_ordinal_five_incumbent_uses_normal_ordering_for_release_0_11_4(
+async def test_ordinal_six_incumbent_uses_normal_ordering_for_release_0_12_0(
     payload_dir: Path,
 ) -> None:
-    (payload_dir / "VERSION").write_text("0.11.4")
-    (payload_dir / "RELEASE_ORDINAL").write_text("6\n")
-    shell = IdentityShell({**_identity(digest="5" * 64, ordinal=5), "version": "0.11.3"})
+    version = (PACKAGED_PAYLOAD_DIR / "VERSION").read_text()
+    ordinal = (PACKAGED_PAYLOAD_DIR / "RELEASE_ORDINAL").read_text()
+    assert version.strip() == "0.12.0"
+    assert ordinal.strip() == "7"
+    (payload_dir / "VERSION").write_text(version)
+    (payload_dir / "RELEASE_ORDINAL").write_text(ordinal)
+    shell = IdentityShell({**_identity(digest="5" * 64, ordinal=6), "version": "0.11.4"})
     await shell.connect()
     async with panel_ops.release_transaction(
         shell, str(payload_dir), panel="guest-bath"
