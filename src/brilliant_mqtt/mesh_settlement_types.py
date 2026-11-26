@@ -36,6 +36,8 @@ class MeshMetadata:
     name: str
     kind: DeviceKind
     peripheral_type: int = 0
+    binding_dimmable: bool | None = None
+    binding_max_intensity: int | None = None
 
 
 @dataclass(frozen=True)
@@ -142,6 +144,24 @@ class SeedBinding:
 
     envelope: Envelope
     capture: PrimitiveCapture
+
+
+@dataclass(frozen=True)
+class UpdateMetadata:
+    envelope: Envelope
+    metadata: MeshMetadata
+
+
+@dataclass(frozen=True)
+class RequestPublication:
+    envelope: Envelope
+
+
+@dataclass(frozen=True)
+class RetireAbsent:
+    """Irreversibly close ingress, retaining only bounded absence publication."""
+
+    envelope: Envelope
 
 
 @dataclass(frozen=True)
@@ -280,6 +300,9 @@ class WakePublication:
 Event = (
     Observe
     | SeedBinding
+    | UpdateMetadata
+    | RequestPublication
+    | RetireAbsent
     | PeripheralAbsent
     | ScopeUnknown
     | Begin

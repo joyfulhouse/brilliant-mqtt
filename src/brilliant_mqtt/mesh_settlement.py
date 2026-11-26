@@ -41,11 +41,14 @@ from brilliant_mqtt.mesh_settlement_types import (
     PublishAccepted,
     PublishFailed,
     PublishStarted,
+    RequestPublication,
+    RetireAbsent,
     Revoke,
     RevokeEffects,
     ScopeUnknown,
     SeedBinding,
     TerminalObligation,
+    UpdateMetadata,
     WakePublication,
     WindowToken,
     WorkerCancelled,
@@ -72,6 +75,11 @@ class MeshSettlement:
     def active(self) -> bool:
         return self._phase is not Phase.INACTIVE
 
+    @property
+    def retired(self) -> bool:
+        """An absent binding remains live solely to finish bounded cleanup debt."""
+        return self._retired
+
     def __init__(
         self,
         metadata: MeshMetadata,
@@ -84,6 +92,7 @@ class MeshSettlement:
         initial_unconfirmed: bool = False,
         motion_hold_s: float = 60.0,
         native_motion_passthrough: bool = False,
+        derive_motion: bool = True,
     ) -> None:
         if (
             not source
@@ -148,6 +157,8 @@ class MeshSettlement:
         self._last_hot: float | None = None
         self._motion_hold_s = motion_hold_s
         self._native_motion_passthrough = native_motion_passthrough
+        self._derive_motion = derive_motion
+        self._retired = False
         self._revision = 1
         self._ordinary_debt: int | None = 1
         self._terminal: TerminalObligation | None = (
@@ -194,7 +205,12 @@ class MeshSettlement:
     def materialize(self, now: float) -> BrilliantDevice:
         """Disposable legacy view; mutations cannot feed back into the owner."""
         return mesh_settlement_render.materialize(
-            self._metadata, self.view, now, self._motion_hold_s, self._native_motion_passthrough
+            self._metadata,
+            self.view,
+            now,
+            self._motion_hold_s,
+            self._native_motion_passthrough,
+            self._derive_motion,
         )
 
     def render(self, now: float, *, token: PublicationToken | None = None) -> Mapping[str, object]:
@@ -208,6 +224,7 @@ class MeshSettlement:
             self._motion_hold_s,
             self._native_motion_passthrough,
             token,
+            self._derive_motion,
         )
 
     def publication_token(self, client_session: object) -> PublicationToken | None:
@@ -239,6 +256,10 @@ class MeshSettlement:
         effects: list[Effect] = []
         if self._phase is Phase.INACTIVE:
             return ()
+        if self._retired and not isinstance(
+            event, (PublishStarted, PublishAccepted, PublishFailed, Revoke)
+        ):
+            return ()
         if isinstance(event, Completion):
             return self._complete(event)
         if isinstance(event, SeedBinding):
@@ -255,7 +276,50 @@ class MeshSettlement:
             return tuple(effects)
         if not self._admitted(envelope):
             return ()
-        if isinstance(event, Observe):
+        if isinstance(event, UpdateMetadata):
+            if (
+                event.metadata.device_id == self._metadata.device_id
+                and event.metadata.peripheral_id == self._metadata.peripheral_id
+                and event.metadata.kind is self._metadata.kind
+                and event.metadata.peripheral_type == self._metadata.peripheral_type
+                and event.metadata.binding_dimmable == self._metadata.binding_dimmable
+                and event.metadata.binding_max_intensity == self._metadata.binding_max_intensity
+            ):
+                self._metadata = event.metadata
+        elif isinstance(event, RequestPublication):
+            self._touch(effects)
+        elif isinstance(event, RetireAbsent):
+            tracked = (
+                self._phase in (Phase.ISSUING, Phase.UNRESOLVED, Phase.INCONCLUSIVE, Phase.ACCEPTED)
+                or self._terminal is not None
+            )
+            self._end_window(effects)
+            self._retired = True
+            self._phase = Phase.TERMINAL
+            self._status = "unconfirmed" if tracked and self._primary else "idle"
+            self._targets = ()
+            self._issued_targets = ()
+            self._ticket = None
+            self._issue = None
+            self._outcome = None
+            self._receipt = None
+            self._return = None
+            self._completion_hold = None
+            self._hold_blocks_primary = False
+            self._fields.clear()
+            self._watermarks.clear()
+            self._evidence.clear()
+            self._aux_tickets.clear()
+            self._projections.clear()
+            self._projection_fences.clear()
+            self._last_hot = None
+            self._retire(envelope)
+            if tracked and self._primary:
+                self._terminal = TerminalObligation(
+                    self._command_id, self._window_identity, envelope.sequence, "unconfirmed"
+                )
+            self._touch(effects)
+        elif isinstance(event, Observe):
             self._observe(event, effects)
         elif isinstance(event, (PeripheralAbsent, ScopeUnknown)):
             names = self._supported if isinstance(event, PeripheralAbsent) else _PRIMARY
@@ -550,7 +614,7 @@ class MeshSettlement:
             removed = removed | (self._supported - present)
         for name in removed & self._supported:
             changed |= self._merge(name, None, event.envelope, effects, seed=seed)
-        if admitted_score is not None:
+        if admitted_score is not None and self._derive_motion:
             self._motion_score(admitted_score, event.envelope.captured_at)
         if changed:
             self._touch(effects)

@@ -139,6 +139,8 @@ class BrilliantDevice:
     capture_unknown: frozenset[str] = frozenset()
     # Notification-wide inventory, captured before per-peripheral callback delivery.
     capture_hardware_count: int | None = None
+    binding_dimmable: bool | None = None
+    binding_max_intensity: int | None = None
 
     # Deliberate asymmetry: is_on collapses an absent "on" variable to False (a load
     # without "on" is just off/uncontrollable), while motion_detected preserves None
@@ -154,6 +156,8 @@ class BrilliantDevice:
     @property
     def is_dimmable(self) -> bool:
         """True iff an "intensity" variable is present."""
+        if self.binding_dimmable is not None:
+            return self.binding_dimmable
         return "intensity" in self.variables
 
     @property
@@ -170,6 +174,8 @@ class BrilliantDevice:
 
         Downstream milestones divide by this value, so non-positive values fall back too.
         """
+        if self.binding_max_intensity is not None:
+            return self.binding_max_intensity
         var = self.variables.get("max_intensity_value")
         if var is None:
             return 1000

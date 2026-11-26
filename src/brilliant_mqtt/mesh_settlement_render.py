@@ -17,6 +17,7 @@ def materialize(
     now: float,
     hold_s: float,
     native_motion_passthrough: bool,
+    derive_motion: bool = True,
 ) -> BrilliantDevice:
     fields = dict(view.observed)
     fields.update(view.projections)
@@ -30,12 +31,14 @@ def materialize(
             name: Variable(name, value.value, value.externally_settable, value.timestamp_ms)
             for name, value in fields.items()
         },
+        binding_dimmable=metadata.binding_dimmable,
+        binding_max_intensity=metadata.binding_max_intensity,
     )
     variables = device.variables
     motion = variables.get("movement_detected")
     score = variables.get("motion_score")
     enable = variables.get("enable_motion_score")
-    if motion is None or score is None or enable is None:
+    if not derive_motion or motion is None or score is None or enable is None:
         return device
     if not enable.as_bool():
         if native_motion_passthrough and has_calibrated_motion_thresholds(device):
@@ -63,8 +66,9 @@ def render(
     hold_s: float,
     native_motion_passthrough: bool,
     token: PublicationToken | None,
+    derive_motion: bool = True,
 ) -> Mapping[str, object]:
-    device = materialize(metadata, view, now, hold_s, native_motion_passthrough)
+    device = materialize(metadata, view, now, hold_s, native_motion_passthrough, derive_motion)
     fields = payload_fields(device, native_motion_passthrough=native_motion_passthrough)
     if metadata.kind not in (DeviceKind.LIGHT, DeviceKind.SWITCH):
         return MappingProxyType(fields)
