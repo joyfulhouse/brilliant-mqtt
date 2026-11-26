@@ -200,12 +200,12 @@ async def _journal(hass: HomeAssistant) -> MigrationRecord | None:
 
 
 async def _drive_setup_retries(hass: HomeAssistant, entry_id: str) -> None:
-    """Advance time until HA's own (backed-off) setup retry has run."""
-    for step in range(1, 7):
-        async_fire_time_changed(hass, dt_util.utcnow() + timedelta(minutes=10 * step))
-        await hass.async_block_till_done()
-        if hass.config_entries.async_get_known_entry(entry_id).state is ConfigEntryState.LOADED:
-            return
+    """Run HA's scheduled setup retry, including its background setup task."""
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(minutes=10))
+    # HA retries setup in the background. Advancing time again while it awaits
+    # executor I/O can fire the provisioning journal's read timeout prematurely.
+    await hass.async_block_till_done(wait_background_tasks=True)
+    assert hass.config_entries.async_get_known_entry(entry_id).state is ConfigEntryState.LOADED
 
 
 def _journal_exists(hass: HomeAssistant) -> bool:
