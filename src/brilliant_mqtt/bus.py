@@ -1102,14 +1102,17 @@ class RpcBusAdapter:
         if previous is None or boundary.sequence > previous.sequence:
             self._privacy_revocation = boundary
 
-    def _next_capture_provenance(self, origin: str = "capture") -> CaptureProvenance:
+    def _capture_generation_snapshot(self) -> int:
         with self._generation_lock:
             session, generation = self._session, self._capture_generation
         if generation > self._applied_capture_generation:
             # A ready write/push can run ahead of the foreign hook's queued
             # fanout. Reset eras/privacy before recording new-generation data.
             self._apply_reconnect(session, generation, from_hook=False)
-        return self._allocate_capture_provenance(origin, generation)
+        return generation
+
+    def _next_capture_provenance(self, origin: str = "capture") -> CaptureProvenance:
+        return self._allocate_capture_provenance(origin, self._capture_generation_snapshot())
 
     def _allocate_capture_provenance(self, origin: str, generation: int) -> CaptureProvenance:
         self._capture_sequence += 1
@@ -1304,11 +1307,17 @@ class RpcBusAdapter:
             session = self._session
         if self._shutting_down or session != self._session:
             return
-        cbs = list(self._change_cbs)
         raw_id = getattr(raw_device, "id", None)
         device_id = str(raw_id) if raw_id else self._own_device_id
         if device_id is None:
             return
+        mesh_generation = None
+        if device_id == "ble_mesh" and self._mesh_sinks:
+            # Lifecycle fanout precedes every live scope decision. A hook after
+            # this snapshot leaves the notification in the older generation.
+            mesh_generation = self._capture_generation_snapshot()
+            if self._shutting_down or session != self._session:
+                return
         # Scope pre-filter (issue #98): decide which callbacks want THIS device
         # by its id BEFORE touching its peripherals. A device no registered
         # consumer currently wants — a mesh push while this panel is a mesh
@@ -1318,11 +1327,11 @@ class RpcBusAdapter:
         # preserves synchronous camera revocation independently of delivery.
         admitted = [
             (cb, coalesce_pushes)
-            for cb, coalesce_pushes, want_device in cbs
+            for cb, coalesce_pushes, want_device in list(self._change_cbs)
             if want_device is None or want_device(device_id)
         ]
-        if device_id == "ble_mesh" and self._mesh_sinks:
-            self._dispatch_mesh_push(raw_device, admitted, session)
+        if mesh_generation is not None:
+            self._dispatch_mesh_push(raw_device, admitted, session, mesh_generation)
             return
         if not admitted and device_id != self._own_device_id:
             return
@@ -1387,13 +1396,14 @@ class RpcBusAdapter:
         raw_device: Any,
         admitted: list[tuple[Callable[[BrilliantDevice], Awaitable[None]], bool]],
         session: int,
+        generation: int,
     ) -> None:
         boundary: CaptureProvenance | None = None
 
         def push_boundary() -> CaptureProvenance:
             nonlocal boundary
             if boundary is None:
-                boundary = self._next_capture_provenance("push")
+                boundary = self._allocate_capture_provenance("push", generation)
             return boundary
 
         if getattr(raw_device, "deleted", False) is True:
