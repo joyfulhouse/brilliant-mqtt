@@ -2248,13 +2248,23 @@ class PanelProvisioner:
         finally:
             await _settle_close(observer.async_close)
 
-    async def _resolve_credential(self, request: StoredPanelRequest) -> str:
-        password = await self._credential_resolver(request) if self._credential_resolver else None
+    async def _resolve_credential(
+        self,
+        request: StoredPanelRequest,
+        resolver: Callable[[StoredPanelRequest], Awaitable[str | None]] | None = None,
+    ) -> str:
+        resolver = resolver if resolver is not None else self._credential_resolver
+        password = await resolver(request) if resolver else None
         if password is None:
             raise PanelProvisioningError("rollback_credentials_unavailable")
         return password
 
-    async def async_rollback(self, transaction_id: UUID) -> None:
+    async def async_rollback(
+        self,
+        transaction_id: UUID,
+        *,
+        credential_resolver: Callable[[StoredPanelRequest], Awaitable[str | None]] | None = None,
+    ) -> None:
         """Persist operator intent before asking the existing runner to execute it."""
         async with self._lock:
             current = await self._journal.async_load()
@@ -2263,12 +2273,19 @@ class PanelProvisioner:
             retained = await self._journal.async_retained(transaction_id)
             if retained is None:
                 raise PanelProvisioningError("baseline_incomplete")
-            password = await self._resolve_credential(retained.record.panel_request)
+            password = await self._resolve_credential(
+                retained.record.panel_request, credential_resolver
+            )
             await self._journal.async_retained_state(transaction_id, "restore_requested")
             await self._journal.async_begin_restore(transaction_id, password)
         await self.async_recover()
 
-    async def async_finalize(self, transaction_id: UUID) -> None:
+    async def async_finalize(
+        self,
+        transaction_id: UUID,
+        *,
+        credential_resolver: Callable[[StoredPanelRequest], Awaitable[str | None]] | None = None,
+    ) -> None:
         """Explicit intentional loss of the rollback guarantee, with durable intent."""
         async with self._lock:
             if await self._journal.async_load() is not None:
@@ -2278,8 +2295,11 @@ class PanelProvisioner:
                 return
             if retained.finalization_origin == "ownerless_restored":
                 raise PanelProvisioningError("ownerless_finalize_reauthentication_required")
+            password = await self._resolve_credential(
+                retained.record.panel_request, credential_resolver
+            )
             await self._journal.async_retained_state(transaction_id, "finalizing")
-            await self._async_finalize(retained)
+            await self._async_finalize(retained, password=password)
 
     async def _async_assert_ownerless(self, expected: RetainedRollback) -> None:
         current = await self._journal.async_retained(expected.record.transaction_id)
@@ -2444,9 +2464,12 @@ class PanelProvisioner:
         await self._journal.async_remove_retained(marked.record.transaction_id)
         await self._repair_reporter.async_clear_rollback_failure(marked.record.transaction_id)
 
-    async def _async_finalize(self, retained: RetainedRollback) -> None:
+    async def _async_finalize(
+        self, retained: RetainedRollback, *, password: str | None = None
+    ) -> None:
         request = retained.record.panel_request
-        password = await self._resolve_credential(request)
+        if password is None:
+            password = await self._resolve_credential(request)
         shell = self._shell_factory(request.host, password, request.public_key)
         try:
             if shell.pinned_host_key() != request.public_key:

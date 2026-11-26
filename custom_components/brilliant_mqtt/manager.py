@@ -23,6 +23,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from typing import Any, Literal, Protocol
 from uuid import UUID
@@ -1817,7 +1818,7 @@ class PanelManager:
 
     async def async_canary_operation(self, operation: str, name: str) -> None:
         """Bind an explicitly named rollback/finalization to this one panel owner."""
-        from .fleet_manager import _get_recovery_provisioner
+        from .fleet_manager import _async_rollback_credential, _get_recovery_provisioner
 
         try:
             transaction = UUID(name)
@@ -1879,10 +1880,20 @@ class PanelManager:
             if not adopted:
                 raise _CanaryOperationError("baseline_owner_mismatch")
             provisioner = _get_recovery_provisioner(self.hass)
+            credential_resolver = partial(
+                _async_rollback_credential,
+                self.hass,
+                entry_id=owner_entry_id,
+                subentry_id=owner_subentry_id,
+            )
             if operation == "rollback":
-                await provisioner.async_rollback(transaction)
+                await provisioner.async_rollback(
+                    transaction, credential_resolver=credential_resolver
+                )
             elif operation == "finalize":
-                await provisioner.async_finalize(transaction)
+                await provisioner.async_finalize(
+                    transaction, credential_resolver=credential_resolver
+                )
             else:
                 raise _CanaryOperationError("invalid_canary_operation")
         except Exception as error:

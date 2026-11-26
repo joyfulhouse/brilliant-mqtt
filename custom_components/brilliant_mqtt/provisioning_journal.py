@@ -32,7 +32,12 @@ from .const import (
     SUBENTRY_TYPE_PANEL,
 )
 from .release_identity import RollbackBaseline
-from .shell import HostIdentity, PanelIdentityError, known_hosts_line
+from .shell import (
+    HostIdentity,
+    PanelIdentityError,
+    known_hosts_line,
+    validated_public_key_fingerprint,
+)
 
 JOURNAL_STORAGE_VERSION = 1
 JOURNAL_STORAGE_KEY = "brilliant_mqtt.provisioning"
@@ -1453,6 +1458,37 @@ def _matching_config_owner(
     return matches[0]
 
 
+def _superseding_config_owner(
+    hass: HomeAssistant,
+    pending: _PendingOwner,
+) -> tuple[ConfigEntry[Any], ConfigSubentry | None, Mapping[str, Any]] | None:
+    """Identify a new pin on the exact owner, without granting it the old baseline."""
+    if pending.entry_id is None:
+        return None
+    entry = hass.config_entries.async_get_entry(pending.entry_id)
+    if entry is None or entry.domain != DOMAIN:
+        return None
+    subentry = entry.subentries.get(pending.subentry_id) if pending.subentry_id else None
+    if pending.subentry_id is not None and subentry is None:
+        return None
+    data = subentry.data if subentry is not None else entry.data
+    key = data.get(CONF_SSH_HOST_KEY)
+    if (
+        data.get(CONF_PANEL) != pending.slug
+        or not isinstance(key, str)
+        or key == pending.public_key
+    ):
+        return None
+    try:
+        fingerprint = validated_public_key_fingerprint(key)
+    except PanelIdentityError:
+        return None
+    stored_fingerprint = data.get(CONF_IDENTITY_FINGERPRINT)
+    if stored_fingerprint and stored_fingerprint != fingerprint:
+        return None
+    return entry, subentry, data
+
+
 def _active_adoption_needed(record: ProvisioningRecord | None, pending: _PendingOwner) -> bool:
     return (
         record is not None
@@ -2016,20 +2052,20 @@ class ProvisioningJournal:
             return
         owner = _matching_config_owner(self._hass, pending)
         if owner is None:
+            if require_owner:
+                raise ProvisioningJournalError("owner_changed")
+            active_matches = self._coordinator.record is not None and _same_verified_panel(
+                self._coordinator.record.panel_request,
+                slug=pending.slug,
+                public_key=pending.public_key,
+                fingerprint=pending.fingerprint,
+            )
             if pending.entry_id is not None:
                 entry = self._hass.config_entries.async_get_entry(pending.entry_id)
                 removed = entry is None or (
                     pending.subentry_id is not None and pending.subentry_id not in entry.subentries
                 )
-                if removed and not (
-                    self._coordinator.record is not None
-                    and _same_verified_panel(
-                        self._coordinator.record.panel_request,
-                        slug=pending.slug,
-                        public_key=pending.public_key,
-                        fingerprint=pending.fingerprint,
-                    )
-                ):
+                if removed and not active_matches:
                     from .fleet_manager import async_wait_config_owner_removed
 
                     self._hass.config_entries._async_schedule_save()
@@ -2038,8 +2074,28 @@ class ProvisioningJournal:
                     ):
                         await self._async_persist(self._coordinator.record, None)
                     return
-            if require_owner:
-                raise ProvisioningJournalError("journal_save_failed")
+            superseding = _superseding_config_owner(self._hass, pending)
+            if superseding is not None and not active_matches:
+                from .fleet_manager import (
+                    ConfigEntryPersistenceError,
+                    async_wait_config_entry_persisted,
+                )
+
+                entry, subentry, data = superseding
+                self._hass.config_entries._async_schedule_save()
+                try:
+                    await async_wait_config_entry_persisted(
+                        self._hass,
+                        entry,
+                        subentry_id=subentry.subentry_id if subentry is not None else None,
+                    )
+                except ConfigEntryPersistenceError:
+                    return
+                current = _superseding_config_owner(self._hass, pending)
+                if current is not None and current[:2] == superseding[:2] and current[2] == data:
+                    # The old intent has no active transaction. Keep the old
+                    # retained pin/host untouched; discard only its stale move.
+                    await self._async_persist(self._coordinator.record, None)
             return
         active = self._coordinator.record
         if active is not None and _same_verified_panel(

@@ -76,10 +76,10 @@ class _CanaryDouble:
         self.finalized: list[UUID] = []
         self.rolled_back: list[UUID] = []
 
-    async def async_finalize(self, transaction_id: UUID) -> None:
+    async def async_finalize(self, transaction_id: UUID, **kwargs: Any) -> None:
         self.finalized.append(transaction_id)
 
-    async def async_rollback(self, transaction_id: UUID) -> None:
+    async def async_rollback(self, transaction_id: UUID, **kwargs: Any) -> None:
         self.rolled_back.append(transaction_id)
 
 

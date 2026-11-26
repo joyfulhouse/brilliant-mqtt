@@ -710,13 +710,25 @@ def _managed_components(data: Mapping[str, Any]) -> frozenset[str] | None:
 
 
 async def _async_rollback_credential(
-    hass: HomeAssistant, request: StoredPanelRequest
+    hass: HomeAssistant,
+    request: StoredPanelRequest,
+    *,
+    entry_id: str | None = None,
+    subentry_id: str | None = None,
 ) -> str | None:
     """Resolve the login only from a current, exactly matching config owner."""
     matches: list[str] = []
     for entry in hass.config_entries.async_entries(DOMAIN):
+        if entry_id is not None and entry.entry_id != entry_id:
+            continue
+        if entry_id is not None and subentry_id is not None and subentry_id not in entry.subentries:
+            continue
         owners = (
-            [subentry.data for subentry in entry.subentries.values()]
+            [
+                subentry.data
+                for subentry in entry.subentries.values()
+                if entry_id is None or subentry.subentry_id == subentry_id
+            ]
             if entry.subentries
             else [entry.data]
         )

@@ -8,17 +8,27 @@ from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import ANY, AsyncMock, Mock
 from uuid import uuid4
 
+import asyncssh
 import pytest
 from homeassistant import config_entries
 from homeassistant.const import CONF_NAME
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.util.file import WriteError
+from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.brilliant_mqtt import fleet_manager, panel_ops
-from custom_components.brilliant_mqtt.const import CONF_HOST, CONF_ROOT_PASSWORD
+from custom_components.brilliant_mqtt.const import (
+    CONF_HOST,
+    CONF_PANEL,
+    CONF_ROOT_PASSWORD,
+    DATA_SSH_HOST_KEY,
+    DOMAIN,
+    OPT_TRUST_HOST_KEY_CHANGES,
+)
 from custom_components.brilliant_mqtt.flow import gateway
 from custom_components.brilliant_mqtt.provisioning_journal import (
     _JOURNAL_COORDINATOR_KEY,
@@ -33,6 +43,7 @@ from tests.test_address_baseline_host import (
     _OLD_HOST,
     _arm_soak,
     _baseline_record,
+    _legacy_runtime,
     _managed_record,
     _manager,
     _storage_data,
@@ -48,8 +59,187 @@ from tests.test_config_flow import (
     _start_panel_reconfigure_step,
     _subentry,
 )
+from tests.test_init import ENTRY_DATA
+from tests.test_manager import _legacy_manager
 
 pytestmark = pytest.mark.usefixtures("durable_journal")
+
+
+@pytest.mark.parametrize("durable_removal", [False, True])
+async def test_interactive_adoption_rejects_disappearing_owner(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch, durable_removal: bool
+) -> None:
+    entry, panel = _fleet(hass)
+    await hass.config_entries._store.async_save(hass.config_entries._data_to_save())
+    record = _baseline_record(host=_OLD_HOST)
+    await _arm_soak(hass, record)
+    saved, resume = asyncio.Event(), asyncio.Event()
+    persist = ProvisioningJournal._async_persist
+
+    async def gated(journal: ProvisioningJournal, active: Any, pending: Any) -> None:
+        await persist(journal, active, pending)
+        if pending is not None and not saved.is_set():
+            saved.set()
+            await resume.wait()
+
+    monkeypatch.setattr(ProvisioningJournal, "_async_persist", gated)
+    monkeypatch.setattr(config_entries, "SAVE_DELAY", 60)
+    monkeypatch.setattr(fleet_manager, "_CONFIG_ENTRY_PERSISTENCE_TIMEOUT_SECONDS", 0.03)
+    task = asyncio.create_task(
+        _change(hass, entry, panel, **{CONF_HOST: _NEW_HOST, CONF_ROOT_PASSWORD: "verified"})
+    )
+    await asyncio.wait_for(saved.wait(), 10)
+    try:
+        hass.config_entries.async_remove_subentry(entry, panel.subentry_id)
+        if durable_removal:
+            await hass.config_entries._store.async_save(hass.config_entries._data_to_save())
+    finally:
+        resume.set()
+    result = await task
+    assert result.get("reason") == "parent_changed"
+    retained = await ProvisioningJournal(hass).async_retained(record.transaction_id)
+    assert retained is not None and retained.record.panel_request.host == _OLD_HOST
+
+
+@pytest.mark.parametrize("action", ["finalize", "rollback"])
+async def test_dispatched_canary_cannot_use_replacement_owner(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch, action: str
+) -> None:
+    entry, panel = _fleet(hass)
+    record = _baseline_record(host=_OLD_HOST)
+    await _arm_soak(hass, record)
+    manager = _manager(hass, entry, panel)
+    provisioner = fleet_manager._get_recovery_provisioner(hass)
+    monkeypatch.setattr(fleet_manager, "_get_recovery_provisioner", lambda _: provisioner)
+    reading, resume = asyncio.Event(), asyncio.Event()
+    load = ProvisioningJournal._async_retained_load
+
+    async def gated(journal: ProvisioningJournal) -> Any:
+        rows = await load(journal)
+        if journal is provisioner._journal and not reading.is_set():
+            reading.set()
+            await resume.wait()
+        return rows
+
+    monkeypatch.setattr(ProvisioningJournal, "_async_retained_load", gated)
+    transport = Mock(side_effect=lambda host, password, key: FakeShell(pinned=key))
+    monkeypatch.setattr(provisioner, "_shell_factory", transport)
+    monkeypatch.setattr(provisioner, "async_recover", AsyncMock())
+    monkeypatch.setattr(panel_ops, "finalize_baseline", AsyncMock())
+    task = asyncio.create_task(manager.async_canary_operation(action, str(record.transaction_id)))
+    await asyncio.wait_for(reading.wait(), 10)
+    try:
+        hass.config_entries.async_remove_subentry(entry, panel.subentry_id)
+        replacement = config_entries.ConfigSubentry(
+            data=MappingProxyType({**panel.data, CONF_ROOT_PASSWORD: "replacement-login"}),
+            subentry_id=uuid4().hex,
+            subentry_type=panel.subentry_type,
+            title=panel.title,
+            unique_id=panel.unique_id,
+        )
+        hass.config_entries.async_add_subentry(entry, replacement)
+    finally:
+        resume.set()
+    with pytest.raises(HomeAssistantError, match="rollback_credentials_unavailable"):
+        await task
+    transport.assert_not_called()
+    retained = await ProvisioningJournal(hass).async_retained(record.transaction_id)
+    assert retained is not None and retained.state == "soak"
+    assert await ProvisioningJournal(hass).async_load() is None
+
+
+async def test_durable_legacy_repin_retires_only_its_pending_intent(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    office, manager = _legacy_runtime(hass, host=_NEW_HOST, public_key=_PUBLIC_KEY)
+    hass.config_entries.async_update_entry(office, options={OPT_TRUST_HOST_KEY_CHANGES: True})
+    kitchen = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="kitchen",
+        version=3,
+        data={
+            **ENTRY_DATA,
+            CONF_PANEL: "kitchen",
+            CONF_HOST: "192.0.2.30",
+            DATA_SSH_HOST_KEY: _OTHER_PUBLIC_KEY,
+        },
+    )
+    kitchen.add_to_hass(hass)
+    other_manager = _legacy_manager(hass, kitchen, fleet_manager._shared_ssh_lock(hass))
+    first = _baseline_record(host=_OLD_HOST)
+    other = _baseline_record(
+        slug="kitchen",
+        host=kitchen.data[CONF_HOST],
+        public_key=_OTHER_PUBLIC_KEY,
+        fingerprint=_OTHER_FINGERPRINT,
+        transaction_id=uuid4(),
+    )
+    await _arm_soak(hass, first)
+    await _arm_soak(hass, other)
+    with monkeypatch.context() as fault:
+        fault.setattr(
+            ProvisioningJournal,
+            "_async_retained_save",
+            AsyncMock(side_effect=ProvisioningJournalError("journal_save_failed")),
+        )
+        with pytest.raises(HomeAssistantError, match="journal_save_failed"):
+            await manager.async_canary_operation("finalize", str(first.transaction_id))
+    rotated = asyncssh.generate_private_key("ssh-ed25519").export_public_key().decode().strip()
+    monkeypatch.setattr(
+        manager, "_shell", lambda: FakeShell(connect_error=asyncssh.HostKeyNotVerifiable("fixture"))
+    )
+    monkeypatch.setattr(manager, "_shell_unpinned", lambda: FakeShell(pinned=rotated))
+    async with fleet_manager._shared_ssh_lock(hass):
+        shell = await manager._connect_for_repair()
+        await shell.close()
+    await hass.config_entries._store.async_save(hass.config_entries._data_to_save())
+    assert await ProvisioningJournal(hass).async_load() is None
+    provisioner = AsyncMock()
+    monkeypatch.setattr(fleet_manager, "_get_recovery_provisioner", lambda _: provisioner)
+    await other_manager.async_canary_operation("rollback", str(other.transaction_id))
+    provisioner.async_rollback.assert_awaited_once()
+    retained = await ProvisioningJournal(hass).async_retained(first.transaction_id)
+    assert retained is not None
+    assert retained.record.panel_request.public_key == _PUBLIC_KEY
+    assert retained.record.panel_request.host == _OLD_HOST
+    assert not await hass.async_add_executor_job(
+        Path(hass.config.path(".storage", JOURNAL_STORAGE_KEY)).exists
+    )
+
+
+@pytest.mark.parametrize("boundary", ["unflushed", "invalid_pin", "active"])
+async def test_legacy_repin_preserves_unproven_or_active_intent(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch, boundary: str
+) -> None:
+    entry, manager = _legacy_runtime(hass, host=_NEW_HOST, public_key=_PUBLIC_KEY)
+    await hass.config_entries._store.async_save(hass.config_entries._data_to_save())
+    record = (
+        _managed_record(host=_OLD_HOST)
+        if boundary == "active"
+        else _baseline_record(host=_OLD_HOST)
+    )
+    await _arm_soak(hass, record)
+    if boundary == "active":
+        await ProvisioningJournal(hass).async_create(record)
+    with monkeypatch.context() as fault:
+        fault.setattr(
+            ProvisioningJournal,
+            "_async_retained_save",
+            AsyncMock(side_effect=ProvisioningJournalError("journal_save_failed")),
+        )
+        with pytest.raises(HomeAssistantError, match="journal_save_failed"):
+            await manager.async_canary_operation("finalize", str(record.transaction_id))
+    key = "invalid-key" if boundary == "invalid_pin" else _OTHER_PUBLIC_KEY
+    hass.config_entries.async_update_entry(entry, data={**entry.data, DATA_SSH_HOST_KEY: key})
+    if boundary == "unflushed":
+        monkeypatch.setattr(hass.config_entries._store, "async_delay_save", Mock())
+        monkeypatch.setattr(fleet_manager, "_CONFIG_ENTRY_PERSISTENCE_TIMEOUT_SECONDS", 0.03)
+    else:
+        await hass.config_entries._store.async_save(hass.config_entries._data_to_save())
+    await ProvisioningJournal(hass).async_load()
+    assert "pending_owner" in _storage_data(hass, JOURNAL_STORAGE_KEY)
+    retained = await ProvisioningJournal(hass).async_retained(record.transaction_id)
+    assert retained is not None and retained.record.panel_request.public_key == _PUBLIC_KEY
 
 
 @pytest.fixture(autouse=True)
@@ -219,7 +409,9 @@ async def test_removed_owner_intent_does_not_block_another_panel(
         await _manager(hass, entry, second).async_canary_operation(
             "rollback", str(other.transaction_id)
         )
-        provisioner.async_rollback.assert_awaited_once_with(other.transaction_id)
+        provisioner.async_rollback.assert_awaited_once_with(
+            other.transaction_id, credential_resolver=ANY
+        )
     else:
         await ProvisioningJournal(hass).async_adopt_verified_host(
             entry_id=entry.entry_id,
