@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from brilliant_mqtt.mesh_settlement_types import MeshMetadata
 from brilliant_mqtt.model import CaptureProvenance, PrimitiveCapture
 
+MESH_RECORD_LIMIT = 256
+
 
 @dataclass(frozen=True)
 class MeshCapture:
@@ -23,7 +25,8 @@ class MeshCapture:
 @dataclass(frozen=True)
 class MeshInventory:
     provenance: CaptureProvenance
-    peripheral_ids: frozenset[str]
+    peripheral_ids: frozenset[str] | None
+    count: int = 0
 
 
 @dataclass(frozen=True)

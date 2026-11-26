@@ -29,6 +29,7 @@ from typing import Any, NamedTuple
 from brilliant_mqtt.commands import VarSet
 from brilliant_mqtt.diagnostics import ResponseDiagnostics, WriteOutcome
 from brilliant_mqtt.mesh_ingress import (
+    MESH_RECORD_LIMIT,
     MeshCapture,
     MeshGeneration,
     MeshIngress,
@@ -554,11 +555,20 @@ def _make_observer_class(base: Any) -> Any:
                 if self._device_ids and updated.id not in self._device_ids:
                     # Not a device we bridge (own panel or configured extra).
                     return
+                peripherals = getattr(updated, "peripherals", None)
+                modified = getattr(notification, "modified_peripherals", None)
+                bounded_masks = updated.id != "ble_mesh" or (
+                    (peripherals is None or len(peripherals) <= MESH_RECORD_LIMIT)
+                    and (
+                        not isinstance(modified, (list, tuple))
+                        or len(modified) <= MESH_RECORD_LIMIT
+                    )
+                )
                 self._dispatch(
                     _NotificationDevice(
                         updated.id,
-                        getattr(updated, "peripherals", None),
-                        _notification_masks(notification),
+                        peripherals,
+                        _notification_masks(notification) if bounded_masks else None,
                         getattr(notification, "deleted", False) is True,
                     )
                 )
@@ -792,6 +802,12 @@ class RpcBusAdapter:
         ):
             return admission.ticket
         return None
+
+    def revoke_mesh_waiting(self) -> None:
+        """Close existing waiting admissions permanently; issued RPCs keep their lock."""
+        for admission in tuple(self._write_admissions.values()):
+            if admission.device_id == "ble_mesh" and not admission.issued:
+                self._cancel_waiting(admission.ticket)
 
     def register_mesh_write_guard(
         self, guard: Callable[[AdmissionTicket, str], bool]
@@ -1427,6 +1443,10 @@ class RpcBusAdapter:
         masks: tuple[_PeripheralMask, ...] | None = getattr(raw_device, "masks", None)
         if peripherals is None:
             return
+        count = len(peripherals)
+        if count > MESH_RECORD_LIMIT:
+            self._mesh_control(MeshInventory(push_boundary(), None, count))
+            return
         candidates = (
             tuple((mask.peripheral_id, mask) for mask in masks)
             if masks is not None
@@ -1705,7 +1725,11 @@ class RpcBusAdapter:
                 logger.warning("%s id=%s not returned by get_device()", label, device_id)
                 continue
             if device_id == "ble_mesh" and self._mesh_sinks:
-                self._mesh_control(MeshInventory(boundary, frozenset(raw_device.peripherals)))
+                count = len(raw_device.peripherals)
+                ids = frozenset(raw_device.peripherals) if count <= MESH_RECORD_LIMIT else None
+                self._mesh_control(MeshInventory(boundary, ids, count))
+                if ids is None:
+                    continue
                 for pid in raw_device.peripherals:
                     scopes = self._mesh_fields(pid)
                     if not scopes:

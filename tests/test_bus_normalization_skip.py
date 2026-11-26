@@ -122,8 +122,12 @@ class _Leader:
 
 
 def _mesh_state_publishes(mqtt: FakeMqtt) -> list[str]:
-    """Topics published under the mesh namespace (the gated data output)."""
-    return [topic for topic, _payload, _retain in mqtt.published if topic.startswith("brilliant/")]
+    """State topics published under the mesh namespace (the gated data output)."""
+    return [
+        topic
+        for topic, _payload, _retain in mqtt.published
+        if topic.startswith("brilliant/") and topic.endswith("/state")
+    ]
 
 
 class TestMeshStandbySkipsNormalization:

@@ -178,7 +178,7 @@ async def test_inventory_preflight_closes_fields_before_extraction_and_can_recov
         nonlocal enabled
         seen.append(event)
         if isinstance(event, MeshInventory):
-            enabled = len(event.peripheral_ids) <= 256
+            enabled = event.peripheral_ids is not None and event.count <= 256
 
     adapter.register_mesh_sink(
         ingress, want_fields=lambda _pid: frozenset({"on"}) if enabled else None

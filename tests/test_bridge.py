@@ -1309,6 +1309,8 @@ class TestM11Withdraw:
         # ...and the routing cache is gone regardless: no bus write routes.
         await mqtt.inject(fail_topic, "ON")
         assert bus.commands == []
+        await bridge.reconcile()
+        assert mqtt.subscriptions.count(fail_topic) == 2
 
 
 class TestM11MeshEndToEnd:

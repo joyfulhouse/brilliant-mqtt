@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
@@ -9,6 +10,7 @@ from types import MappingProxyType
 
 from brilliant_mqtt.mapping import AUX_SPECS
 from brilliant_mqtt.mesh_ingress import (
+    MESH_RECORD_LIMIT,
     MeshCapture,
     MeshGeneration,
     MeshIngress,
@@ -52,6 +54,8 @@ _FIELDS = frozenset(spec.var for specs in AUX_SPECS.values() for spec in specs) 
     )
 )
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class _Binding:
@@ -80,9 +84,16 @@ class MeshRegistry:
         self._motion_hold_s = motion_hold_s
         self._native_motion_passthrough = native_motion_passthrough
         self.enabled = False
+        self.disabled = False
+        self.inventory_ready = False
+        self.inventory_count = 0
+        self._inventory_sequence = -1
+        self.changed: Callable[[], None] = lambda: None
+        self.retained_ids: Callable[[], frozenset[str]] = frozenset
         self._disposed = False
         self._floor = -1
         self._born_at = 0.0
+        self.acquisition: CaptureProvenance | None = None
         self._bindings: dict[str, _Binding] = {}
         self._retired: dict[str, MeshSettlement] = {}
         self.effects: Callable[[MeshSettlement, tuple[Effect, ...]], None] = self._ignore_effects
@@ -116,13 +127,14 @@ class MeshRegistry:
             registered |= self._retired.get(pid) is owner
         return (
             self.enabled
+            and (not self.disabled or publication and self._retired.get(pid) is owner)
             and registered
             and self.bus.mesh_admission_open
             and self.bus.mesh_owner_live(owner)
         )
 
     def want_fields(self, peripheral_id: str) -> frozenset[str] | None:
-        return _FIELDS if self.enabled else None
+        return _FIELDS if self.enabled and not self.disabled else None
 
     def acquire(self) -> None:
         if self._disposed:
@@ -130,8 +142,11 @@ class MeshRegistry:
         if self.enabled:
             return
         boundary = self.bus.reserve_mesh_boundary("acquire")
+        self.acquisition = boundary
         self._floor, self._born_at = boundary.sequence, boundary.captured_at
         self.enabled = self.bus.mesh_admission_open
+        self.inventory_ready = False
+        self.changed()
 
     def envelope(self, owner: MeshSettlement, boundary: CaptureProvenance) -> Envelope:
         return Envelope(
@@ -185,9 +200,47 @@ class MeshRegistry:
             if binding is not None:
                 self._absence(binding, boundary)
         elif isinstance(event, MeshInventory):
+            if boundary.sequence <= self._inventory_sequence:
+                return
+            self._inventory_sequence = boundary.sequence
+            self.inventory_count = event.count or len(event.peripheral_ids or ())
+            ids = event.peripheral_ids
+            if (
+                ids is None
+                or len(set(self._bindings) | set(self._retired) | self.retained_ids() | ids)
+                > MESH_RECORD_LIMIT
+            ):
+                self._disable(boundary)
+                return
+            if self.disabled:
+                self.disabled = False
+                logger.info("MESH_CAPACITY_RECOVERED count=%d", self.inventory_count)
+                self.changed()
+            self.inventory_ready = True
             for pid, binding in tuple(self._bindings.items()):
-                if pid not in event.peripheral_ids:
+                if pid not in ids:
                     self._absence(binding, boundary)
+
+    def _disable(self, boundary: CaptureProvenance) -> None:
+        if self.disabled:
+            return
+        self.disabled = True
+        self._inventory_sequence = max(self._inventory_sequence, boundary.sequence)
+        self.inventory_ready = False
+        logger.warning("MESH_CAPACITY_DISABLED count=%d", self.inventory_count)
+        self.bus.revoke_mesh_waiting()
+        # Retired owners can publish their own unknown document and finish exact
+        # cleanup while command/field admission remains closed.
+        for pid, binding in tuple(self._bindings.items()):
+            owner = binding.owner
+            self._bindings.pop(pid)
+            self._retired[pid] = owner
+            self._release_native_listener(owner)
+            self.revoked(owner)
+            self.dispatch(owner, RetireAbsent(self.envelope(owner, boundary)))
+            self.removed(owner)
+        self.bus.advance_mesh_creation_floor(boundary)
+        self.changed()
 
     def _absence(self, binding: _Binding, boundary: CaptureProvenance) -> None:
         owner = binding.owner
@@ -262,7 +315,14 @@ class MeshRegistry:
 
     def _capture(self, event: MeshCapture) -> None:
         boundary, pid = event.provenance, event.metadata.peripheral_id
+        if self.disabled:
+            return
         binding = self._bindings.get(pid)
+        if binding is None:
+            records = set(self._bindings) | set(self._retired) | self.retained_ids()
+            if pid not in records and len(records) >= MESH_RECORD_LIMIT:
+                self._disable(boundary)
+                return
         if binding is not None and (
             not self.live(binding.owner) or not binding.owner.accepts_capture(boundary)
         ):
@@ -387,6 +447,8 @@ class MeshRegistry:
 
     def close(self) -> None:
         self.enabled = False
+        self.inventory_ready = False
+        self.bus.revoke_mesh_waiting()
         boundary = self.bus.reserve_mesh_boundary("withdraw")
         for owner in self.owners + tuple(self._retired.values()):
             self._revoke(owner, boundary)

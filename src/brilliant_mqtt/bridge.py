@@ -37,6 +37,7 @@ from brilliant_mqtt.mapping import (
 from brilliant_mqtt.mesh_commands import MeshCommands
 from brilliant_mqtt.mesh_driver import MeshDriver
 from brilliant_mqtt.mesh_registry import MeshRegistry
+from brilliant_mqtt.mesh_routing import DesiredTopic, MeshRouting
 from brilliant_mqtt.mesh_settlement import MeshSettlement
 from brilliant_mqtt.model import BrilliantDevice, CaptureProvenance, DeviceKind, Variable
 from brilliant_mqtt.motion_derive import MotionDeriver
@@ -278,6 +279,9 @@ class Bridge:
         self._mesh_commands: MeshCommands | None = None
         self._mesh_route_owners: dict[str, MeshSettlement] = {}
         self._mesh_descriptors: dict[MeshSettlement, tuple[EntityDescriptor, ...]] = {}
+        self._mesh_routing = MeshRouting(
+            mqtt, self._subscribed, self._fail_mesh_routing, self._async_publish_retained
+        )
         if panel == _MESH_PANEL or include is None or include(_MESH_DEVICE_ID):
             mesh_bus = cast(MeshBusClient, bus)
             self._mesh = MeshRegistry(
@@ -292,6 +296,8 @@ class Bridge:
             self._mesh_driver.cleanup = self._cleanup_mesh
             self._mesh_commands = MeshCommands(self._mesh, self._mesh_driver, bus)
             self._mesh.revoked = self._mesh_revoked
+            self._mesh.changed = self._mesh_status_changed
+            self._mesh.retained_ids = self._mesh_retained_ids
             mqtt.set_mesh_owner_resolver(self._resolve_mesh_owner)
         self._wired: dict[str, _WiredSlot] = {}
         self._wired_source_generation = getattr(bus, "capture_generation", 0)
@@ -313,7 +319,62 @@ class Bridge:
     def mesh_driver(self) -> MeshDriver | None:
         return self._mesh_driver
 
+    def _fail_mesh_routing(self, error: Exception) -> None:
+        if self._mesh is not None:
+            self._mesh.bus.fail_mesh(error)
+
+    def _mesh_retained_ids(self) -> frozenset[str]:
+        ids = self._mesh_routing.peripheral_ids
+        if self._mesh_driver is not None:
+            ids |= self._mesh_driver.peripheral_ids
+        return ids
+
+    def _mesh_status_changed(self) -> None:
+        registry = self._mesh
+        if registry is not None and registry.enabled and self._panel == _MESH_PANEL:
+            self._queue_mesh_availability("offline")
+
+    def _queue_mesh_availability(self, payload: str) -> asyncio.Task[None]:
+        registry = self._mesh
+        assert registry is not None
+        acquisition = registry.acquisition
+        assert acquisition is not None
+        return self._mesh_routing.request(
+            availability_topic(self._panel),
+            DesiredTopic(
+                acquisition,
+                lambda: (
+                    registry.enabled
+                    and registry.acquisition is acquisition
+                    and registry.bus.mesh_admission_open
+                    and (payload == "offline" or not registry.disabled and registry.inventory_ready)
+                ),
+                payload=payload,
+            ),
+            revoke=payload == "offline",
+        )
+
+    async def _repair_mesh_availability(self) -> None:
+        registry = self._mesh
+        if registry is None or not registry.enabled or self._panel != _MESH_PANEL:
+            return
+        ready = (
+            not registry.disabled
+            and registry.inventory_ready
+            and not registry.retired
+            and all(
+                registry.live(owner)
+                and self._mesh_driver is not None
+                and self._mesh_driver.published_fields(owner) is not None
+                and owner.view.terminal is None
+                and owner.view.in_flight is None
+                for owner in registry.owners
+            )
+        )
+        await asyncio.shield(self._queue_mesh_availability("online" if ready else "offline"))
+
     def _mesh_revoked(self, owner: MeshSettlement) -> None:
+        self._mesh_routing.revoke(owner)
         if self._mesh_commands is not None:
             self._mesh_commands.revoke(owner)
         if (
@@ -369,31 +430,40 @@ class Bridge:
             descriptors = entities_for(device, self._panel)
             self._remember_device(device)
             self._mesh_descriptors[owner] = tuple(descriptors)
+            if self._mesh_driver is not None:
+                self._mesh_driver.wake(owner, force=force)
+            desired: dict[str, DesiredTopic] = {}
+
+            def current(owner: MeshSettlement = owner) -> bool:
+                return registry.current(peripheral_id) is owner and registry.live(owner)
+
             for descriptor in descriptors:
-                if registry.current(peripheral_id) is not owner or not registry.live(owner):
-                    break
-                await self._async_publish_retained(
-                    config_topic(descriptor), config_payload(descriptor, sw_version=sw_version)
+                desired[config_topic(descriptor)] = DesiredTopic(
+                    owner, current, payload=config_payload(descriptor, sw_version=sw_version)
                 )
-            if registry.current(peripheral_id) is not owner:
-                continue
-            if not registry.live(owner):
-                return
-            if descriptors != entities_for(owner.materialize(self._clock()), self._panel):
-                continue
-            for descriptor in descriptors:
-                if registry.current(peripheral_id) is not owner or not registry.live(owner):
-                    break
                 topic = self._command_topic_for(peripheral_id, descriptor)
                 self._register_command_topic(peripheral_id, descriptor)
                 if topic is None:
                     continue
                 self._mesh_route_owners[topic] = owner
-                if topic not in self._subscribed:
-                    await self._mqtt.subscribe(topic)
-                    if registry.current(peripheral_id) is not owner or not registry.live(owner):
-                        break
-                    self._subscribed.add(topic)
+                desired[topic] = DesiredTopic(owner, current, membership=True)
+            for topic, record in tuple(self._mesh_routing.records.items()):
+                if record.peripheral_id == peripheral_id and topic not in desired:
+                    desired[topic] = DesiredTopic(
+                        owner,
+                        current,
+                        payload="" if record.desired.membership is None else None,
+                        membership=False if record.desired.membership is not None else None,
+                        forget=True,
+                    )
+                    self._mesh_route_owners.pop(topic, None)
+                    self._by_cmd_topic.pop(topic, None)
+            tasks = [
+                self._mesh_routing.request(topic, target, force=force)
+                for topic, target in desired.items()
+            ]
+            for task in tasks:
+                await asyncio.shield(task)
             if registry.current(peripheral_id) is not owner:
                 continue
             if registry.live(owner) and descriptors != entities_for(
@@ -401,7 +471,7 @@ class Bridge:
             ):
                 continue
             if registry.live(owner):
-                await self._flush_mesh(peripheral_id, force=force)
+                await self._flush_mesh(peripheral_id)
             return
 
     async def _cleanup_mesh(self, owner: MeshSettlement) -> None:
@@ -409,25 +479,43 @@ class Bridge:
         peripheral_id = owner.metadata.peripheral_id
         if registry is None:
             return
-        for topic, route_owner in tuple(self._mesh_route_owners.items()):
-            if route_owner is not owner or registry.retired.get(peripheral_id) is not owner:
-                continue
-            await self._mqtt.unsubscribe(topic)
-            if (
-                self._mesh_route_owners.get(topic) is owner
+
+        def current() -> bool:
+            return (
+                registry.enabled
+                and registry.bus.mesh_admission_open
                 and registry.retired.get(peripheral_id) is owner
-            ):
-                self._mesh_route_owners.pop(topic)
-                self._by_cmd_topic.pop(topic, None)
-                self._subscribed.discard(topic)
-        for descriptor in self._mesh_descriptors.get(owner, ()):
-            if (
-                registry.retired.get(peripheral_id) is not owner
-                or registry.current(peripheral_id) is not None
-            ):
+                and registry.current(peripheral_id) is None
+            )
+
+        if not current():
+            return
+        records = [
+            (topic, record)
+            for topic, record in tuple(self._mesh_routing.records.items())
+            if record.peripheral_id == peripheral_id
+        ]
+        records.sort(key=lambda item: item[1].desired.membership is None)
+        for topic, record in records:
+            if not current():
                 return
-            await self._async_publish_retained(config_topic(descriptor), "")
+            await asyncio.shield(
+                self._mesh_routing.request(
+                    topic,
+                    DesiredTopic(
+                        owner,
+                        current,
+                        payload="" if record.desired.payload is not None else None,
+                        membership=False if record.desired.membership is not None else None,
+                        forget=True,
+                    ),
+                )
+            )
         if registry.retired.get(peripheral_id) is owner:
+            for topic, route_owner in tuple(self._mesh_route_owners.items()):
+                if route_owner.metadata.peripheral_id == peripheral_id:
+                    self._mesh_route_owners.pop(topic)
+                    self._by_cmd_topic.pop(topic, None)
             self._mesh_descriptors.pop(owner, None)
             self._devices.pop(peripheral_id, None)
             self._command_generation.pop(peripheral_id, None)
@@ -666,10 +754,8 @@ class Bridge:
                 observed = self._derived(captured)
                 self._remember_native_observation(observed)
 
-        await self._async_publish_retained(
-            availability_topic(self._panel),
-            "online",
-        )
+        if self._panel != _MESH_PANEL:
+            await self._async_publish_retained(availability_topic(self._panel), "online")
         if not self._feedback_alive(lifecycle):
             return
 
@@ -775,6 +861,7 @@ class Bridge:
         if self._feedback_alive(lifecycle):
             await self._flush_retired_mesh()
             await self._enforce_desired(devices)
+            await self._repair_mesh_availability()
 
     async def reconcile_after_reconnect(self) -> None:
         """Retire session-local wired evidence before reading a new bus generation."""
@@ -831,35 +918,39 @@ class Bridge:
         # Close routing and registry synchronously before joining effects or
         # awaiting the broker. Queued commands and ready expiry lose ownership
         # at this boundary, while actual native RPCs retain their physical lock.
-        topics = list(self._by_cmd_topic)
+        topics = [topic for topic in self._by_cmd_topic if topic not in self._mesh_routing.records]
         for peripheral_id in self._command_generation:
             self._command_generation[peripheral_id] += 1
         self._by_cmd_topic.clear()
-        self._subscribed.clear()
+        self._subscribed.difference_update(topics)
         if self._mesh is not None:
             self._mesh.close()
+        mesh_repairs = self._mesh_routing.withdraw()
         self._mesh_route_owners.clear()
         self._mesh_descriptors.clear()
+        self._last_state_payload.clear()
+        self._last_state_fields.clear()
+        self._devices.clear()
+        if self._deriver is not None:
+            self._deriver.clear()
+        if self._panel == _MESH_PANEL:
+            self._wired_lifecycle += 1
         if self._mesh_driver is not None:
             await self._mesh_driver.shutdown()
-        await self.shutdown_wired_feedback()
+        if self._panel != _MESH_PANEL:
+            await self.shutdown_wired_feedback()
         unsubscribed = 0
+        await self._mesh_routing.join(mesh_repairs)
         for topic in topics:
             # A failed unsubscribe must not abort the rest — a step-down must
             # always complete so the routing/state caches are reliably cleared.
             try:
                 await self._mqtt.unsubscribe(topic)
+                self._subscribed.discard(topic)
                 unsubscribed += 1
             except Exception:
                 logger.exception("withdraw: unsubscribe failed for %s; continuing", topic)
-        self._last_state_payload.clear()
-        self._last_state_fields.clear()
-        self._devices.clear()
         self._wired_feedback_enabled = True
-        if self._deriver is not None:
-            # An ex-leader must not carry hold state into a re-acquisition;
-            # the new session starts cold (motion off until the next spike).
-            self._deriver.clear()
         logger.info("withdraw: %d command topics unsubscribed", unsubscribed)
 
     async def poll_once(self, devices: list[BrilliantDevice] | None = None) -> None:
@@ -895,7 +986,7 @@ class Bridge:
             if not self._included(device):
                 continue
             if device.device_id == _MESH_DEVICE_ID:
-                await self._flush_mesh(device.peripheral_id)
+                await self._repair_mesh(device.peripheral_id, force=False)
                 if not self._feedback_alive(lifecycle):
                     return
                 continue
@@ -911,6 +1002,7 @@ class Bridge:
         if self._feedback_alive(lifecycle):
             await self._flush_retired_mesh()
             await self._enforce_desired(devices)
+            await self._repair_mesh_availability()
 
     def _motion_default_wants(self, device: BrilliantDevice) -> dict[str, str]:
         """Config-driven motion defaults for *device*, overlaid under recorded intent.
@@ -1262,6 +1354,7 @@ class Bridge:
     async def shutdown_mesh_feedback(self) -> None:
         if self._mesh is not None:
             self._mesh.close()
+        await self._mesh_routing.join(self._mesh_routing.withdraw())
         if self._mesh_driver is not None:
             await self._mesh_driver.shutdown()
         if self._mesh is not None:
@@ -1281,7 +1374,7 @@ class Bridge:
         if not self._included(device):
             return
         if device.device_id == _MESH_DEVICE_ID:
-            await self._flush_mesh(device.peripheral_id)
+            await self._repair_mesh(device.peripheral_id, force=False)
             await self._flush_retired_mesh()
             return
         if self._wired_feedback_enabled:

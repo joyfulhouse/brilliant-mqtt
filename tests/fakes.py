@@ -136,6 +136,9 @@ class FakeBus:
         fatal, self._mesh_fatal = self._mesh_fatal, False
         return fatal
 
+    def revoke_mesh_waiting(self) -> None:
+        pass
+
     def register_mesh_sink(
         self,
         callback: Callable[[MeshIngress], None],

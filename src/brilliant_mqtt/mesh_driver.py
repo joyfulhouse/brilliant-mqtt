@@ -60,6 +60,10 @@ class MeshDriver:
         registry.effects = self.apply
 
     @property
+    def peripheral_ids(self) -> frozenset[str]:
+        return frozenset(owner.metadata.peripheral_id for owner in self._lanes)
+
+    @property
     def tasks(self) -> tuple[asyncio.Task[None], ...]:
         return tuple(
             task
