@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+import pytest
+
 from brilliant_mqtt import mesh_settlement_types as events
 from brilliant_mqtt.mesh_settlement import MeshSettlement
 from brilliant_mqtt.mesh_settlement_types import (
@@ -15,7 +17,7 @@ from brilliant_mqtt.mesh_settlement_types import (
     Revoke,
     RevokeEffects,
 )
-from brilliant_mqtt.model import PrimitiveCapture, PrimitiveField
+from brilliant_mqtt.model import BrilliantDevice, DeviceKind, PrimitiveCapture, PrimitiveField
 from tests.test_mesh_settlement import accepted, env, expire, observe, owner
 
 
@@ -127,3 +129,16 @@ def test_binding_capabilities_do_not_fabricate_primary_values_or_evidence() -> N
         events.UpdateMetadata(env(slot, 2, 1), replace(metadata, binding_max_intensity=100))
     )
     assert slot.metadata is metadata
+
+
+@pytest.mark.parametrize("scale", [0, -1, True])
+def test_invalid_normalized_binding_scale_preserves_positive_model_fallback(scale: int) -> None:
+    device = BrilliantDevice(
+        "ble_mesh",
+        "load",
+        "Load",
+        DeviceKind.LIGHT,
+        binding_dimmable=True,
+        binding_max_intensity=scale,
+    )
+    assert device.max_intensity == 1000

@@ -921,6 +921,10 @@ class RpcBusAdapter:
             self.advance_mesh_creation_floor(boundary)
         admission.ticket.mark_settled(outcome, boundary)
 
+    def fail_mesh(self, error: Exception) -> None:
+        """Latch the existing adapter fatal for a noncooperative owner effect."""
+        self._fail_mesh(error)
+
     def _fail_mesh(self, error: Exception) -> None:
         self._mesh_failed = True
         self._mesh_fatal = True

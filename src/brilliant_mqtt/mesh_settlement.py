@@ -53,7 +53,7 @@ from brilliant_mqtt.mesh_settlement_types import (
     WindowToken,
     WorkerCancelled,
 )
-from brilliant_mqtt.model import BrilliantDevice, DeviceKind, PrimitiveField
+from brilliant_mqtt.model import BrilliantDevice, CaptureProvenance, DeviceKind, PrimitiveField
 
 _PRIMARY = frozenset(("on", "intensity"))
 _WINDOW_S = 80.0
@@ -79,6 +79,22 @@ class MeshSettlement:
     def retired(self) -> bool:
         """An absent binding remains live solely to finish bounded cleanup debt."""
         return self._retired
+
+    def field_watermark(self, name: str) -> int:
+        """Cheap binding admission query without allocating an immutable full view."""
+        return self._watermarks.get(name, -1)
+
+    def accepts_capture(self, boundary: CaptureProvenance) -> bool:
+        """Fence lifecycle/binding admission before any stateful capture work."""
+        return (
+            self.active
+            and not self._retired
+            and boundary.incarnation == self._source
+            and boundary.source_generation == self._generation
+            and boundary.sequence > self._birth_sequence
+            and math.isfinite(boundary.captured_at)
+            and boundary.captured_at >= self._born_at
+        )
 
     def __init__(
         self,

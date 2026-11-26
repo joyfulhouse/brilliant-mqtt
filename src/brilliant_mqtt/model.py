@@ -155,7 +155,7 @@ class BrilliantDevice:
 
     @property
     def is_dimmable(self) -> bool:
-        """True iff an "intensity" variable is present."""
+        """Use validated binding capability, or legacy native intensity presence."""
         if self.binding_dimmable is not None:
             return self.binding_dimmable
         return "intensity" in self.variables
@@ -170,12 +170,17 @@ class BrilliantDevice:
 
     @property
     def max_intensity(self) -> int:
-        """Parsed "max_intensity_value"; defaults to 1000 when absent, unparseable, or <= 0.
+        """Validated binding scale, or parsed native "max_intensity_value".
 
-        Downstream milestones divide by this value, so non-positive values fall back too.
+        Absent, unparseable or non-positive values default to 1000; consumers divide by it.
         """
         if self.binding_max_intensity is not None:
-            return self.binding_max_intensity
+            return (
+                self.binding_max_intensity
+                if not isinstance(self.binding_max_intensity, bool)
+                and self.binding_max_intensity > 0
+                else 1000
+            )
         var = self.variables.get("max_intensity_value")
         if var is None:
             return 1000

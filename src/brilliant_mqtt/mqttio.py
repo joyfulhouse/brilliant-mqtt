@@ -688,7 +688,9 @@ class _StampedMessage(aiomqtt.Message):
     mesh_owner: object | None = None
 
 
-def _stamp_message(item: aiomqtt.Message, owner: object | None) -> _StampedMessage:
+def _stamp_message(item: aiomqtt.Message, owner: object | None) -> aiomqtt.Message:
+    if owner is None and not isinstance(item, _StampedMessage):
+        return item
     stamped = _StampedMessage(
         topic=item.topic,
         payload=item.payload,
