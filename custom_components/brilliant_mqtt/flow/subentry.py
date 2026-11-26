@@ -20,6 +20,7 @@ from homeassistant.const import CONF_NAME
 from homeassistant.core import callback
 
 from .. import _fleet_lock
+from ..connection_owner import ConnectionOwnershipError, PanelConnectionOwner
 from ..const import (
     COMPONENT_HUE_CA,
     COMPONENT_VOICE,
@@ -233,6 +234,7 @@ class PanelSubentryFlow(ConfigSubentryFlow, _PanelOnboardingMixin):
         *,
         host: str,
         root_password: str,
+        owner: PanelConnectionOwner | None = None,
     ) -> _FlowFailure | None:
         """Prove the pinned identity before offering a password to the candidate."""
         try:
@@ -255,15 +257,21 @@ class PanelSubentryFlow(ConfigSubentryFlow, _PanelOnboardingMixin):
                 stage="panel_identity",
             )
         try:
+            if owner is not None:
+                owner.assert_current()
+                owner.assert_unique()
             await gateway._async_inspect_candidate(
                 self.hass,
                 host,
                 root_password,
                 identity,
                 allow_aarch64=current.allow_aarch64,
+                operation_lock_held=owner is not None,
             )
         except asyncio.CancelledError:
             raise
+        except ConnectionOwnershipError as error:
+            return _panel_failure(error.code, stage="panel_identity")
         except asyncssh.HostKeyNotVerifiable:
             return _panel_failure("host_key_changed", stage="panel_ssh")
         except asyncssh.PermissionDenied:
@@ -279,6 +287,33 @@ class PanelSubentryFlow(ConfigSubentryFlow, _PanelOnboardingMixin):
             return _panel_failure("cannot_connect", stage="panel_ssh")
         except Exception:
             return _panel_failure("inspection_failed", stage="panel_inspection")
+        return None
+
+    async def _async_change_connection(
+        self,
+        entry: ConfigEntry[Any],
+        subentry: ConfigSubentry,
+        current: PanelConfig,
+        *,
+        host: str,
+        password: str,
+    ) -> _FlowFailure | None:
+        from ..fleet_manager import _shared_ssh_lock
+
+        owner = PanelConnectionOwner(self.hass, entry, subentry)
+        async with _shared_ssh_lock(self.hass):
+            failure = await self._async_verify_existing_panel(
+                current,
+                host=host,
+                root_password=password,
+                owner=owner,
+            )
+            if failure is not None:
+                return failure
+            try:
+                await owner.async_commit(host=host, password=password)
+            except ConnectionOwnershipError as error:
+                return _panel_failure(error.code, stage="panel_identity")
         return None
 
     async def async_step_rename(
@@ -339,23 +374,19 @@ class PanelSubentryFlow(ConfigSubentryFlow, _PanelOnboardingMixin):
             else:
                 host = normalized[CONF_HOST]
                 self._reconfigure_host = host
-                failure = await self._async_verify_existing_panel(
+                failure = await self._async_change_connection(
+                    entry,
+                    subentry,
                     current,
                     host=host,
-                    root_password=current.root_password,
+                    password=current.root_password,
                 )
                 if failure is None:
-                    target = self._reconfigure_target()
-                    if target is None:
-                        return self.async_abort(reason="invalid_parent")
-                    entry, subentry, latest = target
-                    if not self._capture_or_compare_reconfigure(latest):
-                        return self.async_abort(reason="parent_changed")
-                    return self.async_update_and_abort(
-                        entry,
-                        subentry,
-                        data={**subentry.data, CONF_HOST: host},
-                    )
+                    return self.async_abort(reason="reconfigure_successful")
+                if failure.code == "parent_changed":
+                    return self.async_abort(reason="parent_changed")
+                if failure.code == "panel_authentication_failed":
+                    return await self.async_step_repair_credentials()
         source = {CONF_HOST: self._reconfigure_host or current.host}
         return self.async_show_form(
             step_id="address",
@@ -384,28 +415,18 @@ class PanelSubentryFlow(ConfigSubentryFlow, _PanelOnboardingMixin):
                 errors = dict(error.errors)
             else:
                 password = normalized[CONF_ROOT_PASSWORD]
-                host = normalized.get(CONF_HOST, current.host)
-                failure = await self._async_verify_existing_panel(
+                host = normalized.get(CONF_HOST, self._reconfigure_host or current.host)
+                failure = await self._async_change_connection(
+                    entry,
+                    subentry,
                     current,
                     host=host,
-                    root_password=password,
+                    password=password,
                 )
                 if failure is None:
-                    target = self._reconfigure_target()
-                    if target is None:
-                        return self.async_abort(reason="invalid_parent")
-                    entry, subentry, latest = target
-                    if not self._capture_or_compare_reconfigure(latest):
-                        return self.async_abort(reason="parent_changed")
-                    return self.async_update_and_abort(
-                        entry,
-                        subentry,
-                        data={
-                            **subentry.data,
-                            CONF_HOST: host,
-                            CONF_ROOT_PASSWORD: password,
-                        },
-                    )
+                    return self.async_abort(reason="reconfigure_successful")
+                if failure.code == "parent_changed":
+                    return self.async_abort(reason="parent_changed")
         return self.async_show_form(
             step_id="repair_credentials",
             data_schema=panel_ssh_credentials_schema(),

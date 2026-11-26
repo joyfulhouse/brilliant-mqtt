@@ -157,6 +157,7 @@ class MigrationFence:
         self.active = False
         self.allowed: set[str] = set()
         self.quiet: set[str] = set()
+        self.operation_lock_entries: frozenset[str] = frozenset()
 
     def activate(self) -> None:
         self.active = True
@@ -532,8 +533,10 @@ class MigrationCoordinator:
                     dry_run=False,
                 )
             try:
+                self._fence.operation_lock_entries = frozenset(entry.entry_id for entry in entries)
                 return await self._async_execute()
             finally:
+                self._fence.operation_lock_entries = frozenset()
                 ssh_lock.release()
 
     async def async_recover(self) -> dict[str, Any] | None:
@@ -565,6 +568,18 @@ class MigrationCoordinator:
                 blockers.append(_blocker("provisioning_in_progress", "provisioning"))
             if await provisioning.async_retained_records():
                 blockers.append(_blocker("retained_canary_present", "provisioning"))
+            participating = {entry.entry_id for entry in entries}
+            identities = {
+                (str(data.get("panel")), str(data.get("ssh_host_key")))
+                for entry in entries
+                for data in (entry.data, *(panel.data for panel in entry.subentries.values()))
+            }
+            if any(
+                item.owner.entry_id in participating
+                or (item.owner.slug, item.owner.public_key) in identities
+                for item in await provisioning.async_connection_intents()
+            ):
+                blockers.append(_blocker("address_change_incomplete", "provisioning"))
         except Exception:
             blockers.append(_blocker("provisioning_journal_unavailable", "provisioning"))
 

@@ -92,12 +92,35 @@ means a token was deliberately withheld. Older failures cannot be reconstructed
 from phase alone. Preserve the journal and baseline
 while obtaining redacted diagnostics and the HA repair/log code.
 
+### If the panel address or login changed
+
+Keep the original HA panel entry and its retained baseline. Open that panel's
+**Change network address** action and submit its current address. If the saved
+login no longer works, complete **Repair SSH credentials** with the current login
+and the entered address. For a legacy single-panel entry, use **Connection**.
+These forms require the existing pinned identity; a different-key legacy
+replacement is unsupported by Connection.
+
+A successful verified submission updates the config, active recovery record and
+retained baseline together. If the operation is interrupted or HA cannot prove
+the config save reached disk, `address_change_incomplete` asks you to repeat the
+verified form. Repeat it even if the address displayed in HA already looks
+correct. Restarting HA does not finish an incomplete move automatically. The
+affected owner's recovery waits while healthy sibling runtimes can start.
+
+Do not delete and recreate the entry to clear the repair. A replacement entry
+does not inherit an interrupted move or a named recovery's authority. A canary
+action never adopts a new address or identity; resolve its typed refusal through
+the owning panel's verified form first.
+
 | Code/state | Operator action |
 | --- | --- |
 | `baseline_capture_failed`, `baseline_verify_failed` | Candidate mutation is refused. Preserve the incumbent; investigate missing/drifting code, permissions, free space, or capture bounds before retrying. |
 | `baseline_capture_interrupted` | A capture re-check failed after publication, and removing its unused baseline also failed. Preserve artifacts and follow Interrupted baseline capture. |
 | `transaction_in_progress` | Another operation holds the shared panel lock. Allow it to finish and retry. |
-| `provisioning_recovery_required` | Another panel's interrupted provisioning journal must be recovered first. Diagnostics name it (`provisioning.name`, `panel`, `phase`, `last_error`). Resolve that journal's own code below; for an onboarding that never created an HA panel, see [Interrupted onboarding without an HA panel owner](#interrupted-onboarding-without-an-ha-panel-owner). Operations stay serialized; nothing is skipped. |
+| `provisioning_recovery_required` | The requested action conflicts with unfinished recovery. Diagnostics identify the active journal or retained baseline. Resolve that record's own code below. A named rollback/finalize can use the target panel's retained baseline while an unrelated panel occupies the active journal, but it cannot compete with an active operation for the same panel or finalize unfinished rollback cleanup. Older unbound named recovery needs a new explicit request from a current matching owner. For onboarding without an HA panel, see [Interrupted onboarding without an HA panel owner](#interrupted-onboarding-without-an-ha-panel-owner). |
+| `address_change_incomplete` | Re-run Change network address, or legacy Connection, with the current address and login. Preserve the original entry and all recovery evidence, including when the displayed address already matches. |
+| `baseline_owner_mismatch` | The selected baseline does not match the targeted panel's saved connection and identity. Verify the target and use its address/Connection form to repair a same-identity move. A canary action does not transfer ownership. |
 | `recovery_connection_failed` | Recovery could not reach the panel at the journal's recorded address. Bring the panel online. If its address or root password changed and it has no HA panel entry, settle it with Add Brilliant panel (below); otherwise repair the owning panel's address/credentials. |
 | `panel_authentication_failed` (stage `recovery`) | The recorded root password was rejected. Same remedy as above, with the current password. |
 | `panel_identity_mismatch` (stage `recovery`) | The host no longer proves the journal's pinned SSH identity. Do not trust a new key automatically; confirm the physical panel and address before any further action. |
@@ -130,8 +153,12 @@ longer appears. Successful finalization synchronously purges the named HA retain
 record and the on-panel archive and `complete.json`; no deferred garbage collection
 is required. Finalize promptly at the agreed soak end to bound the extra credential
 storage window. Until explicitly finalized, the baseline has no automatic expiry.
-An in-flight execution journal prevents finalization. Uninstall
-also refuses to destroy a retained baseline; finalize intentionally first.
+An in-flight execution journal for the same panel prevents finalization. A
+retained rollback with unfinished recovery also prevents finalization, including
+after bytes were restored but cleanup remains. Retry that named rollback or
+resolve its repair; do not discard its evidence. An unrelated panel's active
+journal does not prevent this panel's named finalization. Uninstall also refuses
+to destroy a retained baseline; finalize intentionally first.
 
 ## Storage, limits, and evidence
 
@@ -241,7 +268,8 @@ back using the address and root password recorded at the time. When that
 recorded access no longer works (for example the panel's DHCP address or root
 password changed), recovery fails with a typed code (`recovery_connection_failed`,
 `panel_authentication_failed`) on every restart, and the journal blocks other
-panels' updates and canary actions with `provisioning_recovery_required`.
+panels' updates with `provisioning_recovery_required`. An explicitly named canary
+action for a different panel can still use that panel's own retained record.
 
 Settle it with fresh authority, not by deleting storage:
 

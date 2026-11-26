@@ -7,7 +7,7 @@ import base64
 import binascii
 import logging
 import re
-from collections.abc import Coroutine, Mapping
+from collections.abc import Callable, Coroutine, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -21,6 +21,7 @@ from homeassistant.util import json as json_util
 from homeassistant.util.json import json_loads
 
 from .broker import BrokerKind
+from .connection_state import ConnectionIntent, PanelOwner
 from .release_identity import RollbackBaseline
 from .shell import HostIdentity, PanelIdentityError, known_hosts_line
 
@@ -133,6 +134,8 @@ _SNAPSHOT_KEYS = frozenset(
 )
 PROVISIONING_ERROR_CODES = frozenset(
     {
+        "address_change_incomplete",
+        "baseline_owner_mismatch",
         "duplicate_panel",
         "activation_failed",
         "cleanup_failed",
@@ -198,6 +201,8 @@ _DIAGNOSTIC_RECOVERY_CODES = frozenset({"recovery_interrupted", "flow_aborted"})
 _ERROR_KEYS = frozenset({"stage", "code"})
 _JOURNAL_ERROR_CODES = frozenset(
     {
+        "address_change_incomplete",
+        "baseline_owner_mismatch",
         "invalid_provisioning_journal",
         "invalid_journal_transition",
         "journal_load_failed",
@@ -573,6 +578,7 @@ class StoredPanelRequest:
     fingerprint: str
     slug: str
     selected_components: tuple[str, ...]
+    bound_owner: PanelOwner | None = None
 
     def __post_init__(self) -> None:
         public_key = _safe_ascii_text(
@@ -598,6 +604,12 @@ class StoredPanelRequest:
         root_password = _secret_text(self.root_password)
         if not isinstance(self.slug, str) or _PANEL_SLUG.fullmatch(self.slug) is None:
             raise _invalid()
+        if self.bound_owner is not None and (
+            not isinstance(self.bound_owner, PanelOwner)
+            or self.bound_owner.slug != self.slug
+            or self.bound_owner.public_key != public_key
+        ):
+            raise _invalid()
         object.__setattr__(self, "root_password", root_password)
         object.__setattr__(self, "public_key", identity.public_key)
         object.__setattr__(self, "fingerprint", identity.fingerprint)
@@ -607,7 +619,7 @@ class StoredPanelRequest:
         return "StoredPanelRequest(<redacted>)"
 
     def _to_storage(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "host": self.host,
             "ssh_username": self.ssh_username,
             "root_password": self.root_password,
@@ -616,10 +628,16 @@ class StoredPanelRequest:
             "slug": self.slug,
             "selected_components": list(self.selected_components),
         }
+        if self.bound_owner is not None:
+            payload["bound_owner"] = self.bound_owner.to_storage()
+        return payload
 
     @classmethod
     def _from_storage(cls, raw: object) -> Self:
-        value = _exact_keys(raw, _PANEL_REQUEST_KEYS)
+        keys = _PANEL_REQUEST_KEYS
+        if isinstance(raw, Mapping) and "bound_owner" in raw:
+            keys |= {"bound_owner"}
+        value = _exact_keys(raw, keys)
         return cls(
             host=_string(value["host"]),
             ssh_username=_string(value["ssh_username"]),
@@ -628,6 +646,11 @@ class StoredPanelRequest:
             fingerprint=_string(value["fingerprint"]),
             slug=_string(value["slug"]),
             selected_components=_components(value["selected_components"]),
+            bound_owner=(
+                None
+                if "bound_owner" not in value
+                else PanelOwner.from_storage(value["bound_owner"])
+            ),
         )
 
 
@@ -1011,6 +1034,7 @@ class _JournalCoordinator:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     loaded: bool = False
     record: ProvisioningRecord | None = None
+    intents: dict[str, ConnectionIntent] = field(default_factory=dict)
     last_storage_error: str | None = None
 
 
@@ -1078,6 +1102,7 @@ class RetainedRollback:
     state: str = "armed"
     recovery_deployment_id: str | None = None
     finalization_origin: str | None = None
+    recovery_record: ProvisioningRecord | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if self.state not in _RETAINED_STATES or self.record.prior_snapshot.baseline is None:
@@ -1115,6 +1140,25 @@ class RetainedRollback:
                 ),
             ),
         )
+        if self.recovery_record is not None:
+            recovery = self.recovery_record
+            if (
+                recovery.transaction_id != self.record.transaction_id
+                or recovery.panel_request.public_key != self.record.panel_request.public_key
+                or recovery.panel_request.slug != self.record.panel_request.slug
+                or recovery.operation is not ProvisioningOperation.ROLLBACK
+            ):
+                raise _invalid()
+            object.__setattr__(
+                self,
+                "recovery_record",
+                replace(
+                    recovery,
+                    panel_request=replace(
+                        recovery.panel_request, root_password=_CREDENTIAL_PLACEHOLDER
+                    ),
+                ),
+            )
 
     def __repr__(self) -> str:
         return "RetainedRollback(<redacted>)"
@@ -1199,6 +1243,12 @@ class RetainedRollback:
         }
         if self.finalization_origin is not None:
             payload["finalization_origin"] = self.finalization_origin
+        if self.recovery_record is not None:
+            recovery = self.recovery_record._to_storage()
+            request = self.recovery_record.panel_request._to_storage()
+            del request["root_password"]
+            recovery["panel_request"] = request
+            payload["recovery_record"] = recovery
         return payload
 
     @classmethod
@@ -1206,18 +1256,32 @@ class RetainedRollback:
         keys = frozenset({"record", "state", "recovery_deployment_id"})
         if isinstance(raw, Mapping) and "finalization_origin" in raw:
             keys |= {"finalization_origin"}
+        if isinstance(raw, Mapping) and "recovery_record" in raw:
+            keys |= {"recovery_record"}
         value = _exact_keys(raw, keys)
         record = dict(_exact_keys(value["record"], _RECORD_KEYS))
-        request = dict(
-            _exact_keys(record["panel_request"], _PANEL_REQUEST_KEYS - {"root_password"})
-        )
+        request_keys = _PANEL_REQUEST_KEYS - {"root_password"}
+        if (
+            isinstance(record["panel_request"], Mapping)
+            and "bound_owner" in record["panel_request"]
+        ):
+            request_keys |= {"bound_owner"}
+        request = dict(_exact_keys(record["panel_request"], request_keys))
         request["root_password"] = _CREDENTIAL_PLACEHOLDER
         record["panel_request"] = request
+        recovery = None
+        if "recovery_record" in value:
+            recovery_raw = dict(_exact_keys(value["recovery_record"], _RECORD_KEYS))
+            recovery_request = dict(_exact_keys(recovery_raw["panel_request"], request_keys))
+            recovery_request["root_password"] = _CREDENTIAL_PLACEHOLDER
+            recovery_raw["panel_request"] = recovery_request
+            recovery = ProvisioningRecord._from_storage(recovery_raw)
         return cls(
             ProvisioningRecord._from_storage(record),
             _string(value["state"]),
             _optional_string(value["recovery_deployment_id"]),
             _optional_string(value.get("finalization_origin")),
+            recovery,
         )
 
 
@@ -1334,6 +1398,199 @@ class ProvisioningJournal:
             await self._async_save(record)
             return record
 
+    async def async_connection_intents(self) -> tuple[ConnectionIntent, ...]:
+        """Read pending evidence without applying or retiring it."""
+        async with self._coordinator.lock:
+            await self._async_reload()
+            return tuple(self._coordinator.intents.values())
+
+    async def async_assert_connection_available(
+        self, *, owner: PanelOwner | None = None, request: StoredPanelRequest | None = None
+    ) -> None:
+        for intent in await self.async_connection_intents():
+            if (
+                owner is not None
+                and (
+                    (owner.entry_id, owner.subentry_id)
+                    == (intent.owner.entry_id, intent.owner.subentry_id)
+                    or (
+                        owner.slug == intent.owner.slug
+                        and owner.public_key == intent.owner.public_key
+                    )
+                )
+                or request is not None
+                and (
+                    request.slug == intent.owner.slug
+                    or request.public_key == intent.owner.public_key
+                )
+            ):
+                raise ProvisioningJournalError("address_change_incomplete")
+
+    async def _async_save_envelope(
+        self, record: ProvisioningRecord | None, intents: dict[str, ConnectionIntent]
+    ) -> None:
+        payload: dict[str, Any] = {
+            "record": None if record is None else record._to_storage(),
+            "connection_intents": {key: item.to_storage() for key, item in intents.items()},
+        }
+        outcome = await _async_settle_storage(self._hass, self._store.async_save(payload))
+        verified = await _async_settle_storage(self._hass, self._store.async_load())
+        cancellation = outcome.cancellation or verified.cancellation
+        if outcome.error is not None or verified.error is not None or verified.result != payload:
+            if cancellation is not None:
+                raise cancellation
+            raise ProvisioningJournalError("journal_save_failed")
+        self._coordinator.record = record
+        self._coordinator.intents = intents
+        self._coordinator.loaded = True
+        if cancellation is not None:
+            raise cancellation
+
+    async def async_begin_connection_change(self, intent: ConnectionIntent) -> None:
+        async with self._coordinator.lock:
+            await self._async_reload()
+            intents = dict(self._coordinator.intents)
+            for key, current in tuple(intents.items()):
+                if current.owner == intent.owner:
+                    del intents[key]
+                elif (
+                    current.owner.slug == intent.owner.slug
+                    or current.owner.public_key == intent.owner.public_key
+                ):
+                    raise ProvisioningJournalError("baseline_owner_mismatch")
+            intents[intent.commit_id] = intent
+            await self._async_save_envelope(self._coordinator.record, intents)
+
+    async def async_retarget_connection(self, intent: ConnectionIntent) -> None:
+        """Retarget only matching records, retaining all phase and snapshot evidence."""
+        async with self._coordinator.lock:
+            await self._async_reload()
+            if self._coordinator.intents.get(intent.commit_id) != intent:
+                raise ProvisioningJournalError("address_change_incomplete")
+            target = intent.proposed
+
+            def retarget(record: ProvisioningRecord) -> ProvisioningRecord:
+                request = record.panel_request
+                if (
+                    request.slug != intent.owner.slug
+                    or request.public_key != intent.owner.public_key
+                ):
+                    return record
+                if request.bound_owner is not None and request.bound_owner != intent.owner:
+                    raise ProvisioningJournalError("baseline_owner_mismatch")
+                return replace(
+                    record,
+                    panel_request=replace(
+                        request,
+                        host=target.host,
+                        ssh_username=target.username,
+                        root_password=target.password,
+                    ),
+                )
+
+            active = self._coordinator.record
+            if active is not None and (updated := retarget(active)) != active:
+                await self._async_save(updated)
+            retained = await self._async_retained_load()
+            changed = {
+                key: replace(
+                    row,
+                    record=retarget(row.record),
+                    recovery_record=None
+                    if row.recovery_record is None
+                    else retarget(row.recovery_record),
+                )
+                for key, row in retained.items()
+            }
+            if changed != retained:
+                await self._async_retained_save(changed)
+
+    async def async_finish_connection_change(
+        self, intent: ConnectionIntent, *, validate_owner: Callable[[], None] | None = None
+    ) -> None:
+        async with self._coordinator.lock:
+            await self._async_reload()
+            if self._coordinator.intents.get(intent.commit_id) != intent:
+                raise ProvisioningJournalError("address_change_incomplete")
+            records = await self._async_retained_load()
+            active = self._coordinator.record
+            candidates = [row.record for row in records.values()]
+            candidates.extend(
+                row.recovery_record for row in records.values() if row.recovery_record is not None
+            )
+            if active is not None:
+                candidates.append(active)
+            matching_active = (
+                str(active.transaction_id)
+                if active is not None and active.panel_request.public_key == intent.owner.public_key
+                else None
+            )
+            matching_retained = tuple(
+                sorted(
+                    str(row.record.transaction_id)
+                    for row in records.values()
+                    if row.record.panel_request.public_key == intent.owner.public_key
+                )
+            )
+            if (
+                matching_active != intent.active_transaction
+                or matching_retained != intent.retained_transactions
+                or set(intent.transactions)
+                != {
+                    str(record.transaction_id)
+                    for record in candidates
+                    if record.panel_request.public_key == intent.owner.public_key
+                }
+            ):
+                raise ProvisioningJournalError("address_change_incomplete")
+            for record in candidates:
+                request = record.panel_request
+                if (
+                    request.slug == intent.owner.slug
+                    and request.public_key == intent.owner.public_key
+                ):
+                    if (
+                        request.host != intent.proposed.host
+                        or request.ssh_username != intent.proposed.username
+                    ):
+                        raise ProvisioningJournalError("address_change_incomplete")
+                    if record is active and request.root_password != intent.proposed.password:
+                        raise ProvisioningJournalError("address_change_incomplete")
+            intents = dict(self._coordinator.intents)
+            del intents[intent.commit_id]
+            if validate_owner is not None:
+                validate_owner()
+            original_intents = dict(self._coordinator.intents)
+            try:
+                if active is None and not intents:
+                    self._coordinator.intents = intents
+                    await self._async_remove()
+                else:
+                    await self._async_save_envelope(active, intents)
+            except asyncio.CancelledError:
+                verified = await _async_settle_storage(self._hass, self._store.async_load())
+                expected: dict[str, Any] | None = None
+                if active is not None or intents:
+                    expected = {
+                        "record": None if active is None else active._to_storage(),
+                        "connection_intents": {
+                            key: item.to_storage() for key, item in intents.items()
+                        },
+                    }
+                if verified.error is not None or verified.result != expected:
+                    await self._async_save_envelope(active, original_intents)
+                raise
+            except Exception:
+                await self._async_save_envelope(active, original_intents)
+                raise
+            if validate_owner is not None:
+                try:
+                    validate_owner()
+                except Exception:
+                    intents[intent.commit_id] = intent
+                    await self._async_save_envelope(active, intents)
+                    raise
+
     async def _async_retained_load(self) -> dict[str, RetainedRollback]:
         failed = False
         result: dict[str, RetainedRollback] = {}
@@ -1419,6 +1676,76 @@ class ProvisioningJournal:
     async def async_retained_records(self) -> tuple[RetainedRollback, ...]:
         async with self._coordinator.lock:
             return tuple((await self._async_retained_load()).values())
+
+    async def async_bind_retained(
+        self, expected: RetainedRollback, owner: PanelOwner
+    ) -> RetainedRollback:
+        async with self._coordinator.lock:
+            records = await self._async_retained_load()
+            key = str(expected.record.transaction_id)
+            if records.get(key) != expected:
+                raise ProvisioningJournalError("journal_transaction_mismatch")
+            bound = expected.record.panel_request.bound_owner
+            if bound is not None and bound != owner:
+                raise ProvisioningJournalError("baseline_owner_mismatch")
+            recovery = expected.recovery_record
+            if recovery is not None:
+                if recovery.panel_request.bound_owner not in {None, owner}:
+                    raise ProvisioningJournalError("baseline_owner_mismatch")
+                recovery = replace(
+                    recovery, panel_request=replace(recovery.panel_request, bound_owner=owner)
+                )
+            updated = replace(
+                expected,
+                record=replace(
+                    expected.record,
+                    panel_request=replace(expected.record.panel_request, bound_owner=owner),
+                ),
+                recovery_record=recovery,
+            )
+            if updated != expected:
+                records[key] = updated
+                await self._async_retained_save(records)
+            return updated
+
+    async def async_bind_active_owner(
+        self, expected: ProvisioningRecord, owner: PanelOwner
+    ) -> ProvisioningRecord:
+        async with self._coordinator.lock:
+            current = await self._async_current(expected.transaction_id)
+            if current != expected or current.panel_request.bound_owner not in {None, owner}:
+                raise ProvisioningJournalError("baseline_owner_mismatch")
+            updated = replace(
+                current, panel_request=replace(current.panel_request, bound_owner=owner)
+            )
+            if updated != current:
+                await self._async_save(updated)
+            return updated
+
+    async def async_begin_scoped_restore(self, expected: RetainedRollback) -> None:
+        async with self._coordinator.lock:
+            records = await self._async_retained_load()
+            key = str(expected.record.transaction_id)
+            if records.get(key) != expected or expected.recovery_record is not None:
+                raise ProvisioningJournalError("invalid_journal_transition")
+            await self._async_reload()
+            active = self._coordinator.record
+            if active is not None and (
+                active.panel_request.public_key == expected.record.panel_request.public_key
+                or active.panel_request.slug == expected.record.panel_request.slug
+            ):
+                raise ProvisioningJournalError("journal_transaction_in_progress")
+            recovery = replace(
+                expected.record,
+                operation=ProvisioningOperation.ROLLBACK,
+                phase=ProvisioningPhase.ROLLBACK_PENDING,
+                last_error=None,
+            )
+            records[key] = replace(expected, state="restore_requested", recovery_record=recovery)
+            await self._async_retained_save(records)
+
+    def scoped(self, transaction_id: UUID) -> ScopedProvisioningJournal:
+        return ScopedProvisioningJournal(self, transaction_id)
 
     async def async_begin_ownerless_finalize(self, expected: RetainedRollback) -> RetainedRollback:
         """Publish fresh operator intent only for this exact verified, ownerless restore."""
@@ -1664,6 +1991,18 @@ class ProvisioningJournal:
             "count": 0 if record is None else 1,
             "phase": None if record is None else record.phase.value,
         }
+        if self._coordinator.intents:
+            output["connection_changes"] = [
+                {
+                    "commit_id": item.commit_id,
+                    "entry_id": item.owner.entry_id,
+                    "subentry_id": item.owner.subentry_id,
+                    "panel": item.owner.slug,
+                    "transactions": list(item.transactions),
+                    "error": "address_change_incomplete",
+                }
+                for item in self._coordinator.intents.values()
+            ]
         if self._coordinator.last_storage_error is not None:
             output["storage_error"] = self._coordinator.last_storage_error
         if record is not None:
@@ -1701,19 +2040,36 @@ class ProvisioningJournal:
             raise ProvisioningJournalError("journal_load_failed")
         if raw is None:
             record = None
+            intents: dict[str, ConnectionIntent] = {}
         else:
             parse_failed = False
             record = None
             try:
-                envelope = _exact_keys(raw, frozenset({"record"}))
-                record = ProvisioningRecord._from_storage(envelope["record"])
+                keys = frozenset({"record"})
+                if "connection_intents" in raw:
+                    keys |= {"connection_intents"}
+                envelope = _exact_keys(raw, keys)
+                record = (
+                    None
+                    if envelope["record"] is None
+                    else ProvisioningRecord._from_storage(envelope["record"])
+                )
+                raw_intents = envelope.get("connection_intents", {})
+                if not isinstance(raw_intents, dict):
+                    raise _invalid()
+                intents = {
+                    key: ConnectionIntent.from_storage(value) for key, value in raw_intents.items()
+                }
+                if any(key != item.commit_id for key, item in intents.items()):
+                    raise _invalid()
             except ProvisioningJournalError:
                 raise
             except Exception:
                 parse_failed = True
-            if parse_failed or record is None:
+            if parse_failed or (record is None and not intents):
                 raise _invalid()
         self._coordinator.record = record
+        self._coordinator.intents = intents
         self._coordinator.loaded = True
 
     async def _async_current(self, transaction_id: UUID) -> ProvisioningRecord:
@@ -1728,7 +2084,21 @@ class ProvisioningJournal:
 
     async def _async_save(self, record: ProvisioningRecord) -> None:
         payload = {"record": record._to_storage()}
-        secrets = _storage_secrets(record)
+        if self._coordinator.intents:
+            payload["connection_intents"] = {
+                key: intent.to_storage() for key, intent in self._coordinator.intents.items()
+            }
+        secrets = _storage_secrets(record) + tuple(
+            value
+            for intent in self._coordinator.intents.values()
+            for connection in (intent.prior, intent.proposed)
+            for value in (
+                connection.host,
+                connection.username,
+                connection.password,
+                connection.public_key,
+            )
+        )
         _require_storage_round_trip(payload, self._coordinator, secrets, store="journal")
         save_outcome = await _async_settle_storage(
             self._hass,
@@ -1763,6 +2133,9 @@ class ProvisioningJournal:
             raise cancellation from None
 
     async def _async_remove(self) -> None:
+        if self._coordinator.intents:
+            await self._async_save_envelope(None, self._coordinator.intents)
+            return
         remove_outcome = await _async_settle_storage(
             self._hass,
             self._store.async_remove(),
@@ -1788,3 +2161,65 @@ class ProvisioningJournal:
         self._coordinator.loaded = True
         if cancellation is not None:
             raise cancellation from None
+
+
+class ScopedProvisioningJournal(ProvisioningJournal):
+    """Run an existing rollback state machine inside exactly one retained row."""
+
+    __slots__ = ("_transaction_id",)
+
+    def __init__(self, journal: ProvisioningJournal, transaction_id: UUID) -> None:
+        super().__init__(journal._hass)
+        self._transaction_id = _uuid4(transaction_id)
+        self._coordinator = _JournalCoordinator(lock=journal._coordinator.lock)
+        self._store = journal._store
+        self._retained_store = journal._retained_storage()
+
+    async def _async_reload(self) -> None:
+        row = (await self._async_retained_load()).get(str(self._transaction_id))
+        if row is None:
+            raise ProvisioningJournalError("journal_transaction_missing")
+        self._coordinator.record = row.recovery_record
+        self._coordinator.loaded = True
+
+    async def async_begin_restore(self, transaction_id: UUID, root_password: str) -> None:
+        """A scoped runner resumes its exact existing record without reseeding it."""
+        async with self._coordinator.lock:
+            await self._async_reload()
+            current = self._coordinator.record
+            if current is None or current.transaction_id != transaction_id:
+                raise ProvisioningJournalError("journal_transaction_mismatch")
+
+    async def async_connection_intents(self) -> tuple[ConnectionIntent, ...]:
+        return await ProvisioningJournal(self._hass).async_connection_intents()
+
+    async def _async_save(self, record: ProvisioningRecord) -> None:
+        if record.transaction_id != self._transaction_id:
+            raise ProvisioningJournalError("journal_transaction_mismatch")
+        records = await self._async_retained_load()
+        key = str(self._transaction_id)
+        row = records.get(key)
+        if row is None:
+            raise ProvisioningJournalError("journal_transaction_missing")
+        records[key] = replace(row, recovery_record=record)
+        await self._async_retained_save(records)
+        self._coordinator.record = record
+        self._coordinator.loaded = True
+
+    async def _async_remove(self) -> None:
+        records = await self._async_retained_load()
+        key = str(self._transaction_id)
+        row = records.get(key)
+        if row is None or row.state != "restored":
+            raise ProvisioningJournalError("invalid_journal_transition")
+        records[key] = replace(row, recovery_record=None)
+        await self._async_retained_save(records)
+        self._coordinator.record = None
+        self._coordinator.loaded = True
+
+    async def async_assert_connection_available(
+        self, *, owner: PanelOwner | None = None, request: StoredPanelRequest | None = None
+    ) -> None:
+        await ProvisioningJournal(self._hass).async_assert_connection_available(
+            owner=owner, request=request
+        )

@@ -31,6 +31,7 @@ from homeassistant.const import CONF_NAME
 
 from .broker import BrokerKind
 from .certificates import canonical_hue_ca_certificate, is_public_certificate_chain
+from .connection_state import canonical_commit_id
 from .const import (
     COMPONENT_BRIDGE,
     COMPONENT_HA_MIRROR,
@@ -183,7 +184,7 @@ _KNOWN_LEGACY_KEYS = (
     | _PANEL_SOURCE_KEYS
     | frozenset(_FEATURE_OVERRIDE_KEYS)
     | _HA_MIRROR_CONFIG_KEYS
-    | frozenset({CONF_PROVISIONING_TRANSACTION_ID})
+    | frozenset({CONF_PROVISIONING_TRANSACTION_ID, "connection_commit_id"})
 )
 _RESILIENCE_OPTIONS: tuple[tuple[str, object, int | None, int | None], ...] = (
     (OPT_AUTO_REPAIR, DEFAULT_AUTO_REPAIR, None, None),
@@ -536,6 +537,12 @@ def _draft_panel(collector: _Collector, snapshot: LegacySnapshot) -> _PanelDraft
     data = snapshot.data
     entry_id = snapshot.entry_id
     valid = True
+    if "connection_commit_id" in data:
+        try:
+            canonical_commit_id(data["connection_commit_id"])
+        except (ValueError, TypeError, AttributeError):
+            collector.add(CONFLICT_INVALID_VALUE, "connection_commit_id", [entry_id])
+            valid = False
 
     for key in sorted(set(data) - _KNOWN_LEGACY_KEYS):
         collector.add(CONFLICT_UNSUPPORTED_LEGACY_FIELD, key, [entry_id])

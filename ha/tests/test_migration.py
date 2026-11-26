@@ -305,6 +305,21 @@ def test_eligible_fleet_preserves_identity_and_round_trips_fleet_parsers() -> No
     assert {config.panel for config in parsed.values()} == {"kitchen", "office", "bedroom"}
 
 
+def test_migration_validates_but_never_copies_connection_commit_metadata() -> None:
+    snapshots = fixture()
+    replace_data(snapshots, KITCHEN_ID, connection_commit_id="abcdefab-cdef-4abc-8def-abcdefabcdef")
+    plan = eligible(snapshots)
+    assert "connection_commit_id" not in plan.fleet_data
+    assert all("connection_commit_id" not in panel.data for panel in plan.panels)
+
+
+@pytest.mark.parametrize("commit_id", [None, "not-a-uuid", "ABCDEFAB-CDEF-4ABC-8DEF-ABCDEFABCDEF"])
+def test_migration_rejects_noncanonical_connection_commit_metadata(commit_id: object) -> None:
+    snapshots = fixture()
+    replace_data(snapshots, KITCHEN_ID, connection_commit_id=commit_id)
+    assert ("invalid_value", "connection_commit_id", (KITCHEN_ID,)) in conflicts(snapshots)
+
+
 def test_snapshot_from_entry_detaches_entry_values() -> None:
     data = legacy_data("kitchen", "192.0.2.10", 1)
     entry = MockConfigEntry(

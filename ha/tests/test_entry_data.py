@@ -344,6 +344,39 @@ def test_established_panel_may_omit_provisioning_transaction() -> None:
     assert panel.provisioning_transaction_id is None
 
 
+@pytest.mark.parametrize(
+    "commit_id",
+    [
+        None,
+        "",
+        "not-a-uuid",
+        "ABCDEFAB-CDEF-4ABC-8DEF-ABCDEFABCDEF",
+        "abcdefabcdef4abc8defabcdefabcdef",
+    ],
+)
+async def test_connection_commit_metadata_rejects_noncanonical_values(
+    hass: HomeAssistant, commit_id: object
+) -> None:
+    with pytest.raises(EntryDataError, match="invalid_panel_entry_data"):
+        PanelConfig.from_subentry(_subentry(connection_commit_id=commit_id))
+    entry = MockConfigEntry(
+        domain=DOMAIN, version=3, data={CONF_PANEL: "office", "connection_commit_id": commit_id}
+    )
+    with pytest.raises(EntryDataError, match="invalid_legacy_panel_entry_data"):
+        LegacyPanelStore(hass, entry)
+
+
+async def test_connection_commit_metadata_accepts_canonical_uuid_without_schema_migration(
+    hass: HomeAssistant,
+) -> None:
+    commit_id = "abcdefab-cdef-4abc-8def-abcdefabcdef"
+    assert PanelConfig.from_subentry(_subentry(connection_commit_id=commit_id)).panel == "office"
+    entry = MockConfigEntry(
+        domain=DOMAIN, version=3, data={CONF_PANEL: "office", "connection_commit_id": commit_id}
+    )
+    assert LegacyPanelStore(hass, entry).data["connection_commit_id"] == commit_id
+
+
 def test_provisioning_transaction_cannot_be_persisted_as_null() -> None:
     """The temporary journal link is either a real ID or absent, never a null marker."""
     with pytest.raises(EntryDataError):
