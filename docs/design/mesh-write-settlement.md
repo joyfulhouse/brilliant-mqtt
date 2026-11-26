@@ -304,6 +304,8 @@ holding a thread lock across a native await.
 
 An issued command worker cancellation is deliberately fail-closed: abandon its
 intent, clear targets/deadline, and mark the load unconfirmed/null immediately.
+Reserve the existing retirement floor at cancellation; a stored or later return
+can only advance that floor, never lower it.
 The native RPC and device lock continue; keep only its completion listener.
 Pre-return mirror values cannot release this unknown hold. Real native return
 sets the existing unknown-state barrier to its return sequence; the next
@@ -340,19 +342,32 @@ explicit command can replace abandoned intent normally, but cannot release the
 physical outstanding-work hold; shared device locking already keeps its own
 issue after that completion. The old completion never rearms the abandoned
 intent, changes the newer command or publishes success/failure. Completed
-references are removed, so this is not a history of abandoned commands.
+references are removed, so this is not a history of abandoned commands. If
+completion has no current recipient, first advance the existing device creation
+floor to at least its return sequence. An older-started read then cannot seed
+an absent slot, even if it began after removal and returns after completion.
+Existing slots still merge their unshadowed fields normally. A genuinely later
+existing inventory/explicit creation can restore the absent slot; retain no
+per-ID completion tombstone or new read trigger.
 
 Resident virtual-slider configuration/restore writes are separate from
 settlement-owned load commands: they need no published-load slot. Their existing
 live eligibility predicate also requires mesh enabled and leadership before
 admission and again under the device lock immediately before native issue.
-Use that same mesh-disabled flag, including queued configuration work; defer
-an ineligible operation without marking it complete. On fitting-inventory
-recovery, invoke the controller's existing `on_mesh_leadership_acquired()`
-after re-enabling mesh to retry deferred work idempotently; no new read trigger
-or polling loop is added. Healthy mesh and
-wired slider behavior is preserved; no configuration owners or new reads are
-introduced. All resident `ble_mesh` writers must pass the mesh-enabled check;
+Use that same mesh-disabled flag, including queued configuration work. Defer
+only standing configured bindings/orphan restorations without marking them
+complete. On fitting recovery, retry only mesh entries already marked
+`binding_ready=False` and pending orphan restorations, using those existing
+collections and their required backup/verification steps. Do not synthesize
+`on_mesh_leadership_acquired()` or sweep ready sliders: with no deferred work,
+recovery performs zero slider reads/writes. Healthy mesh and wired slider
+behavior is preserved; no configuration owners or polling loops are introduced.
+One-shot interactive mode requests that lose eligibility before issue are
+rejected, not retained/replayed. Report no success, preserve the committed mode
+and its known readiness, and require a new request after recovery. Distinguish
+this definite pre-issue refusal from a genuinely attempted/inconclusive write;
+existing failure/readiness handling for attempted writes remains unchanged.
+All resident `ble_mesh` writers must pass the mesh-enabled check;
 already-authorized RPCs remain subject to the nonpreemption rule above.
 
 ## State, identities and invariants
@@ -749,8 +764,11 @@ historical #232 port:
 | Many successful create/write/remove cycles without reconnect | Adapter era keys, per-capture scan work, materialized views and route/payload maps remain bounded; wired/privacy provenance passes unchanged. |
 | Stable 257-binding inventory over repeated ticks/resyncs, then newer fitting inventory | Mesh stays safely disabled with bounded attempts and records while wired service continues; existing inventory event permits bounded recovery, without added polling. |
 | Issued worker abandoned, registered reconnect hook, new-generation primary capture before real native completion | Keep primary unknown through completion and until a genuinely later trusted capture. Inherit only the exact ticket's release condition; no rearm or old outcome settlement. Also return-before-cancel and successor acquisition cases. |
+| Fully remove an abandoned slot; start reappearance read R; real native return with no owner; then deliver R | Advance existing device creation floor before dropping completed ticket; R cannot recreate known primary from its pre-return capture. Recover only on a genuinely post-return inventory/creation, without per-ID history or extra reads. |
 | Retained mesh online/ON, cold oversized startup with zero local slots, repeated resync and fitting recovery | Mesh availability offline while disabled and online only after current routing/state repair, with wired service online. Pre-handoff obsolete availability is cancelled on leadership loss; no per-ID overflow records or extra reads. |
 | Actual leader acquisition with deferred/orphan mesh slider configuration; separate queued write disabled before issue | No resident mesh native writes while disabled, no false completion of deferred work; fitting recovery applies it normally. Wired slider behavior continues. |
+| Two capacity crossings with K ready sliders; separate run with one standing deferred binding among K ready ones | No slider reads/writes when none is deferred; only genuinely deferred work uses existing backup/verification steps. Count get_peripheral as well as get_device and writes; unrelated ready sliders are untouched. |
+| VIRTUAL-to-PASSTHROUGH interactive request waits for native lock; disable before issue, then recover | Reject the one-shot request, preserve/report committed VIRTUAL mode/readiness, no PASSTHROUGH replay. A new post-recovery request sends the correct PASSTHROUGH payload and commits only on success. |
 
 1. Obtain both design reviews on the exact draft head and resolve design
    findings before runtime code. Record reviewer sessions and verdicts in S9's
