@@ -124,6 +124,12 @@ baseline remain intact; no new recovery shell is created. Before baseline captur
 a private update intent provides the same block for interrupted release admission,
 which can already have published an audit record. Dismiss cannot remove that block.
 
+An unknown or unreadable update intent conservatively blocks management changes
+for every panel entry until reconciliation. These older intents lack a stable
+physical-panel identity, so removing and re-adding an entry cannot safely bypass
+the guard. Only the current live update task may hand off its exact unchanged
+intent to baseline capture; a different task or record cannot use that exception.
+
 The operator must establish externally that every prior command has settled and
 obtain maintainer guidance for recovery. There is no automatic clear or settlement
 button. Do not delete the intent, journal or baseline to force a retry. Known health

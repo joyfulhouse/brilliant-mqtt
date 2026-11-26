@@ -25,7 +25,12 @@ from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN
 from .panel_ops import PanelOpError, candidate_identities
-from .provisioning_journal import ProvisioningJournal, Store, StoredPanelRequest
+from .provisioning_journal import (
+    ProvisioningJournal,
+    Store,
+    StoredPanelRequest,
+    _async_settle_storage,
+)
 from .release_identity import ReleaseIdentity
 
 _LOGGER = logging.getLogger(__name__)
@@ -33,6 +38,7 @@ _LOGGER = logging.getLogger(__name__)
 UPDATE_INTENT_STORAGE_VERSION = 1
 UPDATE_INTENT_STORAGE_KEY = f"{DOMAIN}.update_intents"
 _STORE_DATA_KEY = f"{DOMAIN}_update_intent_store"
+_LOCK_DATA_KEY = f"{DOMAIN}_update_intent_lock"
 _INTENT_KEYS = frozenset(
     {
         "panel",
@@ -117,7 +123,7 @@ def _count(value: object, *, minimum: int) -> bool:
 
 @dataclass(frozen=True, slots=True)
 class UpdateIntent:
-    """One panel's in-window update, strictly validated; invalid reads as absent."""
+    """One panel's in-window update, strictly validated."""
 
     panel: str
     target_version: str
@@ -180,7 +186,7 @@ class UpdateIntent:
 
     @classmethod
     def from_dict(cls, raw: object) -> UpdateIntent | None:
-        """Parse one stored record; anything not exactly valid is absent."""
+        """Parse one row; the store refuses the whole map if any row is invalid."""
         if not isinstance(raw, Mapping) or frozenset(raw) != _INTENT_KEYS:
             return None
         started_at = _aware(raw["started_at"])
@@ -214,13 +220,14 @@ class UpdateIntent:
 class UpdateIntentStore:
     """HA-wide store of in-window update records, keyed by panel management ID.
 
-    Every mutation builds a NEW mapping, awaits ``Store.async_save`` and only then
-    replaces the cache, so a save that raises leaves the previous record in place.
-    Uses the provisioning journal's strict atomic Store so admission never starts
-    when persistence fails. An unknown outcome is sticky until operator recovery.
+    Every operation reloads and validates the complete map under a shared lock.
+    Mutations settle their atomic write and verify readback under that lock before
+    updating the cache or propagating cancellation. An unknown outcome is sticky
+    until operator recovery.
     """
 
     def __init__(self, hass: HomeAssistant) -> None:
+        self._hass = hass
         self._store = Store(
             hass,
             UPDATE_INTENT_STORAGE_VERSION,
@@ -229,22 +236,61 @@ class UpdateIntentStore:
             atomic_writes=True,
         )
         self._cache: dict[str, dict[str, object]] | None = None
-        self._lock = asyncio.Lock()
+        self._lock = hass.data.setdefault(_LOCK_DATA_KEY, asyncio.Lock())
 
     async def _async_records(self) -> dict[str, dict[str, object]]:
-        if self._cache is None:
-            raw = await self._store.async_load()
-            records = raw.get("intents") if isinstance(raw, dict) else None
-            self._cache = (
-                {
-                    key: dict(value)
-                    for key, value in records.items()
-                    if isinstance(key, str) and isinstance(value, dict)
-                }
-                if isinstance(records, dict)
-                else {}
-            )
+        raw = await self._store.async_load()
+        if raw is None:
+            self._cache = {}
+            return self._cache
+        if not isinstance(raw, dict) or set(raw) != {"intents"}:
+            raise HomeAssistantError("provisioning_recovery_required")
+        records = raw["intents"]
+        if not isinstance(records, dict) or any(
+            not isinstance(key, str) or UpdateIntent.from_dict(value) is None
+            for key, value in records.items()
+        ):
+            raise HomeAssistantError("provisioning_recovery_required")
+        self._cache = {key: dict(value) for key, value in records.items()}
         return self._cache
+
+    async def _async_save(self, updated: dict[str, dict[str, object]]) -> None:
+        """Settle the whole-map writer and readback before releasing its lock."""
+        payload = {"intents": updated}
+
+        async def persist() -> BaseException | None:
+            # Return failures to the owner, including after owner cancellation;
+            # HA must not log a detached task's raw private-storage exception.
+            try:
+                await self._store.async_save(payload)
+                if await self._store.async_load() != payload:
+                    raise HomeAssistantError("provisioning_recovery_required")
+            except BaseException as error:
+                return error
+            return None
+
+        outcome = await _async_settle_storage(self._hass, persist())
+        cancellation = outcome.cancellation
+        failure = outcome.error or (
+            outcome.result if isinstance(outcome.result, BaseException) else None
+        )
+        self._cache = updated if failure is None else None
+        if cancellation is not None:
+            raise cancellation from None
+        if failure is not None:
+            raise failure
+
+    async def async_assert_settled(self, *, owned: tuple[str, UpdateIntent] | None = None) -> None:
+        """Block every writer, except an exact live operation handoff."""
+        async with self._lock:
+            records = await self._async_records()
+            if owned is not None and records.get(owned[0]) != owned[1].as_dict():
+                raise PanelOpError("provisioning_recovery_required")
+            for key, value in records.items():
+                if value["stage"] == "outcome_unknown" and (
+                    owned is None or key != owned[0] or value != owned[1].as_dict()
+                ):
+                    raise PanelOpError("mutation_outcome_unknown")
 
     async def async_get(self, key: str) -> UpdateIntent | None:
         async with self._lock:
@@ -257,20 +303,20 @@ class UpdateIntentStore:
             if current is not None and current.stage == "outcome_unknown" and current != intent:
                 raise HomeAssistantError("mutation_outcome_unknown")
             updated = {**records, key: intent.as_dict()}
-            await self._store.async_save({"intents": updated})
-            self._cache = updated
+            await self._async_save(updated)
 
     async def async_clear(self, key: str, *, expected: UpdateIntent | None = None) -> None:
         async with self._lock:
             records = await self._async_records()
+            current = UpdateIntent.from_dict(records.get(key))
+            if expected is not None and current != expected:
+                raise HomeAssistantError("interrupted_update_unavailable")
             if key not in records:
                 return
-            current = UpdateIntent.from_dict(records[key])
             if current is not None and current.stage == "outcome_unknown" and current != expected:
                 raise HomeAssistantError("mutation_outcome_unknown")
             updated = {name: value for name, value in records.items() if name != key}
-            await self._store.async_save({"intents": updated})
-            self._cache = updated
+            await self._async_save(updated)
 
 
 def update_intent_store(hass: HomeAssistant) -> UpdateIntentStore:
@@ -280,6 +326,16 @@ def update_intent_store(hass: HomeAssistant) -> UpdateIntentStore:
         store = UpdateIntentStore(hass)
         hass.data[_STORE_DATA_KEY] = store
     return store
+
+
+async def async_assert_no_unknown_update(hass: HomeAssistant) -> None:
+    """Unknown or unreadable safety records block all management identities."""
+    try:
+        await update_intent_store(hass).async_assert_settled()
+    except PanelOpError:
+        raise
+    except Exception:
+        raise PanelOpError("provisioning_recovery_required") from None
 
 
 async def async_forget_update_intent(hass: HomeAssistant, management_id: str) -> None:
@@ -379,13 +435,31 @@ class InterruptedUpdates:
         self._window_target: UpdateTarget | None = None
         self._window_target_bound = False
         self._window_intent: UpdateIntent | None = None
+        self._window_task: asyncio.Task[object] | None = None
+        self._action_lock = asyncio.Lock()
         self.surfaced: UpdateIntent | None = None
 
     def bind_target(self, target: UpdateTarget | None) -> None:
         """Bind one requested operation before any connect or intent write."""
         self._window_started = None
+        self._window_task = asyncio.current_task()
         self._window_target = target
         self._window_target_bound = True
+
+    async def async_assert_live_handoff(self) -> None:
+        """Allow only this task's exact durable admission guard into capture."""
+        intent = self._window_intent
+        if intent is None:
+            await async_assert_no_unknown_update(self._panel.hass)
+            return
+        if self._window_task is not asyncio.current_task() or intent.stage != "outcome_unknown":
+            raise PanelOpError("provisioning_recovery_required")
+        try:
+            await self._store.async_assert_settled(owned=(self._panel.management_id, intent))
+        except PanelOpError:
+            raise
+        except Exception:
+            raise PanelOpError("provisioning_recovery_required") from None
 
     async def async_begin_window(
         self,
@@ -446,7 +520,7 @@ class InterruptedUpdates:
                 return
             if intent.stage != "outcome_unknown" and await self._panel.async_journal_owns_panel():
                 # The provisioning journal owns recovery of this panel: it wins.
-                await self._store.async_clear(self._panel.management_id)
+                await self._store.async_clear(self._panel.management_id, expected=intent)
                 return
             self.surfaced = intent
             ir.async_create_issue(
@@ -503,26 +577,30 @@ class InterruptedUpdates:
             return "mutation_outcome_unknown"
         if not intent.matches(await self._panel.async_update_target()):
             return "interrupted_update_target_changed"
-        if await self._panel.async_journal_owns_panel():
-            await self._store.async_clear(self._panel.management_id)
-            self._drop_surfaced()
-            return "interrupted_update_recovery_owned"
-        # No await between this check and the eager task start: the update sets its
-        # running flag synchronously before its first await.
-        if self._panel.update_running:
-            return "already_in_progress"
-        self._panel.hass.async_create_task(
-            self._async_run_retry(
-                UpdateTarget(
-                    intent.target_version,
-                    intent.target_ordinal,
-                    intent.target_digest,
-                    intent.target_set_digest,
-                )
-            ),
-            f"{DOMAIN}-retry-{self._panel.panel}",
-            eager_start=True,
-        )
+        journal_owns = await self._panel.async_journal_owns_panel()
+        async with self._action_lock:
+            current = await self._store.async_get(self._panel.management_id)
+            if current != intent or self.surfaced != intent:
+                return "interrupted_update_unavailable"
+            if self._panel.update_running:
+                return "already_in_progress"
+            if journal_owns:
+                await self._store.async_clear(self._panel.management_id, expected=intent)
+                self._drop_surfaced()
+                return "interrupted_update_recovery_owned"
+            # No await before eager start acquires the manager's update mutex.
+            self._panel.hass.async_create_task(
+                self._async_run_retry(
+                    UpdateTarget(
+                        intent.target_version,
+                        intent.target_ordinal,
+                        intent.target_digest,
+                        intent.target_set_digest,
+                    )
+                ),
+                f"{DOMAIN}-retry-{self._panel.panel}",
+                eager_start=True,
+            )
         return None
 
     async def _async_run_retry(self, target: UpdateTarget) -> None:
@@ -533,5 +611,13 @@ class InterruptedUpdates:
 
     async def async_dismiss(self) -> None:
         """Forget the interrupted update. Raises when the record could not be cleared."""
-        await self._store.async_clear(self._panel.management_id)
-        self._drop_surfaced()
+        async with self._action_lock:
+            if self._panel.update_running:
+                raise HomeAssistantError("already_in_progress")
+            intent = self.surfaced
+            if intent is None:
+                raise HomeAssistantError("interrupted_update_unavailable")
+            if intent.stage == "outcome_unknown":
+                raise HomeAssistantError("mutation_outcome_unknown")
+            await self._store.async_clear(self._panel.management_id, expected=intent)
+            self._drop_surfaced()

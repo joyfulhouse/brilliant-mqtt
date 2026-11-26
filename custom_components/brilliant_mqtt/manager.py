@@ -103,6 +103,7 @@ from .mqtt_payload import decode_mqtt_payload
 from .panel_health import PanelHealthError
 from .panel_ops import PanelOpError
 from .provisioning_journal import ProvisioningJournal, ProvisioningJournalError
+from .release_identity import ReleaseIdentity
 from .shell import (
     AsyncsshShell as _StrictAsyncsshShell,
 )
@@ -114,6 +115,7 @@ from .shell import (
 from .update_intent import (
     InterruptedUpdates,
     UpdateTarget,
+    async_assert_no_unknown_update,
     async_journal_concerns_panel,
     compute_update_target,
     request_concerns_panel,
@@ -777,7 +779,16 @@ class PanelManager:
             to the entry, fire EVENT_HOST_KEY_REPINNED, return the connected shell.
         Any other connect failure propagates unchanged to the caller's handler.
         """
-        await self._async_assert_update_settled()
+        budget = self._update_budget
+        if budget is not None and budget.deadline is not None:
+            try:
+                async with asyncio.timeout(max(0, budget.deadline - _connect_retry_clock())):
+                    await self._async_assert_update_settled()
+            except TimeoutError:
+                raise _PanelConnectFailed(budget.failure, budget.attempts) from None
+        else:
+            await self._async_assert_update_settled()
+        self._assert_update_connect_dispatch()
         shell = self._shell()
         try:
             await shell.connect()
@@ -831,12 +842,12 @@ class PanelManager:
         creating a session. Ordinary pending journals retain their existing rules.
         """
         try:
-            intent = await update_intent_store(self.hass).async_get(self.management_id)
+            await async_assert_no_unknown_update(self.hass)
             record = await ProvisioningJournal(self.hass).async_load()
+        except PanelOpError:
+            raise
         except Exception:
             raise PanelOpError("provisioning_recovery_required") from None
-        if intent is not None and intent.stage == "outcome_unknown":
-            raise PanelOpError("mutation_outcome_unknown")
         if (
             record is not None
             and record.last_error is not None
@@ -849,6 +860,16 @@ class PanelManager:
             )
         ):
             raise PanelOpError("mutation_outcome_unknown")
+
+    def _assert_update_connect_dispatch(self) -> None:
+        """Recheck after all awaited persistence, immediately before SSH creation."""
+        budget = self._update_budget
+        if budget is None:
+            return
+        if self._shutting_down or self.hass.is_stopping:
+            raise _PanelConnectFailed(budget.failure, budget.attempts, shutdown=True)
+        if budget.deadline is not None and _connect_retry_clock() >= budget.deadline:
+            raise _PanelConnectFailed(budget.failure, budget.attempts)
 
     def _set_update_retry(self, state: dict[str, Any] | None) -> None:
         self.update_retry = state
@@ -906,7 +927,12 @@ class PanelManager:
                 if budget.attempts > 0 and _connect_retry_clock() > budget.deadline:
                     raise _PanelConnectFailed(budget.failure, budget.attempts)
                 budget.attempts += 1
-                await self._async_write_update_window("connect", budget)
+                try:
+                    async with asyncio.timeout(max(0, budget.deadline - _connect_retry_clock())):
+                        await self._async_write_update_window("connect", budget)
+                except TimeoutError:
+                    raise _PanelConnectFailed(budget.failure, budget.attempts) from None
+                self._assert_update_connect_dispatch()
                 try:
                     shell = await self._connect_for_repair(trace)
                 except (OSError, asyncssh.Error) as error:
@@ -1614,7 +1640,7 @@ class PanelManager:
         service is restarted ONLY when code was redeployed: `enable --now` does not
         reload a running service, and a needless restart would just churn it.
 
-        A failed converge is retried once after a short delay (the relay runs
+        An acknowledged failed converge is retried once after a short delay (the relay runs
         inside a longer operation — a repair or an Update-entity install —
         whose SSH session is often slow on marginal links). A restart owed by
         this call's deploy is carried across the retry even when the VERSION
@@ -1624,8 +1650,11 @@ class PanelManager:
         failed AFTER the swap + VERSION stamp, and anything that trusts the
         marker alone skips the restart, leaving the pre-update process running
         code it never loaded.
+        Missing command results stop immediately: neither another attempt nor
+        the fallback restart may race an old command whose outcome is unknown.
         """
         payload_dir = _payload_dir()
+        self._assert_relay_session_settled(shell)
         error: Exception | None = None
         owes_restart = False
         for attempt in range(2):
@@ -1639,6 +1668,7 @@ class PanelManager:
                     (payload_dir / spec.service_filename).read_text
                 )
                 state = await spec.inspect(shell)
+                self._assert_relay_session_settled(shell)
                 # Outside the canaried update the transaction keeps differing installed
                 # watchdog code (#220): re-lay its own unit and service, never upgrade.
                 if not panel_ops.release_keeps_incumbent(spec.payload_subdir) and (
@@ -1647,17 +1677,22 @@ class PanelManager:
                     or panel_ops.release_component_changed(spec.payload_subdir)
                 ):
                     await spec.deploy(shell, str(payload_dir / spec.payload_subdir), version)
+                    self._assert_relay_session_settled(shell)
                     owes_restart = True
                 await spec.ensure_unit(shell, unit)
+                self._assert_relay_session_settled(shell)
                 await spec.enable(shell)
+                self._assert_relay_session_settled(shell)
                 if owes_restart:
                     # Owed by THIS call's deploy (or carried from the failed
                     # previous attempt): the VERSION marker alone must never
                     # excuse skipping it — the running process may predate the
                     # stamp (the 2026-09-10 guest-bath hole).
                     await spec.restart(shell)
+                    self._assert_relay_session_settled(shell)
                     owes_restart = False
             except (OSError, asyncssh.Error, PanelOpError, tarfile.TarError) as err:
+                self._assert_relay_session_settled(shell)
                 if isinstance(err, panel_ops.ReleaseIdentityBlocked):
                     raise
                 if isinstance(err, panel_ops.ReleaseCodeChangeRefused):
@@ -1670,14 +1705,23 @@ class PanelManager:
             # say the new code is live, so try once more before giving up.
             try:
                 state = await spec.inspect(shell)
+                self._assert_relay_session_settled(shell)
             except (OSError, asyncssh.Error, PanelOpError, tarfile.TarError):
+                self._assert_relay_session_settled(shell)
                 return error
             if state.payload_present and state.version == version:
                 try:
                     await spec.restart(shell)
+                    self._assert_relay_session_settled(shell)
                 except (OSError, asyncssh.Error, PanelOpError):
+                    self._assert_relay_session_settled(shell)
                     pass
         return error
+
+    @staticmethod
+    def _assert_relay_session_settled(shell: PanelShell) -> None:
+        if shell.mutation_outcome_unknown() or shell.transport_lost():
+            raise PanelOpError("mutation_outcome_unknown")
 
     async def _relay_selected_components(
         self, shell: PanelShell, *, context: str, version: str
@@ -1688,12 +1732,14 @@ class PanelManager:
         OTA wipes /etc/systemd/system/ (units) — and for hue-ca also /data — even
         though the code in /var survives, so each selected component gets its unit
         re-laid, its code redeployed when missing or version-skewed (watchdogs),
-        and its service (re)enabled. Every failure is logged and swallowed: a
-        companion outage must never block or fail the bridge operation itself.
+        and its service (re)enabled. Known failures are logged as companion
+        outages. An unknown command outcome stops all later component and bridge
+        dispatch; the enclosing update retains its durable recovery guard.
         *context* selects the warning suffix ("repair" / "refresh" / "update").
         """
         from .components import selected_ids  # lazy: components imports manager
 
+        self._assert_relay_session_settled(shell)
         suffix = _RELAY_CONTEXT_SUFFIX[context]
         selected = selected_ids(self.store.data)
         for component_id, spec in (
@@ -1701,11 +1747,14 @@ class PanelManager:
             (COMPONENT_BUS_WATCHDOG, _BUS_WATCHDOG_RELAY),
         ):
             if component_id in selected:
+                self._assert_relay_session_settled(shell)
                 if await self._relay_watchdog(shell, spec, version):
                     _LOGGER.warning("%s: %s %s", self.panel, spec.label, suffix)
+                self._assert_relay_session_settled(shell)
         if COMPONENT_HUE_CA in selected and not await panel_ops.baseline_retained(shell):
             if await self._relay_hue_ca(shell):
                 _LOGGER.warning("%s: hue-ca %s", self.panel, suffix)
+        self._assert_relay_session_settled(shell)
 
     async def _relay_hue_ca(self, shell: PanelShell) -> Exception | None:
         """Restore the selected hue-ca recovery hook without blocking the bridge op.
@@ -1985,6 +2034,7 @@ class PanelManager:
         broker = self.fleet.broker
         profile = StoredFleetProfile(broker.kind, broker.host, broker.port, broker.tls_enabled)
         try:
+            await self._interrupted.async_assert_live_handoff()
             async with _get_recovery_provisioner(self.hass).async_managed_update(
                 shell,
                 request,
@@ -2003,6 +2053,7 @@ class PanelManager:
         from .provisioning_journal import ProvisioningJournal
 
         try:
+            await async_assert_no_unknown_update(self.hass)
             transaction = UUID(name)
             retained = await ProvisioningJournal(self.hass).async_retained(transaction)
             if retained is None:
@@ -2022,7 +2073,11 @@ class PanelManager:
             else:
                 raise ValueError("invalid_canary_operation")
         except Exception as error:
-            code = getattr(error, "code", "canary_operation_failed")
+            code = (
+                str(error)
+                if isinstance(error, PanelOpError)
+                else getattr(error, "code", "canary_operation_failed")
+            )
             if not isinstance(code, str) or re.fullmatch(r"[a-z_]{1,64}", code) is None:
                 code = "canary_operation_failed"
             raise HomeAssistantError(f"{code}: see docs/canary-rollback.md") from None
@@ -2078,7 +2133,11 @@ class PanelManager:
         try:
             try:
                 try:
+                    await async_assert_no_unknown_update(self.hass)
                     saved = await update_intent_store(self.hass).async_get(self.management_id)
+                except PanelOpError:
+                    keep_window = True
+                    raise
                 except Exception:
                     keep_window = True
                     raise _UpdateFailed(
@@ -2205,6 +2264,13 @@ class PanelManager:
         # timer (if this update lands in its window) can't be orphaned.
         self._arm_recovery("update")
 
+    @staticmethod
+    def _assert_update_candidate(
+        candidate: Mapping[str, ReleaseIdentity], target: UpdateTarget | None
+    ) -> None:
+        if target is not None and update_target_from_candidate(candidate) != target:
+            raise PanelOpError("release_candidate_changed")
+
     async def _async_update_attempt(
         self,
         budget: _UpdateRetryBudget,
@@ -2257,6 +2323,9 @@ class PanelManager:
                     components=self._identity_components(),
                     override=release_override,
                     allow_pre_ordinal_upgrade=True,
+                    validate_candidate=lambda candidate: self._assert_update_candidate(
+                        candidate, budget.target
+                    ),
                 ) as admission:
                     if (
                         budget.target is not None
@@ -2292,8 +2361,8 @@ class PanelManager:
                         # Update-entity install can no longer leave a watchdog on the
                         # previous release (0.10.0 bus-phase contract: bridge + bus
                         # watchdog move as a pair). Runs before the bridge restart so
-                        # both come up on *version*; relay failures are logged and
-                        # never fail the update.
+                        # both come up on *version*. Known relay failures are logged;
+                        # unknown outcomes stop subsequent writes.
                         await self._relay_selected_components(
                             shell, context="update", version=version
                         )

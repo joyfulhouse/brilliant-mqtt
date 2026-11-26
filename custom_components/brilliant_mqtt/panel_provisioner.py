@@ -956,6 +956,7 @@ class PanelProvisioner:
         credential_resolver: Callable[[StoredPanelRequest], Awaitable[str | None]] | None = None,
         recovery_authorizer: Callable[[ProvisioningRecord], Awaitable[None]] | None = None,
         retained_owner_exists: Callable[[RetainedRollback], Awaitable[bool]] | None = None,
+        mutation_guard: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self._lock = operation_lock
         self._journal = journal
@@ -978,6 +979,7 @@ class PanelProvisioner:
         self._credential_resolver = credential_resolver
         self._recovery_authorizer = recovery_authorizer
         self._retained_owner_exists = retained_owner_exists
+        self._mutation_guard = mutation_guard
         if (
             not isinstance(operation_lock, asyncio.Lock)
             or not isinstance(health_timeout, (int, float))
@@ -1126,9 +1128,22 @@ class PanelProvisioner:
         except TimeoutError:
             raise PanelProvisioningError("transaction_in_progress") from None
         try:
+            await self._async_assert_mutations_allowed()
             yield
         finally:
             self._lock.release()
+
+    async def _async_assert_mutations_allowed(self) -> None:
+        if self._mutation_guard is not None:
+            try:
+                await self._mutation_guard()
+            except PanelOpError as error:
+                code = (
+                    "mutation_outcome_unknown"
+                    if str(error) == "mutation_outcome_unknown"
+                    else "provisioning_recovery_required"
+                )
+                raise PanelProvisioningError(code) from None
 
     @asynccontextmanager
     async def async_managed_update(
@@ -1145,7 +1160,7 @@ class PanelProvisioner:
 
         The write-ahead unknown marker survives process death. Only this live
         operation, after all mutation acknowledgements, can clear its exact marker.
-        Any failure while the body runs requires external operator settlement;
+        Missing results or cancellation require external operator settlement;
         neither a fresh SSH session nor a health acknowledgement fences old writers.
         """
         if not self._lock.locked():
@@ -1222,6 +1237,20 @@ class PanelProvisioner:
                     raise error from None
                 raise PanelProvisioningError("provisioning_recovery_required") from None
             if current is not None and current.phase is not ProvisioningPhase.COMMITTED:
+                if (
+                    current.last_error is not None
+                    and current.last_error.code == "mutation_outcome_unknown"
+                    and not isinstance(error, (asyncio.CancelledError, TimeoutError))
+                    and not shell.transport_lost()
+                    and not shell.mutation_outcome_unknown()
+                    and not (
+                        isinstance(error, PanelProvisioningError)
+                        and error.code == "mutation_outcome_unknown"
+                    )
+                ):
+                    # A checked nonzero result is acknowledged. Retire only this
+                    # live operation's guard before using existing compensation.
+                    current = await self._journal.async_finish_update_mutations(current)
                 if (
                     current.last_error is not None
                     and current.last_error.code == "mutation_outcome_unknown"
@@ -1786,6 +1815,7 @@ class PanelProvisioner:
     ) -> None:
         """Settle the one durable transaction before accepting new work."""
         async with self._lock:
+            await self._async_assert_mutations_allowed()
             outcome = await _settle(
                 self._async_recover_bounded(
                     progress, expected_record=expected_record, authorize=authorize
@@ -2100,6 +2130,7 @@ class PanelProvisioner:
         staged, _snapshot = await self._async_recovery_artifacts(record, False)
         shell = await self._async_recovery_shell(record, host, password, False)
         primary: PanelProvisioningError | None = None
+        cancellation: asyncio.CancelledError | None = None
         try:
             if shell.pinned_host_key() != record.panel_request.public_key:
                 raise PanelProvisioningError("panel_identity_mismatch")
@@ -2109,17 +2140,29 @@ class PanelProvisioner:
                 raise
             except Exception as error:
                 raise PanelProvisioningError(recovery_connect_failure_code(error)) from None
+            record = await self._journal.async_start_restore_mutations(record)
             await self._operations.cleanup_staged(shell, staged)
+            if shell.transport_lost() or shell.mutation_outcome_unknown():
+                raise PanelProvisioningError("mutation_outcome_unknown")
+            await self._journal.async_finish_restore_mutations(record)
             if record.prior_snapshot.layout is StoredPanelLayout.ABSENT:
                 await self._journal.async_complete_absent_rollback(record.transaction_id)
             else:
                 await self._journal.async_complete_rollback(record.transaction_id, verified=True)
             await self._repair_reporter.async_clear_rollback_failure(record.transaction_id)
+        except asyncio.CancelledError as error:
+            cancellation = error
         except PanelProvisioningError as error:
             primary = error
         except Exception:
-            primary = PanelProvisioningError("cleanup_failed")
+            primary = PanelProvisioningError(
+                "mutation_outcome_unknown"
+                if shell.transport_lost() or shell.mutation_outcome_unknown()
+                else "cleanup_failed"
+            )
         closed = await _settle_close(shell.close)
+        if cancellation is not None:
+            raise cancellation from None
         if closed.cancellation is not None:
             raise closed.cancellation from None
         if primary is not None:
@@ -2202,6 +2245,8 @@ class PanelProvisioner:
             outcome = await _settle(recover())
             if outcome.cancellation is not None:
                 raise outcome.cancellation from None
+            if isinstance(outcome.error, asyncio.CancelledError):
+                raise outcome.error from None
             if isinstance(outcome.error, TimeoutError):
                 raise PanelProvisioningError("rollback_deadline_exceeded") from None
             if isinstance(outcome.error, PanelProvisioningError):
@@ -2367,6 +2412,7 @@ class PanelProvisioner:
     async def async_rollback(self, transaction_id: UUID) -> None:
         """Persist operator intent before asking the existing runner to execute it."""
         async with self._lock:
+            await self._async_assert_mutations_allowed()
             current = await self._journal.async_load()
             self._require_mutation_settled(current)
             if current is not None and current.transaction_id != transaction_id:
@@ -2382,6 +2428,7 @@ class PanelProvisioner:
     async def async_finalize(self, transaction_id: UUID) -> None:
         """Explicit intentional loss of the rollback guarantee, with durable intent."""
         async with self._lock:
+            await self._async_assert_mutations_allowed()
             if await self._journal.async_load() is not None:
                 raise PanelProvisioningError("provisioning_recovery_required")
             retained = await self._journal.async_retained(transaction_id)

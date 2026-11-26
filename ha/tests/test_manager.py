@@ -4917,14 +4917,17 @@ async def test_update_agent_force_restarts_watchdog_when_converged_but_failed(
     restart step twice (inspect says "0.1.0" while running), and without the
     forced restart the process keeps running the old code while the marker
     claims 0.10.1.
+
+    The failed restarts have acknowledged exit results. Missing results must
+    instead stop dispatch, as covered by the in-flight writer regression.
     """
     shell = _RelayVersionAwareShell(
         responses={
             panel_ops.BUS_WATCHDOG_INSPECT_COMMAND: RunResult(
                 0, "unit=1\nenabled=1\nactive=1\npayload=1\n0.1.0\n", ""
-            )
+            ),
+            "systemctl restart brilliant-bus-watchdog": RunResult(1, "", "restart refused"),
         },
-        run_errors={"systemctl restart brilliant-bus-watchdog": OSError("restart dropped")},
     )
     await _update_with(hass, shell, _bus_watchdog_entry_data())
     # attempt 1 + attempt 2 (redeploy path) + forced restart after the final

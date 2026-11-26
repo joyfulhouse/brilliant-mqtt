@@ -99,7 +99,7 @@ from .shell import (
     PanelIdentityError,
     async_verify_host_identity,
 )
-from .update_intent import async_forget_update_intent
+from .update_intent import async_assert_no_unknown_update, async_forget_update_intent
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -780,6 +780,7 @@ def _build_panel_provisioner(
         recovery_authorizer=recovery_authorizer
         or partial(_async_authorize_recorded_recovery, hass),
         retained_owner_exists=partial(_async_retained_owner_exists, hass),
+        mutation_guard=partial(async_assert_no_unknown_update, hass),
         transaction_lookup=partial(_async_transaction_lookup, hass),
         repair_reporter=_ProvisioningRepairReporter(hass),
     )

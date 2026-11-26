@@ -13,6 +13,7 @@ import pytest
 from homeassistant.components.repairs import repairs_flow_manager
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.translation import async_get_translations
 from homeassistant.setup import async_setup_component
@@ -256,15 +257,20 @@ async def test_window_cancelled_before_save_keeps_the_old_record_and_issue(
     panel = _Panel(hass)
     interrupted = await _surfaced(hass, panel)
     entered = asyncio.Event()
+    release = asyncio.Event()
 
     async def hanging_save(_self: Store, _data: object) -> None:
         entered.set()
-        await asyncio.Event().wait()
+        await release.wait()
+        raise RuntimeError("save failed before committing")
 
     monkeypatch.setattr(Store, "async_save", hanging_save)
     task = asyncio.create_task(interrupted.async_begin_window("connect", 0, 5, datetime.now(UTC)))
     await entered.wait()
     task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    release.set()
     with pytest.raises(asyncio.CancelledError):
         await task
     assert interrupted.surfaced == _intent()
@@ -356,6 +362,65 @@ async def test_retry_starts_one_fresh_update_and_refuses_a_second(hass: HomeAssi
     panel.gate.set()
     await hass.async_block_till_done()
     assert panel.updates == 1
+
+
+@pytest.mark.parametrize("replacement", [False, True], ids=["dismissed", "newer_record"])
+async def test_retry_rechecks_request_after_awaited_journal_check(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch, replacement: bool
+) -> None:
+    panel = _Panel(hass)
+    interrupted = await _surfaced(hass, panel)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def journal_check(_panel: _Panel) -> bool:
+        entered.set()
+        await release.wait()
+        return False
+
+    monkeypatch.setattr(_Panel, "async_journal_owns_panel", journal_check)
+    retry = asyncio.create_task(interrupted.async_retry())
+    await entered.wait()
+    newer = _intent(attempts=2)
+    if replacement:
+        await interrupted._store.async_set(panel.management_id, newer)
+    else:
+        await interrupted.async_dismiss()
+    release.set()
+    assert await retry == "interrupted_update_unavailable"
+    await hass.async_block_till_done()
+    assert panel.updates == 0
+    assert await interrupted._store.async_get(panel.management_id) == (
+        newer if replacement else None
+    )
+
+
+async def test_dismiss_refuses_running_retry_and_preserves_newer_record(
+    hass: HomeAssistant,
+) -> None:
+    panel = _Panel(hass, gate=asyncio.Event())
+    interrupted = await _surfaced(hass, panel)
+    assert await interrupted.async_retry() is None
+    try:
+        with pytest.raises(HomeAssistantError, match="already_in_progress"):
+            await interrupted.async_dismiss()
+        assert await interrupted._store.async_get(panel.management_id) == _intent()
+    finally:
+        assert panel.gate is not None
+        panel.gate.set()
+        await hass.async_block_till_done()
+
+
+@pytest.mark.parametrize("stage", ["connect", "admission", "outcome_unknown"])
+async def test_expected_clear_cannot_erase_a_replacement_record(
+    hass: HomeAssistant, stage: str
+) -> None:
+    store = UpdateIntentStore(hass)
+    old = _intent()
+    newer = _intent(stage=stage, attempts=2)
+    await store.async_set("p", newer)
+    with pytest.raises(HomeAssistantError):
+        await store.async_clear("p", expected=old)
+    assert await store.async_get("p") == newer
 
 
 @pytest.mark.parametrize(
@@ -500,6 +565,50 @@ async def test_repairs_flow_dismiss_through_real_entry_setup(
     assert ir.async_get(hass).async_get_issue(DOMAIN, issue_id) is None
     assert await update_intent_store(hass).async_get(entry.entry_id) is None
     assert spies.admissions == 0
+    assert shells.created == []
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.allow_lingering_timers
+async def test_dismiss_prevents_retry_waiting_in_another_repair_flow(
+    hass: HomeAssistant,
+    mqtt_mock: MqttMockHAClient,
+    payload_dir: Path,
+    shells: Shells,
+    spies: Spies,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entry, issue_id = await _surface_through_reload(hass)
+    retry_menu = await _open_menu(hass, issue_id)
+    dismiss_menu = await _open_menu(hass, issue_id)
+    flows = repairs_flow_manager(hass)
+    assert flows is not None
+    manager = entry.runtime_data.panels[entry.entry_id]
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def journal_check() -> bool:
+        entered.set()
+        await release.wait()
+        return False
+
+    monkeypatch.setattr(manager, "async_journal_owns_panel", journal_check)
+    retry = asyncio.create_task(
+        flows.async_configure(retry_menu["flow_id"], {"next_step_id": "retry"})
+    )
+    await entered.wait()
+    try:
+        dismissed = await flows.async_configure(
+            dismiss_menu["flow_id"], {"next_step_id": "dismiss"}
+        )
+        assert dismissed["type"] is FlowResultType.CREATE_ENTRY
+    finally:
+        release.set()
+    refused = await retry
+    assert refused["type"] is FlowResultType.ABORT
+    assert refused["reason"] == "interrupted_update_unavailable"
+    await hass.async_block_till_done()
+    assert await update_intent_store(hass).async_get(entry.entry_id) is None
+    assert spies.admissions == 0 and spies.baselines == 0
     assert shells.created == []
     assert await hass.config_entries.async_unload(entry.entry_id)
 

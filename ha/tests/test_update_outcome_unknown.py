@@ -150,12 +150,14 @@ async def test_repair_retry_binds_persisted_target_across_journal_read(
     manager = update_manager(hass)
     original = await manager.async_update_target()
     assert original is not None
-    manager.interrupted_updates.surfaced = _intent(
+    intent = _intent(
         target_version=original.version,
         target_ordinal=original.ordinal,
         target_digest=original.digest,
         target_set_digest=original.set_digest,
     )
+    await update_intent_store(hass).async_set(manager.management_id, intent)
+    manager.interrupted_updates.surfaced = intent
 
     async def journal_read() -> bool:
         if kind == "selection":

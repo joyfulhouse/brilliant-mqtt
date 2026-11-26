@@ -120,6 +120,7 @@ def _component_issue_ids(management_ids: set[str]) -> set[str]:
     }
 
 
+@pytest.mark.usefixtures("durable_journal_store")
 async def test_ha_remove_delegates_recovery_after_registry_owner_is_deleted(
     hass: HomeAssistant,
 ) -> None:
@@ -167,6 +168,7 @@ async def test_ha_remove_delegates_recovery_after_registry_owner_is_deleted(
     assert await update_intent_store(hass).async_get(entry.entry_id) is None
 
 
+@pytest.mark.usefixtures("durable_journal_store")
 async def test_fleet_remove_deletes_component_issues_for_each_management_id(
     hass: HomeAssistant,
 ) -> None:

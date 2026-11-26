@@ -138,11 +138,26 @@ def _rig(hass: HomeAssistant, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
 
 
 @pytest.mark.parametrize("lose", [False, True])
-async def test_body_failure_keeps_unknown_intent_without_any_rollback(
+async def test_body_failure_compensates_only_when_remote_results_are_known(
     hass: HomeAssistant, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lose: bool
 ) -> None:
     rig = _rig(hass, tmp_path, monkeypatch)
     raised = await rig.update_and_lose(lose=lose)
+    if not lose:
+        assert isinstance(raised, _LiveFailure)
+        assert not rig.panel.transport_lost() and not rig.panel.mutation_outcome_unknown()
+        assert rig.fresh == [] and rig.factory_keys == []
+        assert await rig.journal.async_load() is None
+        retained_records = await rig.journal.async_retained_records()
+        assert len(retained_records) == 1
+        known_retained = retained_records[0]
+        assert known_retained.state == "restored"
+        assert known_retained.recovery_deployment_id is not None
+        assert (rig.code / "vendor/original.py").read_text() == "original = True\n"
+        assert not [
+            issue for (domain, _), issue in ir.async_get(hass).issues.items() if domain == DOMAIN
+        ]
+        return
     assert isinstance(raised, PanelProvisioningError)
     assert raised.code == "mutation_outcome_unknown"
     assert rig.fresh == [] and rig.factory_keys == []

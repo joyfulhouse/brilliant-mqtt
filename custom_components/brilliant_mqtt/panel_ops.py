@@ -304,6 +304,7 @@ async def _admit_release(
     transaction: str | None = None,
     *,
     allow_pre_ordinal_upgrade: bool = False,
+    validate_candidate: Callable[[Mapping[str, ReleaseIdentity]], None] | None = None,
 ) -> ReleaseAdmission:
     candidate = await candidate_identities(local_payload_dir)
     return await _admit_identities(
@@ -314,6 +315,7 @@ async def _admit_release(
         override,
         transaction,
         allow_pre_ordinal_upgrade=allow_pre_ordinal_upgrade,
+        validate_candidate=validate_candidate,
     )
 
 
@@ -326,13 +328,16 @@ async def _admit_identities(
     transaction: str | None = None,
     *,
     allow_pre_ordinal_upgrade: bool = False,
+    validate_candidate: Callable[[Mapping[str, ReleaseIdentity]], None] | None = None,
 ) -> ReleaseAdmission:
-    installed = await _read_release_identities(shell)
     selected = tuple(dict.fromkeys(("bridge", *components)))
     if any(key not in candidate for key in selected):
         raise PanelOpError("release_identity_invalid: selected component missing from payload")
-    incumbent = {key: installed.get(key) for key in selected}
     candidate = {key: candidate[key] for key in selected}
+    if validate_candidate is not None:
+        validate_candidate(candidate)
+    installed = await _read_release_identities(shell)
+    incumbent = {key: installed.get(key) for key in selected}
     transaction = transaction or uuid4().hex
     if override is not None:
         value = override.get("transaction")
@@ -406,6 +411,7 @@ async def release_transaction(
     transaction_id: UUID | None = None,
     allow_pre_ordinal_upgrade: bool = False,
     code_policy: CodePolicy = "admit",
+    validate_candidate: Callable[[Mapping[str, ReleaseIdentity]], None] | None = None,
 ) -> AsyncIterator[ReleaseAdmission]:
     """Admit every selected writer before CA/config writes; never retain an override.
 
@@ -424,6 +430,7 @@ async def release_transaction(
         override,
         transaction_id.hex if transaction_id is not None else None,
         allow_pre_ordinal_upgrade=allow_pre_ordinal_upgrade,
+        validate_candidate=validate_candidate,
     )
     admission.code_policy = code_policy
     token = _RELEASE_ADMISSION.set(admission)

@@ -110,6 +110,13 @@ def durable_journal_store(
 
 
 @pytest.fixture(autouse=True)
+def durable_update_retry_storage(request: pytest.FixtureRequest) -> None:
+    """Retry and fleet removal tests exercise strict intent save/readback."""
+    if request.path.name in {"test_update_connect_retry.py", "test_fleet_manager.py"}:
+        request.getfixturevalue("durable_journal_store")
+
+
+@pytest.fixture(autouse=True)
 def isolated_manager_canary_dependency(
     request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -122,6 +129,9 @@ def isolated_manager_canary_dependency(
         "test_release_identity.py",
     }:
         return
+    # Intent saves now verify disk readback. Keep the real strict store while
+    # isolating baseline capture below; HA's default harness writer is memory-only.
+    request.getfixturevalue("durable_journal_store")
     from custom_components.brilliant_mqtt.manager import PanelManager
     from custom_components.brilliant_mqtt.shell import PanelShell
 
