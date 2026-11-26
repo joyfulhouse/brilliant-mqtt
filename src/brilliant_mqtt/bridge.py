@@ -501,6 +501,11 @@ class Bridge:
                 await self._repair_mesh(pid, force=False)
         await self._mesh_routing.retry_withdrawn()
 
+    def _mesh_withdrawal_valid(self, peripheral_id: str | None) -> bool:
+        return (
+            self._mesh is None or peripheral_id is None or self._mesh.current(peripheral_id) is None
+        )
+
     async def _repair_mesh(self, peripheral_id: str, *, force: bool) -> None:
         registry = self._mesh
         if registry is None:
@@ -1022,7 +1027,7 @@ class Bridge:
         if self._mesh is not None:
             self._mesh.close()
         self._mesh_recovery_pending = False
-        mesh_repairs = self._mesh_routing.withdraw()
+        mesh_repairs = self._mesh_routing.withdraw(self._mesh_withdrawal_valid)
         self._mesh_route_owners.clear()
         self._mesh_descriptors.clear()
         self._last_state_payload.clear()
@@ -1454,7 +1459,7 @@ class Bridge:
     async def shutdown_mesh_feedback(self) -> None:
         if self._mesh is not None:
             self._mesh.close()
-        await self._mesh_routing.join(self._mesh_routing.withdraw())
+        await self._mesh_routing.join(self._mesh_routing.withdraw(self._mesh_withdrawal_valid))
         if self._mesh_driver is not None:
             await self._mesh_driver.shutdown()
         if self._mesh is not None:

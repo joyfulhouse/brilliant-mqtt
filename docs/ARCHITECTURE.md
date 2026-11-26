@@ -172,7 +172,8 @@ bidirectional control.
   and acknowledges its exact absence debt even when its bytes are unchanged.
   Routing work indexes contain only current records: ordinary applied desires
   reuse completed workers, and existing sweeps retry failed ownerless withdrawal
-  cleanup after checking for reappearance.
+  cleanup with live reappearance checks at membership issue. Skipped cleanup
+  retains its debt until a later existing repair trigger.
 - **Scene/mode bridge (opt-in):** when `SCENE_BRIDGE_ENABLED=1`, a
   `SceneBridge` runs on the *same* bus and MQTT sessions (no second adapter):
   it publishes the panel's scene/mode catalogs and execution events under

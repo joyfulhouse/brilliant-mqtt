@@ -644,6 +644,13 @@ rechecks current owners before retrying that cleanup. Bounded topic lookups and
 outstanding-withdrawal work indexes derive only from existing routing records
 and disappear with them. Ordinary unchanged, fully applied desires reuse their
 completed worker; force repair and genuine outstanding debt still run.
+Withdrawal desires retain a live current-owner-absent validity predicate.
+Membership children recheck that exact desire and its validity immediately
+before issuing MQTT work. Skipped or invalidated work retains its record/debt;
+applied/forget bookkeeping requires a still-valid desire and actual matching
+membership. Reappearance during another ID's repair await may stay offline
+until a later existing trigger repairs its current route, without an obsolete
+unsubscribe being issued in the meantime.
 
 Capture ingress happens before availability/discovery publishes, so a newer
 push during a routing await already updates the slot. Reconcile never resumes

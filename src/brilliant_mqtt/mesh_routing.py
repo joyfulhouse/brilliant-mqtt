@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from functools import partial
 
 from brilliant_mqtt.mesh_settlement import MeshSettlement
 from brilliant_mqtt.protocols import MqttClient
@@ -169,7 +170,11 @@ class MeshRouting:
         await self.publish(topic, desired.payload)
         record.payload, record.applied = desired.payload, desired
 
-    async def _membership(self, topic: str, record: TopicRepair, membership: bool) -> None:
+    async def _membership(self, topic: str, record: TopicRepair, desired: DesiredTopic) -> None:
+        membership = desired.membership
+        assert membership is not None
+        if record.desired is not desired or not desired.valid():
+            return
         record.membership = None
         if membership:
             await self.mqtt.subscribe(topic)
@@ -193,10 +198,14 @@ class MeshRouting:
                 if record.applied is not desired:
                     return
             if desired.membership is not None and desired.membership != record.membership:
-                await self._operation(record, self._membership(topic, record, desired.membership))
+                await self._operation(record, self._membership(topic, record, desired))
                 if record.desired is not desired:
                     continue
             if record.desired is desired:
+                if not desired.valid() or (
+                    desired.membership is not None and record.membership is not desired.membership
+                ):
+                    return
                 record.applied = desired
                 if desired.forget:
                     self.records.pop(topic, None)
@@ -218,14 +227,14 @@ class MeshRouting:
             )
         )
 
-    def withdraw(self) -> tuple[asyncio.Task[None], ...]:
+    def withdraw(self, valid: Callable[[str | None], bool]) -> tuple[asyncio.Task[None], ...]:
         """Revoke shared publications immediately; only membership cleanup remains."""
         return tuple(
             self.request(
                 topic,
                 DesiredTopic(
                     self,
-                    lambda: True,
+                    partial(valid, record.peripheral_id),
                     membership=False if record.desired.membership is not None else None,
                     forget=True,
                 ),

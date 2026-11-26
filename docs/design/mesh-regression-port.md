@@ -493,8 +493,8 @@ Earlier fixture-signature and typing corrections are not semantic RED claims.
 The additional routing-index churn assertions are postimplementation supporting
 proof. No baseline XML/log or original reviewer probe was overwritten.
 
-The consolidated correction focused selection passes **1,901 cases across 63 files**,
-including **30 correction cases**, and the exact historical selection again
+The consolidated correction focused selection passes **1,903 cases across 64 files**,
+including **32 correction cases**, and the exact historical selection again
 passes **148 cases**. The seven unchanged reviewer runtime probes pass; an
 external wrapper around the two unchanged sensitivity probes requires their
 invalid sequences to raise an assertion. Healthy stable pushes perform zero
@@ -535,10 +535,25 @@ native `on=0` issue in `pr297-r1-cold-native-red.log`. They pass against the
 corrected source in `pr297-r1-cold-native-green.log`; the imported frozen-source
 path is recorded in `pr297-r1-cold-source-proof.log`. The immutable review
 checkout is untouched. Kimi's unchanged original native reproduction also
-passes with zero owner/route/native write. Root source and payload remain
-byte-identical to the first correction commit; this follow-up adds only test
-and documentation coverage. Final gate and payload-index evidence for the
-consolidated commit is recorded separately under the `pr297-r1-kimi-*` prefix.
+passes with zero owner/route/native write. At Kimi consolidation head `24f5f99`,
+root source and payload remain byte-identical to the first correction commit;
+that follow-up adds only test and documentation coverage. Its gate and
+payload-index evidence is recorded under the `pr297-r1-kimi-*` prefix.
+
+Fresh spec review of the complete correction then found a remaining MED in
+withdrawal repair: an ID checked absent could reappear while another ID's
+repair awaited MQTT, after which its unconditional withdrawal desire still
+issued unsubscribe. Two permanent actual-adapter schedules in
+`tests/test_mesh_routing_issue_guard.py` reproduce this cross-ID schedule and
+the worker-to-membership-child scheduling gap. Both fail semantically before
+the spec correction in `specfix-red-final.log`. The correction retains live
+owner-absence validity in the existing desire, rechecks exact desire/validity
+inside the membership child, and requires still-valid actual membership before
+marking work applied or forgetting it. A skipped operation retains the same
+unapplied record and bounded indexes. Existing poll recovery restores current
+routes, online readiness and actual native command admission. No read, state
+map, permit, timer or retry loop is added. Evidence for this spec follow-up is
+separate under `specfix-*`; earlier reviewer and correction artifacts remain.
 
 The correction connected-schedule run passes 150 cases. Its 40-load resource
 proof preserves 4,040 captures, zero native normalization/Variable allocation,
