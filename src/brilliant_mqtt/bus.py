@@ -955,13 +955,17 @@ class RpcBusAdapter:
         except Exception as error:
             self._fail_mesh(error)
 
-    def _mesh_control(self, event: MeshIngress) -> None:
+    def _mesh_control_sinks(self) -> tuple[MeshSink, ...]:
+        if not self.mesh_admission_open:
+            return ()
         try:
-            sinks = tuple(sink for sink in self._mesh_sinks if sink.want_inventory())
+            return tuple(sink for sink in self._mesh_sinks if sink.want_inventory())
         except Exception as error:
             self._fail_mesh(error)
-            return
-        self._mesh_deliver(event, sinks)
+            return ()
+
+    def _mesh_control(self, event: MeshIngress) -> None:
+        self._mesh_deliver(event, self._mesh_control_sinks())
 
     def _mesh_fields(self, peripheral_id: str) -> tuple[tuple[MeshSink, frozenset[str]], ...]:
         if not self.mesh_admission_open:
@@ -1384,9 +1388,18 @@ class RpcBusAdapter:
         admitted: list[tuple[Callable[[BrilliantDevice], Awaitable[None]], bool]],
         session: int,
     ) -> None:
-        boundary = self._next_capture_provenance("push")
+        boundary: CaptureProvenance | None = None
+
+        def push_boundary() -> CaptureProvenance:
+            nonlocal boundary
+            if boundary is None:
+                boundary = self._next_capture_provenance("push")
+            return boundary
+
         if getattr(raw_device, "deleted", False) is True:
-            self._mesh_control(MeshInventory(boundary, frozenset()))
+            sinks = self._mesh_control_sinks()
+            if sinks:
+                self._mesh_deliver(MeshInventory(push_boundary(), frozenset()), sinks)
             return
         peripherals = getattr(raw_device, "peripherals", None)
         masks: tuple[_PeripheralMask, ...] | None = getattr(raw_device, "masks", None)
@@ -1402,20 +1415,23 @@ class RpcBusAdapter:
         for pid, mask in candidates:
             if mask is not None and mask.deleted:
                 if pid not in peripherals:
-                    self._mesh_control(MeshPeripheralAbsent(boundary, pid))
+                    sinks = self._mesh_control_sinks()
+                    if sinks:
+                        self._mesh_deliver(MeshPeripheralAbsent(push_boundary(), pid), sinks)
                 continue
             scopes = self._mesh_fields(pid)
             if not scopes or pid not in peripherals:
                 continue
+            capture_boundary = push_boundary()
             fields = frozenset().union(*(names for _, names in scopes))
             snapshot = _snapshot_peripheral(
                 peripherals[pid], None if legacy_variables else fields | {"display_name"}
             )
             metadata = self._mesh_capture(
-                pid, snapshot, boundary, scopes, complete=False, mask=mask
+                pid, snapshot, capture_boundary, scopes, complete=False, mask=mask
             )
-            holder = _PendingPeripheral(pid, snapshot, boundary, 0)
-            holder.metadata_carrier = self._mesh_carrier(metadata, boundary, complete=False)
+            holder = _PendingPeripheral(pid, snapshot, capture_boundary, 0)
+            holder.metadata_carrier = self._mesh_carrier(metadata, capture_boundary, complete=False)
             holders.append(holder)
         if not self.mesh_admission_open:
             return

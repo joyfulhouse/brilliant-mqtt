@@ -497,3 +497,148 @@ async def test_metadata_only_field_scope_does_not_infer_target_absence() -> None
     assert not capture.capture.complete
     assert not capture.capture.reliable
     await adapter.shutdown()
+
+
+@pytest.mark.parametrize("shape", ["capture", "peripheral_deleted", "device_deleted", "empty"])
+async def test_fully_closed_mesh_push_allocates_no_boundary_or_clock(shape: str) -> None:
+    clock_reads = 0
+    scope_calls = {"fields": 0, "control": 0, "legacy": 0}
+
+    def clock() -> float:
+        nonlocal clock_reads
+        clock_reads += 1
+        return 0
+
+    def fields(_pid: str) -> None:
+        scope_calls["fields"] += 1
+        return None
+
+    def control() -> bool:
+        scope_calls["control"] += 1
+        return False
+
+    def legacy(_device: str) -> bool:
+        scope_calls["legacy"] += 1
+        return False
+
+    adapter = RpcBusAdapter(clock=clock)
+    adapter._own_device_id = "own"
+    events: list[object] = []
+    adapter.register_mesh_sink(events.append, want_fields=fields, want_inventory=control)
+
+    async def callback(_device: object) -> None:
+        raise AssertionError("closed legacy callback was delivered")
+
+    adapter.on_change(callback, want_device=legacy)
+    raw = _RawDevice("ble_mesh", {"p": _RawPeripheral()} if shape == "capture" else {})
+    modified = [delta("p", "on")] if shape == "capture" else []
+    if shape == "peripheral_deleted":
+        modified = [delta("p", deleted=True)]
+    before_clock, before_sequence = clock_reads, adapter.capture_sequence
+    await notify(adapter, raw, modified, deleted=shape == "device_deleted")
+    assert events == []
+    assert not adapter._pending_tasks
+    assert not adapter._pending_pushes
+    assert adapter.capture_sequence == before_sequence
+    assert clock_reads == before_clock
+    assert scope_calls == {
+        "fields": int(shape == "capture"),
+        "control": int(shape in {"peripheral_deleted", "device_deleted"}),
+        "legacy": 1,
+    }
+    await adapter.shutdown()
+
+
+async def test_admitted_mesh_push_reuses_one_lazy_boundary_before_legacy_fanout() -> None:
+    from brilliant_mqtt.mesh_ingress import MeshCapture, MeshPeripheralAbsent
+    from brilliant_mqtt.model import BrilliantDevice
+
+    clock_reads = 0
+    scope_calls = {"fields": 0, "control": 0, "legacy": 0}
+
+    def clock() -> float:
+        nonlocal clock_reads
+        clock_reads += 1
+        return 7
+
+    def fields(_pid: str) -> frozenset[str]:
+        scope_calls["fields"] += 1
+        return frozenset({"on"})
+
+    def control() -> bool:
+        scope_calls["control"] += 1
+        return True
+
+    def legacy(_device: str) -> bool:
+        scope_calls["legacy"] += 1
+        return True
+
+    adapter = RpcBusAdapter(clock=clock)
+    adapter._own_device_id = "own"
+    events: list[object] = []
+    delivered: list[BrilliantDevice] = []
+    adapter.register_mesh_sink(events.append, want_fields=fields, want_inventory=control)
+
+    async def callback(device: BrilliantDevice) -> None:
+        assert len(events) == 3
+        delivered.append(device)
+
+    adapter.on_change(callback, want_device=legacy)
+    await notify(
+        adapter,
+        _RawDevice("ble_mesh", {"present": _RawPeripheral()}),
+        [delta("absent-a", deleted=True), delta("present", "on"), delta("absent-b", deleted=True)],
+    )
+    assert [type(event) for event in events] == [
+        MeshPeripheralAbsent,
+        MeshCapture,
+        MeshPeripheralAbsent,
+    ]
+    first, capture, last = events
+    assert isinstance(first, MeshPeripheralAbsent)
+    assert isinstance(capture, MeshCapture)
+    assert isinstance(last, MeshPeripheralAbsent)
+    assert first.provenance is capture.provenance is last.provenance
+    assert first.provenance.sequence == adapter.capture_sequence == 1
+    assert clock_reads == 1
+    assert scope_calls == {"fields": 1, "control": 2, "legacy": 1}
+    assert delivered == []
+    await asyncio.gather(*adapter._pending_tasks)
+    assert len(delivered) == 1
+    assert delivered[0].variables["on"].value == "1"
+    await adapter.shutdown()
+
+
+async def test_lazy_boundary_generation_flush_cannot_deliver_to_replacement_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from brilliant_mqtt.mesh_ingress import MeshGeneration
+    from tests.fakes import _StartHarness
+    from tests.test_mesh_bus_reconnect import foreign
+
+    native = _StartHarness(monkeypatch)
+    adapter = RpcBusAdapter()
+    await adapter.start()
+    old_events: list[object] = []
+    new_events: list[object] = []
+    field_calls = 0
+
+    def fields(_pid: str) -> frozenset[str]:
+        nonlocal field_calls
+        field_calls += 1
+        return frozenset({"on"})
+
+    def old_sink(event: object) -> None:
+        old_events.append(event)
+        if isinstance(event, MeshGeneration):
+            remove_old()
+            adapter.register_mesh_sink(new_events.append, want_fields=lambda _pid: None)
+
+    remove_old = adapter.register_mesh_sink(old_sink, want_fields=fields)
+    foreign(native.procs[0].reconnect_cbs[0])
+    await notify(adapter, _RawDevice("ble_mesh", {"p": _RawPeripheral()}), [delta("p", "on")])
+    assert len(old_events) == 1 and isinstance(old_events[0], MeshGeneration)
+    assert new_events == []
+    assert field_calls == 1
+    assert not adapter._pending_pushes
+    await adapter.shutdown()
