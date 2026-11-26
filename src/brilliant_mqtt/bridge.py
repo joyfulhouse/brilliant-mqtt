@@ -252,6 +252,8 @@ class Bridge:
 
         # peripheral_id → most recent BrilliantDevice snapshot.
         self._devices: dict[str, BrilliantDevice] = {}
+        # Only a filtered full reconcile refreshes or clears discovery firmware.
+        self._discovery_sw_version: str | None = None
         # Camera permission must not inherit discovery's intentionally unpruned cache.
         self._privacy_off = False
         self._privacy_source_generation = getattr(bus, "capture_generation", 0)
@@ -381,11 +383,10 @@ class Bridge:
             for descriptor in descriptors:
                 topic = config_topic(descriptor)
                 expected.add(topic)
-                record = self._mesh_routing.records.get(topic)
-                if (
-                    record is None
-                    or record.desired.payload is None
-                    or not self._mesh_routing.repaired(topic, owner, payload=record.desired.payload)
+                if not self._mesh_routing.repaired(
+                    topic,
+                    owner,
+                    payload=config_payload(descriptor, sw_version=self._discovery_sw_version),
                 ):
                     return False
                 command = self._command_topic_for(pid, descriptor)
@@ -456,9 +457,7 @@ class Bridge:
             for owner in tuple(self._mesh.retired.values()):
                 await self._mesh_driver.flush(owner)
 
-    async def _repair_mesh(
-        self, peripheral_id: str, *, force: bool, sw_version: str | None = None
-    ) -> None:
+    async def _repair_mesh(self, peripheral_id: str, *, force: bool) -> None:
         registry = self._mesh
         if registry is None:
             return
@@ -466,6 +465,7 @@ class Bridge:
             owner = registry.current(peripheral_id)
             if owner is None or not registry.live(owner):
                 return
+            sw_version = self._discovery_sw_version
             device = owner.materialize(self._clock())
             descriptors = entities_for(device, self._panel)
             self._remember_device(device)
@@ -477,9 +477,12 @@ class Bridge:
             def current(owner: MeshSettlement = owner) -> bool:
                 return registry.current(peripheral_id) is owner and registry.live(owner)
 
+            def current_config(sw_version: str | None = sw_version) -> bool:
+                return current() and self._discovery_sw_version == sw_version
+
             for descriptor in descriptors:
                 desired[config_topic(descriptor)] = DesiredTopic(
-                    owner, current, payload=config_payload(descriptor, sw_version=sw_version)
+                    owner, current_config, payload=config_payload(descriptor, sw_version=sw_version)
                 )
                 topic = self._command_topic_for(peripheral_id, descriptor)
                 self._register_command_topic(peripheral_id, descriptor)
@@ -504,6 +507,8 @@ class Bridge:
             ]
             for task in tasks:
                 await asyncio.shield(task)
+            if self._discovery_sw_version != sw_version:
+                continue
             if registry.current(peripheral_id) is not owner:
                 continue
             if registry.live(owner) and descriptors != entities_for(
@@ -512,6 +517,8 @@ class Bridge:
                 continue
             if registry.live(owner):
                 await self._flush_mesh(peripheral_id)
+            if self._discovery_sw_version != sw_version:
+                continue
             return
 
     async def _cleanup_mesh(self, owner: MeshSettlement) -> None:
@@ -785,6 +792,12 @@ class Bridge:
         if not self._feedback_alive(lifecycle):
             return
         self._beat()
+        # Refresh before broker awaits so ordinary poll/push repairs and online
+        # readiness use the current filtered HARDWARE context, including absence.
+        sw_version = _sw_version_from(devices)
+        if self._discovery_sw_version != sw_version:
+            self._discovery_sw_version = sw_version
+            self._mesh_status_changed()
         self._observe_privacy_snapshot(devices)
 
         # A broker await may admit a command or native push. Apply this captured
@@ -798,10 +811,6 @@ class Bridge:
             await self._async_publish_retained(availability_topic(self._panel), "online")
         if not self._feedback_alive(lifecycle):
             return
-
-        # Pre-pass: the panel firmware version (from the HARDWARE peripheral) is
-        # attached to every entity's HA device block so the device page shows it.
-        sw_version = _sw_version_from(devices)
 
         # Bridge meta: the companion integration's machine contract. Retained and
         # republished on every reconcile (idempotent, like discovery configs).
@@ -823,7 +832,7 @@ class Bridge:
         n_devices = n_entities = 0
         for device in devices:
             if device.device_id == _MESH_DEVICE_ID:
-                await self._repair_mesh(device.peripheral_id, force=True, sw_version=sw_version)
+                await self._repair_mesh(device.peripheral_id, force=True)
                 if not self._feedback_alive(lifecycle):
                     return
                 continue
@@ -971,6 +980,7 @@ class Bridge:
         self._last_state_payload.clear()
         self._last_state_fields.clear()
         self._devices.clear()
+        self._discovery_sw_version = None
         if self._deriver is not None:
             self._deriver.clear()
         if self._panel == _MESH_PANEL:
