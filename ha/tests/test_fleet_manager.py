@@ -315,7 +315,7 @@ def _legacy_entry() -> MockConfigEntry:
             CONF_ENTRY_KIND: ENTRY_KIND_LEGACY_PENDING_CONSOLIDATION,
             CONF_HOST: "legacy.example.com",
             CONF_ROOT_PASSWORD: "legacy-secret",
-            CONF_SSH_HOST_KEY: "ssh-ed25519 AAAA-legacy",
+            CONF_SSH_HOST_KEY: _OFFICE_PUBLIC_KEY,
             CONF_PANEL: "legacy",
             CONF_MESH_PRIORITY: 1,
             CONF_MQTT_HOST: "mqtt.example.com",
@@ -480,6 +480,8 @@ async def test_initial_setup_normalizes_owner_then_commits_exact_runtime_handoff
     )
     entry.add_to_hass(hass)
     journal = Mock(
+        async_connection_intents=AsyncMock(return_value=()),
+        async_assert_connection_available=AsyncMock(),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record()),
         async_complete_commit=AsyncMock(),
@@ -550,6 +552,8 @@ async def test_cancel_during_pending_handoff_commit_clears_resolved_repair(
         commit_finished.set()
 
     journal = Mock(
+        async_connection_intents=AsyncMock(return_value=()),
+        async_assert_connection_available=AsyncMock(),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record()),
         async_complete_commit=AsyncMock(side_effect=complete_commit),
@@ -602,6 +606,8 @@ async def test_first_handoff_normalizes_reserved_empty_owner_to_exact_subentry(
     )
     entry.add_to_hass(hass)
     journal = Mock(
+        async_connection_intents=AsyncMock(return_value=()),
+        async_assert_connection_available=AsyncMock(),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record()),
         async_complete_commit=AsyncMock(),
@@ -651,6 +657,8 @@ async def test_committed_handoff_clears_before_runtime_failure(
     )
     entry.add_to_hass(hass)
     journal = Mock(
+        async_connection_intents=AsyncMock(return_value=()),
+        async_assert_connection_available=AsyncMock(),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record(phase=ProvisioningPhase.COMMITTED)),
         async_clear_committed=AsyncMock(),
@@ -708,6 +716,8 @@ async def test_cancel_during_startup_committed_clear_clears_resolved_repair(
         clear_finished.set()
 
     journal = Mock(
+        async_connection_intents=AsyncMock(return_value=()),
+        async_assert_connection_available=AsyncMock(),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record(phase=ProvisioningPhase.COMMITTED)),
         async_clear_committed=AsyncMock(side_effect=clear_committed),
@@ -772,6 +782,8 @@ async def test_committed_handoff_corruption_fails_closed_with_repair(
     )
     entry.add_to_hass(hass)
     journal = Mock(
+        async_connection_intents=AsyncMock(return_value=()),
+        async_assert_connection_available=AsyncMock(),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record(phase=ProvisioningPhase.COMMITTED)),
         async_clear_committed=AsyncMock(),
@@ -810,6 +822,8 @@ async def test_restart_after_marker_removal_commits_only_exact_owned_runtime(
     )
     entry.add_to_hass(hass)
     journal = Mock(
+        async_connection_intents=AsyncMock(return_value=()),
+        async_assert_connection_available=AsyncMock(),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record()),
         async_complete_commit=AsyncMock(),
@@ -869,6 +883,8 @@ async def test_restart_after_scene_normalization_finishes_remaining_marker(
     )
     entry.add_to_hass(hass)
     journal = Mock(
+        async_connection_intents=AsyncMock(return_value=()),
+        async_assert_connection_available=AsyncMock(),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record()),
         async_complete_commit=AsyncMock(),
@@ -922,6 +938,8 @@ async def test_markerless_restart_force_saves_before_journal_commit(
     )
     entry.add_to_hass(hass)
     journal = Mock(
+        async_connection_intents=AsyncMock(return_value=()),
+        async_assert_connection_available=AsyncMock(),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record()),
         async_complete_commit=AsyncMock(),
@@ -1181,6 +1199,8 @@ async def test_cancelled_ownership_flush_settles_without_clearing_journal(
     )
     entry.add_to_hass(hass)
     journal = Mock(
+        async_connection_intents=AsyncMock(return_value=()),
+        async_assert_connection_available=AsyncMock(),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record()),
         async_complete_commit=AsyncMock(),
@@ -1285,6 +1305,8 @@ async def test_pending_handoff_mismatch_fails_closed_without_clearing_journal(
     )
     entry.add_to_hass(hass)
     journal = Mock(
+        async_connection_intents=AsyncMock(return_value=()),
+        async_assert_connection_available=AsyncMock(),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record()),
         async_complete_commit=AsyncMock(),
@@ -1326,6 +1348,8 @@ async def test_pending_handoff_rejects_different_journaled_broker(
         data={**entry.data, CONF_MQTT_HOST: "different-broker.example.com"},
     )
     journal = Mock(
+        async_connection_intents=AsyncMock(return_value=()),
+        async_assert_connection_available=AsyncMock(),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record()),
         async_complete_commit=AsyncMock(),
@@ -1371,6 +1395,8 @@ async def test_pending_handoff_accepts_guidance_only_broker_kind_correction(
         },
     )
     journal = Mock(
+        async_connection_intents=AsyncMock(return_value=()),
+        async_assert_connection_available=AsyncMock(),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record()),
         async_complete_commit=AsyncMock(),
@@ -1415,6 +1441,8 @@ async def test_startup_without_stored_owner_invokes_recorded_recovery_before_set
     )
     entry.add_to_hass(hass)
     journal = Mock(
+        async_connection_intents=AsyncMock(return_value=()),
+        async_assert_connection_available=AsyncMock(),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(side_effect=[_pending_record(), None]),
         async_complete_commit=AsyncMock(),
@@ -1457,6 +1485,8 @@ async def test_unreachable_stale_recovery_does_not_hold_healthy_runtime_offline(
     )
     entry.add_to_hass(hass)
     journal = Mock(
+        async_connection_intents=AsyncMock(return_value=()),
+        async_assert_connection_available=AsyncMock(),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record(phase=ProvisioningPhase.ACTIVATED)),
     )
@@ -1519,6 +1549,8 @@ async def test_finished_background_recovery_is_retried_after_entry_update(
         return state["record"]
 
     journal = Mock(
+        async_connection_intents=AsyncMock(return_value=()),
+        async_assert_connection_available=AsyncMock(),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(side_effect=load_record),
     )
@@ -1578,7 +1610,10 @@ async def test_stale_allocator_hint_does_not_wait_for_storage_before_healthy_run
     )
     entry.add_to_hass(hass)
     journal = Mock(
-        async_retained_records=AsyncMock(return_value=()), async_load=AsyncMock(return_value=None)
+        async_connection_intents=AsyncMock(return_value=()),
+        async_assert_connection_available=AsyncMock(),
+        async_retained_records=AsyncMock(return_value=()),
+        async_load=AsyncMock(return_value=None),
     )
     persisted = AsyncMock(side_effect=OSError("storage is slow"))
     fleet = FleetManager(hass, entry)
@@ -1636,6 +1671,8 @@ async def test_startup_preserves_owned_journal_when_any_domain_competitor_surviv
     entry.add_to_hass(hass)
     competitor.add_to_hass(hass)
     journal = Mock(
+        async_connection_intents=AsyncMock(return_value=()),
+        async_assert_connection_available=AsyncMock(),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record(phase=phase)),
         async_clear_committed=AsyncMock(),
@@ -1675,6 +1712,8 @@ async def test_empty_fleet_with_legacy_competitor_reports_without_orphan_recover
     entry.add_to_hass(hass)
     legacy.add_to_hass(hass)
     journal = Mock(
+        async_connection_intents=AsyncMock(return_value=()),
+        async_assert_connection_available=AsyncMock(),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record(phase=ProvisioningPhase.STAGED)),
     )
@@ -1717,6 +1756,8 @@ async def test_hard_restart_empty_fleet_schedules_orphan_recovery(
     entry = _empty_fleet_entry()
     entry.add_to_hass(hass)
     journal = Mock(
+        async_connection_intents=AsyncMock(return_value=()),
+        async_assert_connection_available=AsyncMock(),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record(phase=phase)),
     )
@@ -1756,6 +1797,8 @@ async def test_live_subentry_flow_prevents_reload_from_rolling_back_staged_panel
     entry = _empty_fleet_entry()
     entry.add_to_hass(hass)
     journal = Mock(
+        async_connection_intents=AsyncMock(return_value=()),
+        async_assert_connection_available=AsyncMock(),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record(phase=ProvisioningPhase.STAGED)),
     )
@@ -1803,6 +1846,8 @@ async def test_active_flow_context_prevents_pre_storage_rollback(
 ) -> None:
     """An unrelated fleet update cannot roll back a flow awaiting HA persistence."""
     journal = Mock(
+        async_connection_intents=AsyncMock(return_value=()),
+        async_assert_connection_available=AsyncMock(),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record()),
     )
@@ -1851,6 +1896,8 @@ async def test_actual_ha_remove_recovers_exact_removed_sole_owner(
     entry = _pending_owner_entry()
     entry.add_to_hass(hass)
     journal = Mock(
+        async_connection_intents=AsyncMock(return_value=()),
+        async_assert_connection_available=AsyncMock(),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record()),
     )
@@ -1892,6 +1939,8 @@ async def test_actual_ha_remove_recovers_exact_empty_fleet_before_subentry(
     entry = _empty_fleet_entry()
     entry.add_to_hass(hass)
     journal = Mock(
+        async_connection_intents=AsyncMock(return_value=()),
+        async_assert_connection_available=AsyncMock(),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record(phase=phase)),
     )
@@ -1950,6 +1999,8 @@ async def test_actual_ha_remove_recovers_pre_subentry_panel_from_nonempty_single
     )
     entry.add_to_hass(hass)
     journal = Mock(
+        async_connection_intents=AsyncMock(return_value=()),
+        async_assert_connection_available=AsyncMock(),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record(phase=phase)),
     )
@@ -1997,6 +2048,8 @@ async def test_actual_ha_remove_preserves_unowned_pre_subentry_committed_phase(
     )
     entry.add_to_hass(hass)
     journal = Mock(
+        async_connection_intents=AsyncMock(return_value=()),
+        async_assert_connection_available=AsyncMock(),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record(phase=ProvisioningPhase.COMMITTED)),
         async_clear_committed=AsyncMock(),
@@ -2036,6 +2089,8 @@ async def test_actual_ha_remove_clears_committed_exact_owner_without_panel_netwo
     entry = _pending_owner_entry()
     entry.add_to_hass(hass)
     journal = Mock(
+        async_connection_intents=AsyncMock(return_value=()),
+        async_assert_connection_available=AsyncMock(),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record(phase=ProvisioningPhase.COMMITTED)),
         async_clear_committed=AsyncMock(),
@@ -2095,6 +2150,8 @@ async def test_removed_entry_wrong_handoff_phase_preserves_journal_and_reports_r
     """Removal stays fail-closed but never leaves the retained root secret silent."""
     entry = _pending_owner_entry()
     journal = Mock(
+        async_connection_intents=AsyncMock(return_value=()),
+        async_assert_connection_available=AsyncMock(),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record(phase=ProvisioningPhase.VERIFYING)),
     )
@@ -2128,6 +2185,8 @@ async def test_removed_entry_wrong_broker_preserves_journal_and_reports_repair(
         data={**entry.data, CONF_MQTT_HOST: "different-broker.example.com"},
     )
     journal = Mock(
+        async_connection_intents=AsyncMock(return_value=()),
+        async_assert_connection_available=AsyncMock(),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record()),
     )
@@ -2157,6 +2216,8 @@ async def test_actual_ha_remove_aborts_owned_flow_and_settles_pending_journal(
     entry = _pending_owner_entry()
     entry.add_to_hass(hass)
     journal = Mock(
+        async_connection_intents=AsyncMock(return_value=()),
+        async_assert_connection_available=AsyncMock(),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record()),
     )
@@ -2206,6 +2267,8 @@ async def test_actual_ha_remove_does_not_abort_unrelated_active_flow(
     entry = _pending_owner_entry()
     entry.add_to_hass(hass)
     journal = Mock(
+        async_connection_intents=AsyncMock(return_value=()),
+        async_assert_connection_available=AsyncMock(),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record()),
     )
@@ -2264,6 +2327,8 @@ async def test_removed_empty_fleet_with_legacy_competitor_preserves_journal(
     removed.add_to_hass(hass)
     legacy.add_to_hass(hass)
     journal = Mock(
+        async_connection_intents=AsyncMock(return_value=()),
+        async_assert_connection_available=AsyncMock(),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record(phase=ProvisioningPhase.STAGED)),
         async_clear_committed=AsyncMock(),
@@ -2305,6 +2370,8 @@ async def test_removed_committed_owner_with_legacy_competitor_preserves_journal(
     removed.add_to_hass(hass)
     legacy.add_to_hass(hass)
     journal = Mock(
+        async_connection_intents=AsyncMock(return_value=()),
+        async_assert_connection_available=AsyncMock(),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record(phase=ProvisioningPhase.COMMITTED)),
         async_clear_committed=AsyncMock(),
@@ -2346,6 +2413,8 @@ async def test_actual_ha_remove_preserves_another_exact_persisted_owner(
     removed.add_to_hass(hass)
     survivor.add_to_hass(hass)
     journal = Mock(
+        async_connection_intents=AsyncMock(return_value=()),
+        async_assert_connection_available=AsyncMock(),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record()),
     )
@@ -2371,6 +2440,8 @@ async def test_actual_ha_remove_drains_recovery_before_propagating_cancellation(
     entry = _pending_owner_entry()
     entry.add_to_hass(hass)
     journal = Mock(
+        async_connection_intents=AsyncMock(return_value=()),
+        async_assert_connection_available=AsyncMock(),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record()),
     )
@@ -2418,6 +2489,8 @@ async def test_actual_ha_remove_recovery_failure_keeps_one_redacted_issue(
     entry = _pending_owner_entry()
     entry.add_to_hass(hass)
     journal = Mock(
+        async_connection_intents=AsyncMock(return_value=()),
+        async_assert_connection_available=AsyncMock(),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record()),
         async_complete_rollback=AsyncMock(),
@@ -2977,6 +3050,7 @@ async def test_concurrent_rebinds_serialize_and_stale_snapshot_fails(
 
 async def test_rebind_waits_for_shared_ssh_operation_before_any_write_or_audit(
     hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An old-panel SSH operation must finish before identity ownership can move."""
     entry = _fleet_entry(_panel("office", "SHA256:office", subentry_id="panel-office"))
@@ -2993,51 +3067,70 @@ async def test_rebind_waits_for_shared_ssh_operation_before_any_write_or_audit(
         await fleet.async_setup()
         expected = PanelConfig.from_subentry(entry.subentries["panel-office"])
         manager = fleet.panels["panel-office"]
+        listener_started, listener_release = asyncio.Event(), asyncio.Event()
+        prepare = fleet._async_prepare_provisioning_locked
+
+        async def held_listener() -> None:
+            listener_started.set()
+            await listener_release.wait()
+            await prepare()
+
+        monkeypatch.setattr(fleet, "_async_prepare_provisioning_locked", held_listener)
         await fleet._ssh_lock.acquire()
+        owns_ssh_lock = True
         try:
-            with (
-                patch(
-                    "custom_components.brilliant_mqtt.fleet_manager.async_verify_host_identity",
-                    verified,
-                ),
-                patch(
-                    "custom_components.brilliant_mqtt.fleet_manager.async_wait_config_entry_persisted",
-                    persisted,
-                ),
-                patch.object(manager, "_fire") as audit,
-            ):
-                rebind = asyncio.create_task(
-                    fleet.async_rebind_panel(
-                        "panel-office",
-                        expected,
-                        host="replacement.example.com",
-                        root_password="replacement-secret",
-                        candidate=candidate,
+            try:
+                with (
+                    patch(
+                        "custom_components.brilliant_mqtt.fleet_manager.async_verify_host_identity",
+                        verified,
+                    ),
+                    patch(
+                        "custom_components.brilliant_mqtt.fleet_manager.async_wait_config_entry_persisted",
+                        persisted,
+                    ),
+                    patch.object(manager, "_fire") as audit,
+                ):
+                    rebind = asyncio.create_task(
+                        fleet.async_rebind_panel(
+                            "panel-office",
+                            expected,
+                            host="replacement.example.com",
+                            root_password="replacement-secret",
+                            candidate=candidate,
+                        )
                     )
-                )
-                await asyncio.sleep(0)
+                    await asyncio.sleep(0)
 
-                assert not rebind.done()
-                verified.assert_not_awaited()
-                persisted.assert_not_awaited()
-                audit.assert_not_called()
+                    assert not rebind.done()
+                    verified.assert_not_awaited()
+                    persisted.assert_not_awaited()
+                    audit.assert_not_called()
 
-                fleet._ssh_lock.release()
-                await rebind
+                    fleet._ssh_lock.release()
+                    owns_ssh_lock = False
+                    await rebind
+                    async with asyncio.timeout(5):
+                        await listener_started.wait()
 
-                verified.assert_awaited_once_with(
-                    "replacement.example.com",
-                    candidate,
-                )
-                persisted.assert_awaited_once_with(
-                    hass,
-                    entry,
-                    subentry_id="panel-office",
-                )
-                audit.assert_called_once()
+                    verified.assert_awaited_once_with(
+                        "replacement.example.com",
+                        candidate,
+                    )
+                    persisted.assert_awaited_once_with(
+                        hass,
+                        entry,
+                        subentry_id="panel-office",
+                    )
+                    audit.assert_called_once()
+            finally:
+                if owns_ssh_lock:
+                    fleet._ssh_lock.release()
+                    owns_ssh_lock = False
+            assert fleet._ssh_lock.locked(), "test cleanup must preserve the listener's lock"
         finally:
-            if fleet._ssh_lock.locked():
-                fleet._ssh_lock.release()
+            listener_release.set()
+            await hass.async_block_till_done()
         await fleet.async_shutdown()
 
 
@@ -3123,6 +3216,7 @@ async def test_rebind_rechecks_the_panel_snapshot_after_waiting_for_ssh(
         expected = PanelConfig.from_subentry(entry.subentries["panel-office"])
         manager = fleet.panels["panel-office"]
         await fleet._ssh_lock.acquire()
+        owns_ssh_lock = True
         try:
             with (
                 patch(
@@ -3154,6 +3248,7 @@ async def test_rebind_rechecks_the_panel_snapshot_after_waiting_for_ssh(
                     title="Renamed while queued",
                 )
                 fleet._ssh_lock.release()
+                owns_ssh_lock = False
 
                 with pytest.raises(EntryDataError, match="panel_snapshot_changed"):
                     await rebind
@@ -3170,8 +3265,9 @@ async def test_rebind_rechecks_the_panel_snapshot_after_waiting_for_ssh(
                 assert fleet._panel_configs["panel-office"] == expected
                 assert manager.store.data[CONF_NAME] == "Renamed while queued"
         finally:
-            if fleet._ssh_lock.locked():
+            if owns_ssh_lock:
                 fleet._ssh_lock.release()
+                owns_ssh_lock = False
         await fleet.async_shutdown()
 
 
@@ -3194,6 +3290,7 @@ async def test_rebind_rechecks_duplicate_ownership_after_waiting_for_ssh(
         expected = PanelConfig.from_subentry(entry.subentries["panel-office"])
         manager = fleet.panels["panel-office"]
         await fleet._ssh_lock.acquire()
+        owns_ssh_lock = True
         try:
             with (
                 patch(
@@ -3226,6 +3323,7 @@ async def test_rebind_rechecks_duplicate_ownership_after_waiting_for_ssh(
                 )
                 duplicate_entry.add_to_hass(hass)
                 fleet._ssh_lock.release()
+                owns_ssh_lock = False
 
                 with pytest.raises(
                     EntryDataError,
@@ -3242,8 +3340,9 @@ async def test_rebind_rechecks_duplicate_ownership_after_waiting_for_ssh(
                     expected.identity_fingerprint
                 )
         finally:
-            if fleet._ssh_lock.locked():
+            if owns_ssh_lock:
                 fleet._ssh_lock.release()
+                owns_ssh_lock = False
         await fleet.async_shutdown()
 
 
@@ -3402,6 +3501,8 @@ async def test_rebind_rechecks_global_provisioning_journal_after_identity_wait(
     fleet = FleetManager(hass, entry)
     candidate = HostIdentity(_OTHER_PUBLIC_KEY, _OTHER_FINGERPRINT)
     journal = Mock(
+        async_connection_intents=AsyncMock(return_value=()),
+        async_assert_connection_available=AsyncMock(),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(side_effect=[None, _pending_record()]),
     )
@@ -3462,6 +3563,8 @@ async def test_rebind_active_journal_blocks_before_identity_network(
     fleet = FleetManager(hass, entry)
     candidate = HostIdentity(_OTHER_PUBLIC_KEY, _OTHER_FINGERPRINT)
     journal = Mock(
+        async_connection_intents=AsyncMock(return_value=()),
+        async_assert_connection_available=AsyncMock(),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=_pending_record()),
     )
@@ -3525,6 +3628,8 @@ async def test_rebind_unreadable_journal_blocks_before_identity_network(
     candidate = HostIdentity(_OTHER_PUBLIC_KEY, _OTHER_FINGERPRINT)
     private_failure = "journal-backend-private-detail"
     journal = Mock(
+        async_connection_intents=AsyncMock(return_value=()),
+        async_assert_connection_available=AsyncMock(),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(side_effect=OSError(private_failure)),
     )
@@ -4897,6 +5002,7 @@ async def test_successful_fleet_topology_change_reloads_control_plane(
     with (
         patch.object(PanelManager, "async_setup", _noop_setup),
         patch.object(PanelManager, "async_shutdown", _noop_shutdown),
+        patch.object(hass.config_entries, "async_schedule_reload") as schedule_reload,
     ):
         await fleet.async_setup()
         assert fleet._update_unsub is not None
@@ -4914,6 +5020,7 @@ async def test_successful_fleet_topology_change_reloads_control_plane(
             await fleet.async_panel_added("panel-kitchen")
 
         control_plane.async_reload_settings.assert_awaited_once_with()
+        schedule_reload.assert_called_once_with(entry.entry_id)
         await fleet.async_shutdown()
 
 
@@ -5090,6 +5197,8 @@ async def test_failed_pending_panel_start_is_not_published_and_schedules_retry(
         return current_record
 
     journal = Mock(
+        async_connection_intents=AsyncMock(return_value=()),
+        async_assert_connection_available=AsyncMock(),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(side_effect=load_record),
         async_complete_commit=AsyncMock(),
@@ -5180,6 +5289,8 @@ async def test_successful_live_handoff_advances_priority_and_reloads_parent_once
         current_record = None
 
     journal = Mock(
+        async_connection_intents=AsyncMock(return_value=()),
+        async_assert_connection_available=AsyncMock(),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(side_effect=load_record),
         async_complete_commit=AsyncMock(side_effect=complete_commit),
@@ -5264,6 +5375,8 @@ async def test_live_commit_failure_schedules_one_reload_with_markerless_owner(
         current_record = None
 
     journal = Mock(
+        async_connection_intents=AsyncMock(return_value=()),
+        async_assert_connection_available=AsyncMock(),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(side_effect=load_record),
         async_complete_commit=AsyncMock(side_effect=complete_commit),

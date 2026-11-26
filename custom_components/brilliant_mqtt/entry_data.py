@@ -16,6 +16,7 @@ from homeassistant.core import HomeAssistant
 
 from .broker import BrokerProfile
 from .certificates import canonical_hue_ca_certificate, is_hue_ca_certificate
+from .connection_state import canonical_commit_id
 from .const import (
     CONF_ALLOW_AARCH64,
     CONF_BROKER_KIND,
@@ -107,6 +108,7 @@ _PANEL_KEYS = frozenset(
         CONF_RESYNC_SECONDS,
         CONF_PROVISIONING_TRANSACTION_ID,
         CONF_ALLOW_AARCH64,
+        "connection_commit_id",
     }
 )
 _PANEL_REQUIRED_KEYS = _PANEL_KEYS - {
@@ -114,6 +116,7 @@ _PANEL_REQUIRED_KEYS = _PANEL_KEYS - {
     CONF_PROVISIONING_TRANSACTION_ID,
     CONF_RESYNC_SECONDS,
     CONF_ALLOW_AARCH64,
+    "connection_commit_id",
 }
 
 
@@ -398,6 +401,8 @@ class PanelConfig:
             transaction_id = raw_transaction_id
 
         try:
+            if "connection_commit_id" in data:
+                canonical_commit_id(data["connection_commit_id"])
             feature_overrides = _json_mapping(data[CONF_FEATURE_OVERRIDES])
             _resilience_values(
                 feature_overrides,
@@ -568,7 +573,9 @@ class LegacyPanelStore:
             raise _invalid("invalid_legacy_panel_entry_data")
         try:
             _panel_agent_cadences(entry.data)
-        except EntryDataError:
+            if "connection_commit_id" in entry.data:
+                canonical_commit_id(entry.data["connection_commit_id"])
+        except (EntryDataError, ValueError):
             raise _invalid("invalid_legacy_panel_entry_data") from None
         self.hass = hass
         self.entry = entry

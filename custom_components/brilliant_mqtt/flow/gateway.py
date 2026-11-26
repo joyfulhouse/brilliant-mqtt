@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
@@ -160,14 +160,19 @@ async def async_ownerless_journal_candidate(
 
 @asynccontextmanager
 async def _panel_session(
-    hass: HomeAssistant, host: str, password: str, pinned_key: str | None
+    hass: HomeAssistant,
+    host: str,
+    password: str,
+    pinned_key: str | None,
+    *,
+    operation_lock_held: bool = False,
 ) -> AsyncIterator[PanelShell]:
     """One serialized SSH session (fleet lock held), connected and always closed.
 
     With `pinned_key` set the server key is verified BEFORE auth (a rotated/impostor
     host never receives the root password); `pinned_key=None` is trust-on-first-use.
     """
-    async with _fleet_lock(hass):
+    async with nullcontext() if operation_lock_held else _fleet_lock(hass):
         shell = AsyncsshShell(host, password, pinned_key)
         try:
             await shell.connect()
@@ -184,6 +189,7 @@ async def _apply_config(
     pinned_key: str | None,
     env_content: str,
     expected_panel: str,
+    operation_lock_held: bool = False,
 ) -> str:
     """Verify/capture the host key; if the agent is installed, push env + restart.
 
@@ -195,7 +201,9 @@ async def _apply_config(
     was mistyped to another controller in the fleet), it raises _WrongPanelError
     instead of stamping this entry's identity onto that panel and restarting it.
     """
-    async with _panel_session(hass, host, password, pinned_key) as shell:
+    async with _panel_session(
+        hass, host, password, pinned_key, operation_lock_held=operation_lock_held
+    ) as shell:
         key = shell.pinned_host_key()
         if key is None:
             raise OSError("no host key captured")
@@ -311,9 +319,10 @@ async def _async_inspect_candidate(
     identity: HostIdentity,
     *,
     allow_aarch64: bool = False,
+    operation_lock_held: bool = False,
 ) -> PanelFacts:
     """Authenticate only to the previously fetched identity and inspect read-only."""
-    async with _fleet_lock(hass):
+    async with nullcontext() if operation_lock_held else _fleet_lock(hass):
         shell = FleetAsyncsshShell(host, root_password, identity.public_key)
         primary: BaseException | None = None
         try:

@@ -660,12 +660,14 @@ async def test_full_migration_preserves_every_identity_and_is_idempotent(
     assert _disk_state(hass_storage) == before
     audits = no_panel_contact.await_count
 
-    outcome = await hass.services.async_call(
-        DOMAIN, "migrate_to_fleet", {"dry_run": False}, blocking=True, return_response=True
-    )
+    async with asyncio.timeout(10):
+        outcome = await hass.services.async_call(
+            DOMAIN, "migrate_to_fleet", {"dry_run": False}, blocking=True, return_response=True
+        )
     await hass.async_block_till_done()
 
     assert outcome is not None
+    assert not migration_fence(hass).operation_lock_entries
     assert outcome["status"] == "migrated"
     assert outcome["fleet_entry_id"] == ANCHOR_ID
     assert outcome["removed_entry_ids"] == list(SIBLINGS)
@@ -806,6 +808,7 @@ async def test_in_process_failure_before_commit_reverses_exactly_without_panel_c
     audits = no_panel_contact.await_count
 
     outcome = await _run(hass, dry_run=False, checkpoint=_inject(point, InjectedFailure()))
+    assert not migration_fence(hass).operation_lock_entries
     await hass.async_block_till_done()
 
     assert outcome == {"status": "reverted", "dry_run": False, "error": "unexpected_error"}
@@ -827,6 +830,7 @@ async def test_crash_before_commit_recovers_to_originals_after_restart_from_disk
 
     with pytest.raises(SimulatedCrash):
         await _run(hass, dry_run=False, checkpoint=_inject(point, SimulatedCrash()))
+    assert not migration_fence(hass).operation_lock_entries
     disk = copy.deepcopy(hass_storage)
     record = await MigrationJournal(hass).async_load()
     assert record is None or record.phase is not MigrationPhase.FLEET_VERIFIED
@@ -836,6 +840,16 @@ async def test_crash_before_commit_recovers_to_originals_after_restart_from_disk
     await _assert_originals(hass, before, hass_storage)
     assert (await _run(hass, dry_run=False))["status"] == "migrated"
     await _assert_migrated(hass, before, hass_storage)
+
+
+async def test_cancelled_migration_clears_controller_operation_lock_context(
+    hass: HomeAssistant, legacy_fleet: list[MockConfigEntry]
+) -> None:
+    del legacy_fleet
+    with pytest.raises(asyncio.CancelledError):
+        await _run(hass, dry_run=False, checkpoint=_inject("setup_fleet", asyncio.CancelledError()))
+    assert not migration_fence(hass).operation_lock_entries
+    assert not fleet_manager._shared_ssh_lock(hass).locked()
 
 
 # ------------------------------------------------------------------- after the commit point

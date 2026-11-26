@@ -3013,7 +3013,7 @@ async def test_repair_host_key_changed_without_optin_escalates_and_never_repins(
     assert failed.data["reason"] == "host_key_changed"
     assert manager.problem is True
     # The pin is UNCHANGED — no silent re-pin (the TOFU bypass).
-    assert entry.data[DATA_SSH_HOST_KEY] == "ssh-ed25519 PINNED"
+    assert entry.data[DATA_SSH_HOST_KEY] == ENTRY_DATA[DATA_SSH_HOST_KEY]
     # SECURITY INVARIANT: an unpinned shell was NEVER constructed (the factory only ever
     # saw the stored pin, never None), so the password was never offered to a new-key host.
     assert repin_shells.unpinned_shell is None
@@ -3109,7 +3109,7 @@ async def test_repin_aborts_before_unpinned_connect_when_pinned_close_is_uncerta
 
     assert unpinned_created is False
     assert unpinned.connect_count == 0
-    assert entry.data[DATA_SSH_HOST_KEY] == "ssh-ed25519 PINNED"
+    assert entry.data[DATA_SSH_HOST_KEY] == ENTRY_DATA[DATA_SSH_HOST_KEY]
 
 
 async def test_repair_repin_connect_failure_is_unreachable(
@@ -3143,7 +3143,7 @@ async def test_repair_repin_connect_failure_is_unreachable(
     assert failed.data["reason"] == "unreachable"
     assert "host_key_repinned" not in _types(events)
     # The re-pin attempt failed before any key could be persisted → pin UNCHANGED.
-    assert entry.data[DATA_SSH_HOST_KEY] == "ssh-ed25519 PINNED"
+    assert entry.data[DATA_SSH_HOST_KEY] == ENTRY_DATA[DATA_SSH_HOST_KEY]
 
     await manager.async_shutdown()
     assert manager._grace_cancel is None
@@ -3177,7 +3177,7 @@ async def test_update_host_key_changed_without_optin_raises(
     # SECURITY INVARIANT: no unpinned shell → password never offered to a new-key host.
     assert repin_shells.unpinned_shell is None
     assert None not in repin_shells.pins_seen
-    assert entry.data[DATA_SSH_HOST_KEY] == "ssh-ed25519 PINNED"
+    assert entry.data[DATA_SSH_HOST_KEY] == ENTRY_DATA[DATA_SSH_HOST_KEY]
     assert manager._recovery_cancel is None
     assert manager._repairing is False
 

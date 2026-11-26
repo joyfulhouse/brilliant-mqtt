@@ -192,7 +192,10 @@
       "wrong_panel": "That host already runs a different Brilliant panel's agent. Check the IP \u2014 applying here would overwrite and restart the wrong panel.",
       "host_key_changed": "The panel's SSH host key changed. For a fleet panel, verify the physical replacement and use Replace physical panel for an explicit identity rebind. For a legacy entry, remove and re-add the verified panel to re-pin it. If the change is unexpected, do not continue; check the address and network for impersonation.",
       "invalid_cadence": "Enter a whole number of seconds within the documented range.",
-      "broker_host_not_panel_reachable": "Panels on the LAN cannot use this broker host. Home Assistant add-on names such as core-mosquitto, names ending in .local.hass.io, a0d7b954- names, and localhost work only inside Home Assistant. Enter the Home Assistant host's LAN IP address or a hostname the panels can resolve, then retry."
+      "broker_host_not_panel_reachable": "Panels on the LAN cannot use this broker host. Home Assistant add-on names such as core-mosquitto, names ending in .local.hass.io, a0d7b954- names, and localhost work only inside Home Assistant. Enter the Home Assistant host's LAN IP address or a hostname the panels can resolve, then retry.",
+      "address_change_incomplete": "The connection change is incomplete. Re-run Change network address (Connection for a legacy entry) and verify the current SSH login. Recovery stays deferred until the connection is saved.",
+      "baseline_owner_mismatch": "The retained baseline belongs to a different panel or configuration owner. Verify the original entry and use its connection form; a replacement entry cannot inherit recovery.",
+      "parent_changed": "The panel connection or its original configuration owner changed during verification. Open the connection form again and retry."
     },
     "abort": {
       "already_configured": "A Brilliant MQTT fleet is already configured.",
@@ -447,7 +450,10 @@
         "baseline_capture_interrupted": "Baseline capture was interrupted and a rollback baseline may remain on the panel. Preserve any journal and baseline, and follow docs/canary-rollback.md before retrying.",
         "ownerless_recovery_unavailable": "This retained baseline is owned, still in use, or not verified restored. Preserve the journal and baseline. Finish recovery or use the owning panel's canary actions; do not delete private storage to retry.",
         "ownerless_finalize_reauthentication_required": "Retained baseline cleanup requires fresh authentication. Start Add Brilliant panel again with the panel address and root password, verify its pinned identity, and explicitly confirm cleanup. Interrupted cleanup remains retained.",
-        "aarch64_opt_in_required": "Check the box to continue with this experimental i350 / aarch64 panel, or go back to cancel."
+        "aarch64_opt_in_required": "Check the box to continue with this experimental i350 / aarch64 panel, or go back to cancel.",
+        "address_change_incomplete": "The connection change is incomplete. Re-run Change network address (Connection for a legacy entry) and verify the current SSH login. Recovery stays deferred until the connection is saved.",
+        "baseline_owner_mismatch": "The retained baseline belongs to a different panel or configuration owner. Verify the original entry and use its connection form; a replacement entry cannot inherit recovery.",
+        "parent_changed": "The panel connection or its original configuration owner changed during verification. Open the connection form again and retry."
       },
       "abort": {
         "already_configured": "Panel `{panel_name}` is already configured.",
@@ -491,7 +497,7 @@
           "trust_host_key_changes": "Trust host-key changes (auto-re-pin on reflash)"
         },
         "data_description": {
-          "trust_host_key_changes": "When on, repair auto-trusts a changed SSH host key so a firmware update that rotates the panel's keys recovers hands-off. This offers the root password to whatever host answers at the panel's address, so only enable on a trusted/isolated network (e.g. a firewalled IoT VLAN). Each automatic re-pin fires a host_key_repinned event you can alert on. Default off: a changed key instead surfaces repair_failed (host_key_changed) and asks you to Reconfigure to re-pin."
+          "trust_host_key_changes": "When on, repair auto-trusts a changed SSH host key so a firmware update that rotates the panel's keys recovers hands-off. This offers the root password to whatever host answers at the panel's address, so only enable on a trusted/isolated network (e.g. a firewalled IoT VLAN). Each automatic re-pin fires a host_key_repinned event you can alert on. Default off: a changed key instead surfaces repair_failed (host_key_changed) and asks you to verify the changed key before proceeding. Legacy Connection does not accept a new host key."
         }
       },
       "broker": {
@@ -848,6 +854,10 @@
     "migration_quiet_state_unwritable": {
       "title": "Brilliant restored panels stay in quiet mode",
       "description": "Home Assistant cannot read or update `.storage/brilliant_mqtt.migration_quiet`, which records Brilliant legacy entries restored by a migration that must start without contacting their panel. Until it can, those entries keep starting quietly and their one-time legacy HA-mirror retirement audit stays deferred. Check the storage directory's permissions and free space, then restart Home Assistant."
+    },
+    "address_change_incomplete": {
+      "title": "Panel connection change needs verification",
+      "description": "The connection change for {panel} is incomplete. Re-run {action} and supply the current panel login. Recovery remains deferred until verification and durable storage complete. If the original entry was removed, preserve the recovery evidence; recreating an entry does not transfer ownership."
     }
   }
 }

@@ -29,6 +29,7 @@ from custom_components.brilliant_mqtt.provisioning_journal import (
     ProvisioningOperation,
     ProvisioningPhase,
     ProvisioningRecord,
+    RetainedRollback,
     Store,
 )
 from custom_components.brilliant_mqtt.shell import HostIdentity, PanelIdentityError, PanelShell
@@ -421,8 +422,10 @@ async def test_named_rollback_recovery_rejects_foreign_owner(
 ) -> None:
     from functools import partial
 
+    from homeassistant.helpers import issue_registry as ir
+
     from custom_components.brilliant_mqtt import fleet_manager
-    from custom_components.brilliant_mqtt.entry_data import EntryDataError
+    from custom_components.brilliant_mqtt.const import DOMAIN
     from tests.test_fleet_manager import _panel, _provisioning_entry
 
     shell = RehearsalShell(tmp_path)
@@ -440,17 +443,30 @@ async def test_named_rollback_recovery_rejects_foreign_owner(
     )
     entry.add_to_hass(hass)
     before = await journal.async_load()
+    retained_before = await journal.async_retained(record.transaction_id)
     if route == "fleet":
         manager = fleet_manager.FleetManager(hass, entry)
-        with pytest.raises(EntryDataError, match="rollback_credentials_unavailable"):
-            await manager._async_prepare_provisioning()
+        await manager._async_prepare_provisioning()
+        assert manager._recovery_task is None
+        assert (
+            ir.async_get(hass).async_get_issue(
+                DOMAIN, fleet_manager._provisioning_repair_issue_id(record.transaction_id)
+            )
+            is not None
+        )
     else:
-        provisioner = _Harness().provisioner()
+        harness = _Harness()
+        provisioner = harness.provisioner()
         provisioner._journal = journal
         provisioner._credential_resolver = partial(fleet_manager._async_rollback_credential, hass)
-        with pytest.raises(PanelProvisioningError, match="rollback_credentials_unavailable"):
+        provisioner._recovery_authorizer = partial(
+            fleet_manager._async_authorize_recorded_recovery, hass
+        )
+        with pytest.raises(PanelProvisioningError, match="provisioning_recovery_required"):
             await provisioner.async_recover()
+        assert not any(event[0] == "shell_factory" for event in harness.events)
     assert await journal.async_load() == before
+    assert await journal.async_retained(record.transaction_id) == retained_before
 
 
 @pytest.mark.parametrize("policy", ["blocked", "unchanged", "override", "auto"])
@@ -1113,6 +1129,8 @@ async def test_owned_managed_update_schedules_restart_recovery(
     assert recorded is not None
     recorded = replace(recorded, phase=phase)
     journal = Mock(
+        async_connection_intents=AsyncMock(return_value=()),
+        async_assert_connection_available=AsyncMock(),
         async_retained_records=AsyncMock(return_value=()),
         async_load=AsyncMock(return_value=recorded),
     )
@@ -1227,9 +1245,18 @@ async def test_crash_recovery_replays_real_restore_and_finalize(
     async def crash(*args: object, **kwargs: object) -> None:
         raise RuntimeError("simulated process loss")
 
+    before_contact = tuple(shell.commands)
     with monkeypatch.context() as fault:
         if crash_point == "intent":
-            fault.setattr(ProvisioningJournal, "async_begin_restore", crash)
+            begin_restore = ProvisioningJournal.async_begin_scoped_restore
+
+            async def crash_after_intent(
+                current: ProvisioningJournal, expected: RetainedRollback
+            ) -> None:
+                await begin_restore(current, expected)
+                raise RuntimeError("simulated process loss")
+
+            fault.setattr(ProvisioningJournal, "async_begin_scoped_restore", crash_after_intent)
         elif crash_point == "restore":
             original_source = panel_ops._identity_source
 
@@ -1249,6 +1276,12 @@ async def test_crash_recovery_replays_real_restore_and_finalize(
                 await provisioner.async_finalize(record.transaction_id)
             else:
                 await provisioner.async_rollback(record.transaction_id)
+    if crash_point == "intent":
+        interrupted = await journal.async_retained(record.transaction_id)
+        assert interrupted is not None and interrupted.state == "restore_requested"
+        assert interrupted.recovery_record is not None
+        assert interrupted.record.prior_snapshot == record.prior_snapshot
+        assert tuple(shell.commands) == before_contact
     # A new journal view and the existing runner settle durable intent after restart.
     provisioner._journal = ProvisioningJournal(hass)
     await provisioner.async_recover()
@@ -2164,7 +2197,7 @@ async def test_restart_during_ownerless_recovery_stays_durable_and_resumable(
     assert "SECRET" not in json.dumps(settled._to_storage())
 
 
-async def test_stuck_journal_blocks_unrelated_panels_with_actionable_code_and_serializes(
+async def test_stuck_journal_blocks_new_updates_and_serializes_independent_finalize(
     hass: HomeAssistant, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from uuid import UUID
@@ -2205,9 +2238,22 @@ async def test_stuck_journal_blocks_unrelated_panels_with_actionable_code_and_se
     identity = _identity_for(record)
     provisioner._identity_fetcher = AsyncMock(return_value=identity)
 
-    # Unrelated operations are refused with an actionable, typed reason.
-    with pytest.raises(PanelProvisioningError, match="provisioning_recovery_required"):
-        await provisioner.async_finalize(other.transaction_id)
+    active_before = await journal.async_load()
+    ownerless_before = await journal.async_retained(record.transaction_id)
+    await provisioner.async_finalize(other.transaction_id)
+    assert await journal.async_load() == active_before
+    assert await journal.async_retained(record.transaction_id) == ownerless_before
+    assert await journal.async_retained(other.transaction_id) is None
+
+    # Arm a new independent baseline to exercise the queued finalization below.
+    next_snapshot = await panel_ops.capture_baseline(back, await panel_ops.snapshot_panel(back))
+    other = replace(
+        other, transaction_id=uuid4(), prior_snapshot=stored_snapshot_from_panel(next_snapshot)
+    )
+    await journal.async_arm(other)
+    await journal.async_retained_state(other.transaction_id, "soak")
+
+    # New provisioning still needs the one active slot and refuses with a typed reason.
     async with provisioner._lock:
         with pytest.raises(PanelProvisioningError, match="provisioning_recovery_required"):
             async with provisioner.async_managed_update(

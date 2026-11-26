@@ -108,7 +108,7 @@ def isolated_manager_canary_dependency(
 
 
 # The key an unpinned re-pin connect captures (mirrors the rotated server key).
-REPIN_NEW_KEY = "ssh-ed25519 NEWKEY"
+REPIN_NEW_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIG/koBYdTnHujqIpcXlQkQqzGBoZJ6Y4rm22iGIdAu4B"
 
 
 @dataclass
@@ -289,7 +289,7 @@ def installed_voice_entry(hass: HomeAssistant) -> MockConfigEntry:
         CONF_MQTT_USERNAME: "brilliant",
         CONF_MQTT_PASSWORD: "mqttpass",
         CONF_MESH_PRIORITY: 0,
-        DATA_SSH_HOST_KEY: "ssh-ed25519 STORED",
+        DATA_SSH_HOST_KEY: ENTRY_DATA[DATA_SSH_HOST_KEY],
         CONF_COMPONENTS: {COMPONENT_BRIDGE: True, COMPONENT_VOICE: True},
         CONF_VOICE_WAKE_WORD: "okay_nabu",
         CONF_VOICE_HA_HOST: "",
@@ -297,3 +297,42 @@ def installed_voice_entry(hass: HomeAssistant) -> MockConfigEntry:
     entry = MockConfigEntry(domain=DOMAIN, unique_id="office", data=data, version=2)
     entry.add_to_hass(hass)
     return entry
+
+
+@pytest.fixture
+def durable_connection_storage(
+    hass: HomeAssistant, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[None]:
+    """Use the production disk loader behind an offline atomic writer."""
+    hass.config.config_dir = str(tmp_path)
+    from homeassistant.helpers import json as json_util
+    from homeassistant.helpers.storage import Store as HAStore
+
+    from custom_components.brilliant_mqtt.provisioning_journal import Store
+
+    original = HAStore._async_write_data
+
+    async def write(store: HAStore[Any], data: dict[str, Any]) -> None:
+        if "data_func" in data:
+            data = {**data, "data": data["data_func"]()}
+            del data["data_func"]
+
+        def persist() -> None:
+            Path(store.path).parent.mkdir(parents=True, exist_ok=True)
+            json_util.save_json(store.path, data, private=True, atomic_writes=True)
+
+        await hass.async_add_executor_job(persist)
+
+    async def core_write(store: HAStore[Any], data: dict[str, Any]) -> None:
+        if store.key == "core.config_entries":
+            await write(store, data)
+        else:
+            await original(store, data)
+
+    async def remove(store: Store) -> None:
+        await hass.async_add_executor_job(Path(store.path).unlink, True)
+
+    monkeypatch.setattr(Store, "_async_write_data", write)
+    monkeypatch.setattr(Store, "async_remove", remove)
+    with patch.object(HAStore, "_async_write_data", core_write):
+        yield

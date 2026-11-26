@@ -18,6 +18,7 @@ from homeassistant.config_entries import ConfigEntry, ConfigFlow, ConfigFlowResu
 
 from .. import panel_ops
 from ..components import REGISTRY, optional
+from ..connection_owner import ConnectionOwnershipError, PanelConnectionOwner
 from ..const import (
     COMPONENT_BRIDGE,
     COMPONENT_HA_MIRROR,
@@ -41,6 +42,7 @@ from ..const import (
     ENTRY_KIND_FLEET,
 )
 from ..migration_coordinator import migration_blocks_entry_writes
+from ..provisioning_journal import ProvisioningJournalError
 from ..voice_payload import VoicePayloadError
 from . import gateway
 from .schemas import (
@@ -128,6 +130,49 @@ class LegacyPanelReconfigureFlow(_Base):
         desired_components: dict[str, bool] | None = None,
         remove_keys: frozenset[str] = frozenset(),
     ) -> tuple[dict[str, str], ConfigFlowResult | None]:
+        from ..fleet_manager import _shared_ssh_lock
+
+        if not isinstance(entry.data.get(DATA_SSH_HOST_KEY), str):
+            return {"base": "host_key_changed"}, None
+        try:
+            owner = PanelConnectionOwner(self.hass, entry)
+        except ConnectionOwnershipError as error:
+            return {"base": error.code}, None
+        async with _shared_ssh_lock(self.hass):
+            try:
+                owner.assert_current()
+                if CONF_HOST in updates or CONF_ROOT_PASSWORD in updates:
+                    owner.assert_unique()
+                else:
+                    await owner.journal.async_assert_connection_available(owner=owner.owner)
+                return await self._async_apply_legacy_section_locked(
+                    entry,
+                    updates,
+                    owner=owner,
+                    control_values=control_values,
+                    desired_components=desired_components,
+                    remove_keys=remove_keys,
+                )
+            except ConnectionOwnershipError as error:
+                return {"base": error.code}, None
+            except ProvisioningJournalError as error:
+                code = (
+                    error.code
+                    if error.code in {"address_change_incomplete", "baseline_owner_mismatch"}
+                    else "address_change_incomplete"
+                )
+                return {"base": code}, None
+
+    async def _async_apply_legacy_section_locked(
+        self,
+        entry: ConfigEntry[Any],
+        updates: dict[str, Any],
+        *,
+        owner: PanelConnectionOwner,
+        control_values: dict[str, Any] | None = None,
+        desired_components: dict[str, bool] | None = None,
+        remove_keys: frozenset[str] = frozenset(),
+    ) -> tuple[dict[str, str], ConfigFlowResult | None]:
         """Push the merged config to the panel, then persist one section's edits.
 
         ``updates``/``control_values`` arrive with blank secrets already resolved
@@ -142,12 +187,8 @@ class LegacyPanelReconfigureFlow(_Base):
         host = str(merged[CONF_HOST])
         password = str(merged[CONF_ROOT_PASSWORD])
         panel = str(data[CONF_PANEL])
-        # Same host → verify against the STORED pin (key checked before auth, so
-        # the password is never offered to a changed/impostor host). Different
-        # host → new endpoint/hardware → fresh TOFU.
-        host_unchanged = host == data[CONF_HOST]
-        pinned_key = data.get(DATA_SSH_HOST_KEY) if host_unchanged else None
-        if host_unchanged and pinned_key is None:
+        pinned_key = data.get(DATA_SSH_HOST_KEY)
+        if pinned_key is None:
             # Defense-in-depth: same host but no stored pin (not reachable today
             # — every entry-write pins). Fail closed: an unpinned connect here
             # would re-offer the root password to an unverified host.
@@ -171,6 +212,7 @@ class LegacyPanelReconfigureFlow(_Base):
                 pinned_key=pinned_key,
                 env_content=env,
                 expected_panel=panel,
+                operation_lock_held=True,
             )
         except gateway._WrongPanelError:
             # The host runs a DIFFERENT panel's agent (likely a mistyped
@@ -204,6 +246,7 @@ class LegacyPanelReconfigureFlow(_Base):
                         host,
                         password,
                         host_key,
+                        operation_lock_held=True,
                     ) as shell:
                         if now:
                             await REGISTRY[component.id].install(self.hass, shell, new_data)
@@ -213,6 +256,19 @@ class LegacyPanelReconfigureFlow(_Base):
                 return {"base": "cannot_install_voice"}, None
             except (OSError, asyncssh.Error, panel_ops.PanelOpError):
                 return {"base": "cannot_apply"}, None
+        owner.assert_current()
+        if CONF_HOST in updates or CONF_ROOT_PASSWORD in updates:
+            from ..connection_owner import canonical_connection_key
+
+            if canonical_connection_key(host_key) != owner.owner.public_key:
+                return {"base": "host_key_changed"}, None
+            await owner.async_commit(host=host, password=password)
+            return {}, self.async_abort(reason="reconfigure_successful")
+        new_data = {**owner.live_data(), **updates}
+        if desired_components is not None:
+            new_data[CONF_COMPONENTS] = desired_components
+        for key in remove_keys:
+            new_data.pop(key, None)
         if control_values is not None:
             new_data.update(control_values)
             for fleet_entry in self.hass.config_entries.async_entries(DOMAIN):
@@ -253,9 +309,8 @@ class LegacyPanelReconfigureFlow(_Base):
             return self.async_abort(reason=self._reconfigure_unavailable())
         errors: dict[str, str] = {}
         if user_input is not None:
-            # Reject control chars on the RAW input first, THEN strip benign
-            # surrounding whitespace — otherwise a stray trailing space would read
-            # as a "different" host and downgrade the pinned check to a fresh TOFU.
+            # Reject control chars before normalizing outer whitespace. The stored
+            # pin remains mandatory for every address, including a changed host.
             errors = control_char_errors(
                 user_input,
                 (CONF_HOST, CONF_ROOT_PASSWORD),

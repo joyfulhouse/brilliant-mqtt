@@ -39,6 +39,7 @@ from homeassistant.helpers.event import async_call_later
 from . import panel_ops
 from .broker import PanelBrokerReleaseSettings
 from .certificates import canonical_hue_ca_certificate
+from .connection_owner import PanelConnectionOwner
 from .const import (
     AVAILABILITY_OFFLINE,
     AVAILABILITY_ONLINE,
@@ -651,8 +652,9 @@ class PanelManager:
         """Return architecture-appropriate recovery without unsafe fleet advice."""
         if isinstance(self.store, LegacyPanelStore):
             return (
-                "panel SSH host key changed — open Reconfigure to re-pin, or "
-                "enable 'Trust host-key changes' in options"
+                "panel SSH host key changed — verify the address and physical panel; "
+                "for an intended replacement, remove and re-add the verified legacy panel. "
+                "Connection accepts only the existing key"
             )
         return (
             "panel SSH host key changed — verify the configured address; for a "
@@ -696,6 +698,22 @@ class PanelManager:
         if not await self._async_close_shell(shell):
             raise OSError("panel SSH session could not be closed") from None
 
+    async def _async_admit_connection(self) -> PanelConnectionOwner:
+        from .connection_owner import ConnectionOwnershipError
+        from .provisioning_journal import ProvisioningJournalError
+
+        if not isinstance(self.store, (FleetPanelStore, LegacyPanelStore)):
+            raise PanelOpError("invalid_panel_configuration_store")
+        try:
+            owner = PanelConnectionOwner(
+                self.hass, self.store.entry, getattr(self.store, "subentry", None)
+            )
+            await owner.journal.async_assert_connection_available(owner=owner.owner)
+            owner.assert_current()
+        except (ProvisioningJournalError, ConnectionOwnershipError) as error:
+            raise PanelOpError(error.code) from None
+        return owner
+
     async def _connect_for_repair(self, trace: _ConnectTrace | None = None) -> PanelShell:
         """Connect for a management op, honoring the host-key trust policy.
 
@@ -708,6 +726,7 @@ class PanelManager:
             to the entry, fire EVENT_HOST_KEY_REPINNED, return the connected shell.
         Any other connect failure propagates unchanged to the caller's handler.
         """
+        owner = await self._async_admit_connection()
         shell = self._shell()
         try:
             await shell.connect()
@@ -737,7 +756,12 @@ class PanelManager:
                 # not caused by the host-key mismatch — chain to None, and it reaches
                 # the caller's (OSError, asyncssh.Error) handler as "unreachable".
                 raise OSError("no host key captured on re-pin") from None
-            self.store.update_data({**self.store.data, DATA_SSH_HOST_KEY: new_key})
+            try:
+                owner.assert_current()
+                self.store.update_data({**owner.live_data(), DATA_SSH_HOST_KEY: new_key})
+            except ValueError:
+                await self._async_close_shell_or_raise(repinned)
+                raise PanelOpError("parent_changed") from None
             self._fire(EVENT_HOST_KEY_REPINNED, {"new_host_key": new_key})
             return repinned
         except asyncio.CancelledError:
@@ -748,6 +772,11 @@ class PanelManager:
                 trace.reached_auth = shell.connect_reached_auth()
             await self._async_close_shell_or_raise(shell)
             raise
+        try:
+            owner.assert_current()
+        except ValueError:
+            await self._async_close_shell_or_raise(shell)
+            raise PanelOpError("parent_changed") from None
         return shell
 
     def _set_update_connect_retry(self, state: dict[str, Any] | None) -> None:
@@ -1794,25 +1823,33 @@ class PanelManager:
 
         try:
             transaction = UUID(name)
+            owner = await self._async_admit_connection()
             retained = await ProvisioningJournal(self.hass).async_retained(transaction)
             if retained is None:
-                raise ValueError("baseline_missing")
+                raise PanelOpError("baseline_missing")
             request = retained.record.panel_request
             if (
                 request.slug != self.panel
                 or request.host != self.store.data[CONF_HOST]
-                or request.public_key != self.store.data.get(DATA_SSH_HOST_KEY)
+                or request.public_key != owner.owner.public_key
             ):
-                raise ValueError("baseline_owner_mismatch")
+                raise PanelOpError("baseline_owner_mismatch")
+            if request.bound_owner is not None and request.bound_owner != owner.owner:
+                raise PanelOpError("baseline_owner_mismatch")
             provisioner = _get_recovery_provisioner(self.hass)
             if operation == "rollback":
-                await provisioner.async_rollback(transaction)
+                await provisioner.async_rollback(transaction, expected_owner=owner.owner)
             elif operation == "finalize":
-                await provisioner.async_finalize(transaction)
+                await provisioner.async_finalize(transaction, expected_owner=owner.owner)
             else:
                 raise ValueError("invalid_canary_operation")
         except Exception as error:
             code = getattr(error, "code", "canary_operation_failed")
+            if isinstance(error, PanelOpError) and str(error) in {
+                "address_change_incomplete",
+                "baseline_owner_mismatch",
+            }:
+                code = str(error)
             if not isinstance(code, str) or re.fullmatch(r"[a-z_]{1,64}", code) is None:
                 code = "canary_operation_failed"
             raise HomeAssistantError(f"{code}: see docs/canary-rollback.md") from None
@@ -2473,6 +2510,7 @@ class PanelManager:
                 if self._broker_unavailable():
                     self._defer_recovery_verdict()
                     return
+                await self._async_admit_connection()
                 shell = self._shell()
                 await shell.connect()
                 try:
@@ -2565,6 +2603,7 @@ class PanelManager:
         """Post-OTA hygiene when the bridge survived: re-write /etc + staged copies."""
         try:
             async with self._ssh_lock:
+                await self._async_admit_connection()
                 shell = self._shell()
                 await shell.connect()
                 try:

@@ -11,8 +11,8 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers import issue_registry as ir
 
 from custom_components.brilliant_mqtt import fleet_manager as fm
+from custom_components.brilliant_mqtt.connection_state import PanelOwner
 from custom_components.brilliant_mqtt.const import CONF_HOST, CONF_ROOT_PASSWORD, DOMAIN
-from custom_components.brilliant_mqtt.entry_data import EntryDataError
 from custom_components.brilliant_mqtt.panel_provisioner import PanelProvisioningError
 from custom_components.brilliant_mqtt.provisioning_journal import (
     JOURNAL_STORAGE_KEY,
@@ -102,6 +102,11 @@ async def test_fleet_recovery_keeps_ownerless_marker_separate_and_rechecks_owner
     await journal.async_create(second)
     if reject_when == "finalize":
         await journal.async_complete_cleanup(second.transaction_id)
+        row = await journal.async_retained(second.transaction_id)
+        assert row is not None
+        await journal.async_bind_retained(
+            row, PanelOwner(entry.entry_id, "panel-kitchen", "kitchen", _OTHER_PUBLIC_KEY)
+        )
         await journal.async_retained_state(second.transaction_id, "finalizing")
     harness = _Harness()
     monkeypatch.setattr(harness, "journal", journal)
@@ -123,8 +128,7 @@ async def test_fleet_recovery_keeps_ownerless_marker_separate_and_rechecks_owner
     monkeypatch.setattr(fleet, "_async_authorize_background_recovery", locked_authorize)
     monkeypatch.setattr(fleet, "_async_schedule_reload_once", Mock())
     if reject_when == "before":
-        with pytest.raises(EntryDataError, match="provisioning_ownership_mismatch"):
-            await fleet._async_reconcile()
+        await fleet._async_reconcile()
         assert fleet._recovery_task is None
     else:
         await fleet._async_prepare_provisioning()
@@ -219,6 +223,16 @@ async def test_queued_explicit_rollback_revalidates_its_current_authority(
             selected_components=("bridge", "bus_watchdog", "wifi_watchdog"),
         ),
     )
+    if not onboarding:
+        original = replace(
+            original,
+            panel_request=replace(
+                original.panel_request,
+                bound_owner=PanelOwner(
+                    entry.entry_id, "panel-kitchen", "kitchen", _OTHER_PUBLIC_KEY
+                ),
+            ),
+        )
     await journal.async_create(original)
     if not onboarding:
         await journal.async_complete_cleanup(original.transaction_id)
@@ -309,6 +323,16 @@ async def test_production_generic_recovery_requires_current_operation_authority(
             fingerprint=_OTHER_FINGERPRINT,
         ),
     )
+    if operation is ProvisioningOperation.ROLLBACK:
+        second = replace(
+            second,
+            panel_request=replace(
+                second.panel_request,
+                bound_owner=PanelOwner(
+                    entry.entry_id, "panel-kitchen", "kitchen", _OTHER_PUBLIC_KEY
+                ),
+            ),
+        )
     await journal.async_create(second)
     if operation in {ProvisioningOperation.ROLLBACK, ProvisioningOperation.ONBOARDING_ROLLBACK}:
         if operation is ProvisioningOperation.ROLLBACK:
@@ -399,6 +423,16 @@ async def test_production_authorizer_accepts_current_operation_authority(
                 fingerprint=_OTHER_FINGERPRINT,
                 root_password="kitchen-secret",
                 selected_components=("bridge", "bus_watchdog", "wifi_watchdog"),
+            ),
+        )
+    if operation is ProvisioningOperation.ROLLBACK:
+        record = replace(
+            record,
+            panel_request=replace(
+                record.panel_request,
+                bound_owner=PanelOwner(
+                    entry.entry_id, "panel-kitchen", "kitchen", _OTHER_PUBLIC_KEY
+                ),
             ),
         )
     await journal.async_create(record)

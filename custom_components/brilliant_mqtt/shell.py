@@ -292,7 +292,7 @@ def _verification_host_key_algorithms(public_key: str) -> tuple[str, ...]:
     return (*_RSA_HOST_KEY_ALGORITHMS, *_ED25519_HOST_KEY_ALGORITHMS)
 
 
-def _legacy_known_hosts_line(host: str, public_key: str) -> str:
+def canonical_legacy_public_key(public_key: object) -> str:
     """Validate old persisted pins without imposing the new fleet allowlist."""
     if not isinstance(public_key, str):
         raise PanelIdentityError("host_key_malformed")
@@ -312,7 +312,12 @@ def _legacy_known_hosts_line(host: str, public_key: str) -> str:
         raise PanelIdentityError("host_key_malformed") from None
     if round_trip != canonical:
         raise PanelIdentityError("host_key_malformed")
-    return f"{_validate_host(host)} {canonical}\n"
+    return canonical
+
+
+def _legacy_known_hosts_line(host: str, public_key: str) -> str:
+    """Pin the legacy host using the same validated key identity as ownership reads."""
+    return f"{_validate_host(host)} {canonical_legacy_public_key(public_key)}\n"
 
 
 async def _async_fetch_host_identity(

@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from collections.abc import Awaitable, Callable, Coroutine, Iterable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterable, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from functools import partial
 from types import MappingProxyType
@@ -88,6 +89,7 @@ from .panel_provisioner import (
 from .plugin_catalog import configured_plugin_catalog
 from .provisioning_journal import (
     ProvisioningJournal,
+    ProvisioningJournalError,
     ProvisioningOperation,
     ProvisioningPhase,
     ProvisioningRecord,
@@ -656,6 +658,22 @@ async def _async_rollback_credential(
     hass: HomeAssistant, request: StoredPanelRequest
 ) -> str | None:
     """Resolve the login only from a current, exactly matching config owner."""
+    await ProvisioningJournal(hass).async_assert_connection_available(
+        owner=request.bound_owner, request=request
+    )
+    if request.bound_owner is not None:
+        from .connection_owner import async_resolve_panel_owner
+
+        try:
+            owner = await async_resolve_panel_owner(hass, request)
+        except ValueError:
+            return None
+        entry = hass.config_entries.async_get_entry(owner.entry_id)
+        if entry is None:
+            return None
+        data = entry.data if owner.subentry_id is None else entry.subentries[owner.subentry_id].data
+        password = data.get(CONF_ROOT_PASSWORD)
+        return password if isinstance(password, str) else None
     matches: list[str] = []
     for entry in hass.config_entries.async_entries(DOMAIN):
         owners = (
@@ -699,6 +717,15 @@ async def _async_authorize_recorded_recovery(
     expected_entry: ConfigEntry[Any] | None = None,
 ) -> None:
     """Prove current operation authority before using recorded panel credentials."""
+    from .connection_owner import async_reconcile_connection_issues
+
+    try:
+        await ProvisioningJournal(hass).async_assert_connection_available(
+            request=record.panel_request
+        )
+    except ProvisioningJournalError as error:
+        await async_reconcile_connection_issues(hass)
+        raise PanelProvisioningError(error.code) from None
     try:
         if record.operation is ProvisioningOperation.UPDATE:
             owner, _panel_id = _managed_update_owner(hass, record)
@@ -724,6 +751,8 @@ async def _async_authorize_recorded_recovery(
             }:
                 raise EntryDataError("provisioning_ownership_mismatch")
         elif record.operation is ProvisioningOperation.ROLLBACK:
+            if record.panel_request.bound_owner is None:
+                raise PanelProvisioningError("provisioning_recovery_required")
             password = await _async_rollback_credential(hass, record.panel_request)
             if password is None or password != record.panel_request.root_password:
                 raise PanelProvisioningError("rollback_credentials_unavailable")
@@ -751,6 +780,8 @@ def _build_panel_provisioner(
         hass,
         lambda profile, client_id: profile.device_client(client_id),
     )
+    from .connection_owner import async_resolve_panel_owner
+
     return PanelProvisioner(
         operation_lock=_shared_ssh_lock(hass),
         journal=ProvisioningJournal(hass),
@@ -767,6 +798,8 @@ def _build_panel_provisioner(
         broker_validator=validator,
         health_observer_factory=partial(PanelHealthObserver, hass),
         credential_resolver=partial(_async_rollback_credential, hass),
+        named_owner_resolver=partial(async_resolve_panel_owner, hass),
+        connection_admission=ProvisioningJournal(hass).async_assert_connection_available,
         recovery_authorizer=recovery_authorizer
         or partial(_async_authorize_recorded_recovery, hass),
         retained_owner_exists=partial(_async_retained_owner_exists, hass),
@@ -796,6 +829,12 @@ async def _async_authorize_removed_recovery(
     current: ProvisioningRecord,
 ) -> None:
     """Limit a removal hook's authority to its exact journal and retired owner."""
+    try:
+        await ProvisioningJournal(hass).async_assert_connection_available(
+            owner=current.panel_request.bound_owner, request=current.panel_request
+        )
+    except ProvisioningJournalError as error:
+        raise PanelProvisioningError(error.code) from None
     if (
         current != expected
         or hass.config_entries.async_get_entry(removed_entry.entry_id) is not None
@@ -890,7 +929,12 @@ async def _async_recover_removed_entry(
     record: ProvisioningRecord | None = None
     try:
         journal = ProvisioningJournal(hass)
+        from .connection_owner import async_reconcile_connection_issues
+
+        await async_reconcile_connection_issues(hass)
         record = await journal.async_load()
+        if record is not None:
+            await journal.async_assert_connection_available(request=record.panel_request)
         if record is None or not _is_exact_fleet_entry(entry):
             return
         if _has_other_domain_entry(hass, entry):
@@ -929,7 +973,12 @@ async def _async_recover_removed_entry(
                 return
             _async_abort_owned_panel_flows(hass, entry, record.transaction_id)
             try:
-                await journal.async_clear_committed(record.transaction_id)
+                async with _shared_ssh_lock(hass):
+                    fresh = await journal.async_load()
+                    if fresh != record:
+                        raise PanelProvisioningError("provisioning_recovery_required")
+                    await journal.async_assert_connection_available(request=record.panel_request)
+                    await journal.async_clear_committed(record.transaction_id)
             except Exception:
                 if await journal.async_load() is not None:
                     raise
@@ -983,7 +1032,13 @@ async def _async_recover_removed_entry(
         )
     except asyncio.CancelledError:
         raise
-    except Exception:
+    except Exception as error:
+        if (
+            isinstance(error, (ProvisioningJournalError, PanelProvisioningError))
+            and error.code == "address_change_incomplete"
+        ):
+            await async_reconcile_connection_issues(hass)
+            return
         if record is not None:
             await _ProvisioningRepairReporter(hass).async_report_rollback_failure(
                 record.transaction_id,
@@ -1158,6 +1213,8 @@ class FleetManager:
         # legacy HA-mirror retirement audit runs again on the next ordinary setup).
         self._defer_setup_panel_contact = defer_setup_panel_contact
         self._ssh_lock = _shared_ssh_lock(hass)
+        self._deferred_panel_ids: set[str] = set()
+        self._connection_reconcile_task: asyncio.Task[None] | None = None
         self._lifecycle_lock = asyncio.Lock()
         self._panels: dict[str, PanelManager] = {}
         self._panels_view: Mapping[str, PanelManager] = MappingProxyType(self._panels)
@@ -1344,28 +1401,136 @@ class FleetManager:
         )
 
     async def _async_prepare_provisioning(self) -> None:
+        from .migration_coordinator import migration_fence
+
+        # Migration waits for these setups while holding the same operation lock.
+        if self.entry.entry_id in migration_fence(self.hass).operation_lock_entries:
+            await self._async_prepare_provisioning_locked()
+            return
+        async with self._ssh_lock:
+            await self._async_prepare_provisioning_locked()
+
+    @asynccontextmanager
+    async def _async_admitted_lifecycle(self) -> AsyncIterator[None]:
+        """Publish one admitted snapshot without waiting for SSH under lifecycle."""
+        from .migration_coordinator import migration_fence
+
+        inherited = self.entry.entry_id in migration_fence(self.hass).operation_lock_entries
+        if inherited:
+            async with self._lifecycle_lock:
+                if not self._shutting_down:
+                    await self._async_prepare_provisioning_locked()
+                yield
+            return
+        await self._async_acquire_operation_lifecycle()
+        try:
+            try:
+                if not self._shutting_down:
+                    await self._async_prepare_provisioning_locked()
+            finally:
+                self._ssh_lock.release()
+            yield
+        finally:
+            self._lifecycle_lock.release()
+
+    async def _async_acquire_operation_lifecycle(self) -> None:
+        """Acquire both locks without holding SSH while an existing lifecycle drains."""
+        while True:
+            await self._ssh_lock.acquire()
+            try:
+                if not self._lifecycle_lock.locked():
+                    await self._lifecycle_lock.acquire()
+                    return
+            except BaseException:
+                self._ssh_lock.release()
+                raise
+            # An existing lifecycle may still need SSH to complete its handoff.
+            self._ssh_lock.release()
+            async with self._lifecycle_lock:
+                pass
+
+    async def _async_prepare_provisioning_locked(self) -> None:
         """Bind cheap handoffs now and schedule orphan network recovery separately."""
         self._pending_handoff = None
         journal = ProvisioningJournal(self.hass)
         try:
+            from .connection_owner import async_reconcile_connection_issues
+
+            intents = await journal.async_connection_intents()
+            await async_reconcile_connection_issues(self.hass)
+            self._deferred_panel_ids = set()
+            for item in intents:
+                for panel_id, data in (
+                    [(panel.subentry_id, panel.data) for panel in self.entry.subentries.values()]
+                    if self.entry.subentries
+                    else [(self.entry.entry_id, self.entry.data)]
+                ):
+                    if (
+                        item.owner.entry_id == self.entry.entry_id
+                        and (item.owner.subentry_id or self.entry.entry_id) == panel_id
+                        or data.get(CONF_PANEL) == item.owner.slug
+                        and data.get(CONF_SSH_HOST_KEY) == item.owner.public_key
+                    ):
+                        self._deferred_panel_ids.add(panel_id)
             record = await journal.async_load()
             for retained in await journal.async_retained_records():
-                password = retained.compensation_password(record)
-                if retained.state == "restore_requested" and (
-                    record is None or password is not None
-                ):
-                    if password is None:
-                        password = await _async_rollback_credential(
-                            self.hass, retained.record.panel_request
+                try:
+                    await journal.async_assert_connection_available(
+                        request=retained.record.panel_request
+                    )
+                except ProvisioningJournalError:
+                    continue
+                if retained.recovery_record is not None:
+                    from .connection_owner import async_resolve_panel_owner
+
+                    try:
+                        if retained.recovery_record.panel_request.bound_owner is None:
+                            raise EntryDataError("provisioning_ownership_mismatch")
+                        await async_resolve_panel_owner(
+                            self.hass, retained.recovery_record.panel_request
                         )
-                    if password is None:
-                        raise EntryDataError("rollback_credentials_unavailable")
+                    except ValueError:
+                        await _async_report_ownership_unproven(
+                            self.hass, retained.recovery_record, original_code="restart_recovery"
+                        )
+                    else:
+                        self._async_schedule_background_recovery(retained.recovery_record)
+                    continue
+                if retained.matches_active_rollback(record):
+                    continue
+                if (
+                    retained.state in {"restore_requested", "finalizing"}
+                    and retained.finalization_origin is None
+                    and retained.compensation_password(record) is None
+                ):
+                    from .connection_owner import async_resolve_panel_owner
+
+                    try:
+                        # A restore interrupted before scoped publication needs a fresh action.
+                        if (
+                            retained.state == "restore_requested"
+                            or retained.record.panel_request.bound_owner is None
+                        ):
+                            raise EntryDataError("provisioning_ownership_mismatch")
+                        await async_resolve_panel_owner(self.hass, retained.record.panel_request)
+                    except ValueError:
+                        await _async_report_ownership_unproven(
+                            self.hass, retained.record, original_code="restart_recovery"
+                        )
+                        continue
+                password = retained.compensation_password(record)
+                if retained.state == "restore_requested" and password is not None:
                     await journal.async_begin_restore(retained.record.transaction_id, password)
                     record = await journal.async_load()
                 elif (
                     retained.state == "finalizing"
                     and retained.finalization_origin is None
-                    and record is None
+                    and (
+                        record is None
+                        or record.panel_request.public_key
+                        != retained.record.panel_request.public_key
+                        and record.panel_request.slug != retained.record.panel_request.slug
+                    )
                 ):
                     self._async_schedule_background_recovery(retained.record)
         except asyncio.CancelledError:
@@ -1380,6 +1545,11 @@ class FleetManager:
             await self._async_persist_parent_normalization(None)
             return
 
+        try:
+            await journal.async_assert_connection_available(request=record.panel_request)
+        except ProvisioningJournalError:
+            return
+
         if record.operation is ProvisioningOperation.ONBOARDING_ROLLBACK:
             compensation = await journal.async_retained(record.transaction_id)
             if compensation is None or compensation.compensation_password(record) is None:
@@ -1388,13 +1558,25 @@ class FleetManager:
             return
 
         if record.operation is ProvisioningOperation.ROLLBACK:
-            if await _async_rollback_credential(self.hass, record.panel_request) is None:
-                raise EntryDataError("rollback_credentials_unavailable")
+            if (
+                record.panel_request.bound_owner is None
+                or await _async_rollback_credential(self.hass, record.panel_request) is None
+            ):
+                await _async_report_ownership_unproven(
+                    self.hass, record, original_code="restart_recovery"
+                )
+                return
             self._async_schedule_background_recovery(record)
             return
 
         if record.operation is ProvisioningOperation.UPDATE:
-            owner, _panel_id = _managed_update_owner(self.hass, record)
+            try:
+                owner, _panel_id = _managed_update_owner(self.hass, record)
+            except EntryDataError:
+                await _async_report_ownership_unproven(
+                    self.hass, record, original_code="restart_recovery"
+                )
+                return
             if owner.entry_id == self.entry.entry_id:
                 self._async_schedule_background_recovery(record)
             return
@@ -1494,6 +1676,16 @@ class FleetManager:
         await self._async_persist_parent_normalization(None)
 
     async def _async_complete_pending_handoff(self) -> bool:
+        if self._pending_handoff is None:
+            return False
+        async with self._ssh_lock:
+            if self._pending_handoff is not None:
+                await ProvisioningJournal(self.hass).async_assert_connection_available(
+                    request=self._pending_handoff.record.panel_request
+                )
+            return await self._async_complete_pending_handoff_locked()
+
+    async def _async_complete_pending_handoff_locked(self) -> bool:
         """Remove the temporary field, persist it, then commit the exact journal."""
         handoff = self._pending_handoff
         if handoff is None:
@@ -1721,6 +1913,20 @@ class FleetManager:
             )
             manager.mark_runtime_degraded(f"runtime setup failed ({type(error).__name__})")
             return False
+        from .connection_owner import PanelConnectionOwner, _issue_id
+
+        if isinstance(manager.store, (FleetPanelStore, LegacyPanelStore)):
+            owner = PanelConnectionOwner(
+                self.hass, manager.store.entry, getattr(manager.store, "subentry", None)
+            )
+            issue = ir.async_get(self.hass).async_get_issue(DOMAIN, _issue_id(owner.owner))
+            if (
+                issue is not None
+                and issue.data
+                and issue.data.get("notification_pending")
+                and issue.data.get("commit_id") == manager.store.data.get("connection_commit_id")
+            ):
+                ir.async_delete_issue(self.hass, DOMAIN, _issue_id(owner.owner))
         return True
 
     @callback
@@ -1793,9 +1999,11 @@ class FleetManager:
 
     async def async_setup(self) -> None:
         """Build all stores first, then start panel runtimes independently."""
-        async with self._lifecycle_lock:
-            await self._async_prepare_provisioning()
+        async with self._async_admitted_lifecycle():
             fleet, built, legacy = self._build_stores()
+            built = {
+                key: value for key, value in built.items() if key not in self._deferred_panel_ids
+            }
             managers = {
                 panel_id: PanelManager(
                     self.hass, store, fleet, self._ssh_lock, self._current_broker_available
@@ -1848,6 +2056,20 @@ class FleetManager:
                 )
                 raise
 
+    @callback
+    def async_schedule_connection_reconcile(self) -> None:
+        """Idempotently enqueue fresh runtime admission after a verified commit."""
+        if self._shutting_down or (
+            self._connection_reconcile_task is not None
+            and not self._connection_reconcile_task.done()
+        ):
+            return
+        self._connection_reconcile_task = self.entry.async_create_background_task(
+            self.hass,
+            self._async_entry_updated(self.hass, self.entry),
+            "brilliant-mqtt-connection-reconcile",
+        )
+
     async def _async_entry_updated(
         self,
         hass: HomeAssistant,
@@ -1886,11 +2108,13 @@ class FleetManager:
 
     async def _async_reconcile_once(self) -> bool:
         """Apply one fully validated entry snapshot under the lifecycle lock."""
-        async with self._lifecycle_lock:
+        async with self._async_admitted_lifecycle():
             if self._shutting_down:
                 return False
-            await self._async_prepare_provisioning()
             fleet, built, legacy = self._build_stores()
+            built = {
+                key: value for key, value in built.items() if key not in self._deferred_panel_ids
+            }
             if legacy != self._legacy:
                 raise EntryDataError("runtime_entry_kind_changed")
 
@@ -1975,7 +2199,8 @@ class FleetManager:
                             tuple(manager for _panel_id, manager in removed)
                         )
                     )
-                entry_reload_required = await self._async_complete_pending_handoff()
+                handoff_reload_required = await self._async_complete_pending_handoff()
+                entry_reload_required = bool(staged) or handoff_reload_required
             except asyncio.CancelledError:
                 if control_plane_reload_attempt is not None and not self._shutting_down:
                     self._async_schedule_reload_once()
@@ -2114,6 +2339,8 @@ class FleetManager:
         """Fail closed unless no global panel transaction owns durable recovery."""
         try:
             record = await ProvisioningJournal(self.hass).async_load()
+            if await ProvisioningJournal(self.hass).async_connection_intents():
+                raise EntryDataError("address_change_incomplete")
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -2131,7 +2358,8 @@ class FleetManager:
         candidate: HostIdentity,
     ) -> None:
         """Durably replace one explicitly verified panel identity."""
-        async with self._lifecycle_lock, self._ssh_lock:
+        await self._async_acquire_operation_lifecycle()
+        try:
             await self._async_assert_rebind_journal_clear()
             fleet, manager, subentry = self._rebind_snapshot(subentry_id, expected)
             if await _async_duplicate_fingerprint(
@@ -2245,6 +2473,9 @@ class FleetManager:
                     "new_fingerprint": rebound.identity_fingerprint,
                 },
             )
+        finally:
+            self._lifecycle_lock.release()
+            self._ssh_lock.release()
 
     async def async_panel_added(self, subentry_id: str) -> None:
         """Reconcile a newly persisted panel subentry."""

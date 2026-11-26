@@ -4104,6 +4104,7 @@ async def test_panel_rename_preserves_all_runtime_identity(
 
 
 async def test_panel_address_rejects_changed_identity_before_password_authentication(
+    durable_connection_storage: None,
     hass: HomeAssistant,
 ) -> None:
     panel = _subentry()
@@ -4141,6 +4142,7 @@ async def test_panel_address_rejects_changed_identity_before_password_authentica
 
 
 async def test_panel_address_authenticates_only_after_existing_identity_matches(
+    durable_connection_storage: None,
     hass: HomeAssistant,
 ) -> None:
     panel = _subentry()
@@ -4177,9 +4179,13 @@ async def test_panel_address_authenticates_only_after_existing_identity_matches(
         original[CONF_ROOT_PASSWORD],
         identity,
         allow_aarch64=False,
+        operation_lock_held=True,
     )
+    commit_id = stored.data["connection_commit_id"]
+    assert str(UUID(commit_id)) == commit_id
     assert stored.data == {
         **original,
+        "connection_commit_id": commit_id,
         CONF_HOST: "replacement-office.iot.example",
     }
     assert stored.unique_id == panel.unique_id
@@ -4188,7 +4194,7 @@ async def test_panel_address_authenticates_only_after_existing_identity_matches(
 @pytest.mark.parametrize("step", ["address", "repair_credentials"])
 @pytest.mark.parametrize("consent", [None, False, True], ids=["missing", "off", "on"])
 async def test_aarch64_panel_repair_uses_only_persisted_consent(
-    hass: HomeAssistant, step: str, consent: bool | None
+    durable_connection_storage: None, hass: HomeAssistant, step: str, consent: bool | None
 ) -> None:
     panel = _subentry()
     entry = _fleet_entry(hass, panel)
@@ -4204,7 +4210,9 @@ async def test_aarch64_panel_repair_uses_only_persisted_consent(
     if step == "repair_credentials":
         user_input[CONF_ROOT_PASSWORD] = "SECRET-repaired-password"
 
-    async def inspect(*_args: object, allow_aarch64: bool = False) -> PanelFacts:
+    async def inspect(
+        *_args: object, allow_aarch64: bool = False, operation_lock_held: bool = False
+    ) -> PanelFacts:
         if not allow_aarch64:
             raise PanelCompatibilityError("unsupported_architecture", architecture="aarch64")
         return replace(_facts(identity), model="i350", architecture="aarch64")
@@ -4219,13 +4227,16 @@ async def test_aarch64_panel_repair_uses_only_persisted_consent(
     if consent is True:
         assert result["type"] is FlowResultType.ABORT
         assert result["reason"] == "reconfigure_successful"
-        assert stored.data == {**original, **user_input}
+        commit_id = stored.data["connection_commit_id"]
+        assert str(UUID(commit_id)) == commit_id
+        assert stored.data == {**original, **user_input, "connection_commit_id": commit_id}
         probe.assert_awaited_once_with(
             hass,
             user_input[CONF_HOST],
             user_input.get(CONF_ROOT_PASSWORD, original[CONF_ROOT_PASSWORD]),
             identity,
             allow_aarch64=True,
+            operation_lock_held=True,
         )
     else:
         assert result["step_id"] == step
@@ -4239,7 +4250,7 @@ async def test_aarch64_panel_repair_uses_only_persisted_consent(
 
 @pytest.mark.parametrize("step", ["address", "repair_credentials"])
 async def test_aarch64_panel_repair_rejects_replacement_before_consent_or_password(
-    hass: HomeAssistant, step: str
+    durable_connection_storage: None, hass: HomeAssistant, step: str
 ) -> None:
     panel = _subentry()
     entry = _fleet_entry(hass, panel)
@@ -4280,7 +4291,9 @@ async def test_aarch64_rebind_does_not_inherit_incumbent_consent(
     candidate = _identity(other=True)
     form = await _start_panel_reconfigure_step(hass, entry, stored, "rebind")
 
-    async def inspect(*_args: object, allow_aarch64: bool = False) -> PanelFacts:
+    async def inspect(
+        *_args: object, allow_aarch64: bool = False, operation_lock_held: bool = False
+    ) -> PanelFacts:
         if not allow_aarch64:
             raise PanelCompatibilityError("unsupported_architecture", architecture="aarch64")
         return replace(_facts(candidate), model="i350", architecture="aarch64")
@@ -4303,6 +4316,7 @@ async def test_aarch64_rebind_does_not_inherit_incumbent_consent(
 
 
 async def test_panel_credential_repair_rechecks_identity_and_never_redisplays_secret(
+    durable_connection_storage: None,
     hass: HomeAssistant,
 ) -> None:
     panel = _subentry()
@@ -4340,9 +4354,13 @@ async def test_panel_credential_repair_rechecks_identity_and_never_redisplays_se
         replacement_password,
         identity,
         allow_aarch64=False,
+        operation_lock_held=True,
     )
+    commit_id = stored.data["connection_commit_id"]
+    assert str(UUID(commit_id)) == commit_id
     assert stored.data == {
         **original,
+        "connection_commit_id": commit_id,
         CONF_ROOT_PASSWORD: replacement_password,
     }
     assert replacement_password not in repr(result)
@@ -5167,6 +5185,7 @@ async def _submit_legacy_reconfigure(
 
 
 async def test_legacy_reconfigure_is_a_menu_of_focused_sections(
+    durable_connection_storage: None,
     hass: HomeAssistant,
 ) -> None:
     """Reconfigure offers focused sections instead of one wall of inputs."""
@@ -5186,6 +5205,7 @@ async def test_legacy_reconfigure_is_a_menu_of_focused_sections(
 
 
 async def test_legacy_reconfigure_connection_blank_password_reuses_stored_secret(
+    durable_connection_storage: None,
     hass: HomeAssistant,
 ) -> None:
     """The connection step prefills the host and keeps the stored root password."""
@@ -5224,6 +5244,7 @@ async def test_legacy_reconfigure_connection_blank_password_reuses_stored_secret
 
 
 async def test_legacy_reconfigure_connection_new_password_is_stored(
+    durable_connection_storage: None,
     hass: HomeAssistant,
 ) -> None:
     """A typed replacement root password is offered over SSH and then stored."""
@@ -5246,6 +5267,7 @@ async def test_legacy_reconfigure_connection_new_password_is_stored(
 
 
 async def test_legacy_reconfigure_completion_updates_without_flow_reload(
+    durable_connection_storage: None,
     hass: HomeAssistant,
 ) -> None:
     """Completing a section persists data and aborts; only the listener may reload."""
@@ -5268,6 +5290,7 @@ async def test_legacy_reconfigure_completion_updates_without_flow_reload(
 
 
 async def test_legacy_reconfigure_applies_via_update_listener_without_reload(
+    durable_connection_storage: None,
     hass: HomeAssistant,
 ) -> None:
     """SSH-password and MQTT-endpoint edits live-apply via the update listener alone."""
@@ -5329,6 +5352,7 @@ async def test_legacy_reconfigure_applies_via_update_listener_without_reload(
 
 
 async def test_legacy_reconfigure_mqtt_blank_password_reuses_stored_secret(
+    durable_connection_storage: None,
     hass: HomeAssistant,
 ) -> None:
     """The MQTT step prefills broker fields and keeps the stored password."""
@@ -5369,6 +5393,7 @@ async def test_legacy_reconfigure_mqtt_blank_password_reuses_stored_secret(
 
 
 async def test_legacy_reconfigure_secrets_are_masked_and_never_redisplayed(
+    durable_connection_storage: None,
     hass: HomeAssistant,
 ) -> None:
     """Stored and just-submitted credentials never become schema defaults."""
@@ -5397,6 +5422,7 @@ async def test_legacy_reconfigure_secrets_are_masked_and_never_redisplayed(
 
 
 async def test_legacy_reconfigure_connection_whitespace_password_reuses_stored_secret(
+    durable_connection_storage: None,
     hass: HomeAssistant,
 ) -> None:
     """A root password of only spaces means "keep current", never a new credential."""
@@ -5419,6 +5445,7 @@ async def test_legacy_reconfigure_connection_whitespace_password_reuses_stored_s
 
 
 async def test_legacy_reconfigure_mqtt_whitespace_password_reuses_stored_secret(
+    durable_connection_storage: None,
     hass: HomeAssistant,
 ) -> None:
     """A whitespace-only broker password is never stored nor pushed to the panel."""
@@ -5446,6 +5473,7 @@ async def test_legacy_reconfigure_mqtt_whitespace_password_reuses_stored_secret(
 
 
 async def test_legacy_reconfigure_mqtt_new_password_is_applied_and_stored(
+    durable_connection_storage: None,
     hass: HomeAssistant,
 ) -> None:
     """A non-blank broker password replaces the stored one and reaches the panel."""
@@ -5482,6 +5510,7 @@ async def test_legacy_reconfigure_mqtt_new_password_is_applied_and_stored(
     ),
 )
 async def test_legacy_reconfigure_section_refuses_an_unproven_panel(
+    durable_connection_storage: None,
     hass: HomeAssistant,
     error: Exception,
     code: str,
@@ -5504,6 +5533,7 @@ async def test_legacy_reconfigure_section_refuses_an_unproven_panel(
 
 
 async def test_legacy_reconfigure_section_fails_closed_without_a_stored_pin(
+    durable_connection_storage: None,
     hass: HomeAssistant,
 ) -> None:
     """An unpinned same-host entry never re-offers the root password over SSH."""
@@ -5530,6 +5560,7 @@ async def test_legacy_reconfigure_section_fails_closed_without_a_stored_pin(
 
 
 async def test_legacy_reconfigure_keeps_c0_only_control_char_parity(
+    durable_connection_storage: None,
     hass: HomeAssistant,
 ) -> None:
     """These steps reject C0 controls but still accept DEL, exactly as before the split."""
@@ -5568,6 +5599,7 @@ def test_config_flow_entry_module_exposes_only_the_ha_required_flow_classes() ->
 
 
 async def test_legacy_reconfigure_components_prefill_and_no_change_is_push_only(
+    durable_connection_storage: None,
     hass: HomeAssistant,
 ) -> None:
     """The components step prefills installed state; a no-change save runs no ops."""
@@ -5600,6 +5632,7 @@ async def test_legacy_reconfigure_components_prefill_and_no_change_is_push_only(
 
 
 async def test_legacy_reconfigure_components_diff_installs_with_stored_secrets(
+    durable_connection_storage: None,
     hass: HomeAssistant,
 ) -> None:
     """Enabling a component installs it using the stored SSH credential."""
@@ -5617,7 +5650,10 @@ async def test_legacy_reconfigure_components_diff_installs_with_stored_secrets(
         _host: str,
         password: str,
         _key: str | None,
+        *,
+        operation_lock_held: bool = False,
     ) -> AsyncIterator[object]:
+        assert operation_lock_held
         session_passwords.append(password)
         yield object()
 
@@ -5640,6 +5676,7 @@ async def test_legacy_reconfigure_components_diff_installs_with_stored_secrets(
 
 
 async def test_legacy_reconfigure_ha_control_updates_globals_and_fans_out(
+    durable_connection_storage: None,
     hass: HomeAssistant,
 ) -> None:
     """The HA-control step updates globals here and on every other entry."""
@@ -5697,6 +5734,7 @@ async def test_legacy_reconfigure_ha_control_updates_globals_and_fans_out(
     ids=("c0-unit-separator", "del", "c1-nel", "c1-csi"),
 )
 async def test_legacy_reconfigure_ha_control_label_keeps_c0_only_parity(
+    durable_connection_storage: None,
     hass: HomeAssistant,
     label: str,
     accepted: bool,
@@ -5732,6 +5770,7 @@ async def test_legacy_reconfigure_ha_control_label_keeps_c0_only_parity(
     ids=("trailing-unit-separator", "trailing-tab", "trailing-carriage-return"),
 )
 async def test_legacy_reconfigure_ha_control_label_gate_reads_the_raw_value(
+    durable_connection_storage: None,
     hass: HomeAssistant,
     label: str,
 ) -> None:
@@ -5769,6 +5808,7 @@ async def test_legacy_reconfigure_ha_control_label_gate_reads_the_raw_value(
     ids=("c0-unit-separator", "del", "c1-nel", "c1-csi"),
 )
 async def test_legacy_reconfigure_ha_control_json_keeps_c0_only_parity(
+    durable_connection_storage: None,
     hass: HomeAssistant,
     marker: str,
     accepted: bool,
@@ -5811,6 +5851,7 @@ async def test_legacy_reconfigure_ha_control_json_keeps_c0_only_parity(
 
 
 async def test_legacy_reconfigure_ha_control_redisplay_keeps_del_bearing_json(
+    durable_connection_storage: None,
     hass: HomeAssistant,
 ) -> None:
     """An error redisplay echoes DEL-bearing JSON back instead of blanking it."""
@@ -5839,6 +5880,7 @@ async def test_legacy_reconfigure_ha_control_redisplay_keeps_del_bearing_json(
 
 
 async def test_legacy_reconfigure_advanced_updates_mesh_priority(
+    durable_connection_storage: None,
     hass: HomeAssistant,
 ) -> None:
     """The advanced step edits only the mesh priority and pushes it to the panel."""
@@ -5865,6 +5907,7 @@ async def test_legacy_reconfigure_advanced_updates_mesh_priority(
 
 
 async def test_legacy_reconfigure_advanced_persists_agent_cadences(
+    durable_connection_storage: None,
     hass: HomeAssistant,
 ) -> None:
     entry = _legacy_entry(hass)
@@ -5903,6 +5946,7 @@ async def test_legacy_reconfigure_advanced_persists_agent_cadences(
     ids=("bool", "float", "out-of-range", "non-integer"),
 )
 async def test_legacy_reconfigure_advanced_rejects_raw_invalid_cadences(
+    durable_connection_storage: None,
     hass: HomeAssistant,
     key: str,
     value: object,
@@ -5930,6 +5974,7 @@ async def test_legacy_reconfigure_advanced_rejects_raw_invalid_cadences(
 
 
 async def test_legacy_reconfigure_advanced_keeps_absent_cadences_unset(
+    durable_connection_storage: None,
     hass: HomeAssistant,
 ) -> None:
     entry = _legacy_entry(hass)
@@ -5954,6 +5999,7 @@ async def test_legacy_reconfigure_advanced_keeps_absent_cadences_unset(
 
 
 async def test_legacy_reconfigure_advanced_clears_cadences_from_next_render(
+    durable_connection_storage: None,
     hass: HomeAssistant,
 ) -> None:
     entry = _legacy_entry(hass)
@@ -5986,6 +6032,7 @@ async def test_legacy_reconfigure_advanced_clears_cadences_from_next_render(
 
 
 async def test_panel_credential_repair_updates_address_and_password_atomically(
+    durable_connection_storage: None,
     hass: HomeAssistant,
 ) -> None:
     panel = _subentry()
@@ -6023,9 +6070,13 @@ async def test_panel_credential_repair_updates_address_and_password_atomically(
         replacement_password,
         identity,
         allow_aarch64=False,
+        operation_lock_held=True,
     )
+    commit_id = stored.data["connection_commit_id"]
+    assert str(UUID(commit_id)) == commit_id
     assert stored.data == {
         **original,
+        "connection_commit_id": commit_id,
         CONF_HOST: "moved-office.iot.example",
         CONF_ROOT_PASSWORD: replacement_password,
     }
@@ -6035,6 +6086,7 @@ async def test_panel_credential_repair_updates_address_and_password_atomically(
 
 @pytest.mark.parametrize("failure", ["identity", "authentication", "parent_changed"])
 async def test_combined_credential_repair_preserves_configuration_on_failure(
+    durable_connection_storage: None,
     hass: HomeAssistant,
     failure: str,
 ) -> None:
@@ -6051,7 +6103,7 @@ async def test_combined_credential_repair_preserves_configuration_on_failure(
         if failure == "authentication":
             raise asyncssh.PermissionDenied("SECRET rejected password")
         if failure == "parent_changed":
-            expected = {**original, CONF_NAME: "Concurrent rename"}
+            expected = {**original, CONF_HOST: "concurrent-office.iot.example"}
             hass.config_entries.async_update_subentry(entry, stored, data=expected)
         return _facts(identity)
 
@@ -6137,7 +6189,9 @@ async def test_aarch64_ownerless_recovery_preserves_candidate_and_requires_both_
         (entry.entry_id, SUBENTRY_TYPE_PANEL), context={"source": "user"}
     )
 
-    async def inspect(*_args: object, allow_aarch64: bool = False) -> PanelFacts:
+    async def inspect(
+        *_args: object, allow_aarch64: bool = False, operation_lock_held: bool = False
+    ) -> PanelFacts:
         if not allow_aarch64:
             raise PanelCompatibilityError("unsupported_architecture", architecture="aarch64")
         return replace(_facts(identity), model="i350", architecture="aarch64")
