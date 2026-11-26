@@ -3,7 +3,9 @@
 import hashlib
 import json
 from copy import deepcopy
+from dataclasses import replace
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 
@@ -63,14 +65,15 @@ def manifest_document() -> dict[str, Any]:
 
 
 def policy(**kwargs: Any) -> ValidationPolicy:
-    return ValidationPolicy(
-        adapters=frozenset({"fake_adapter"}),
-        resources_profiles=frozenset({"fake_resources"}),
-        firmware_profiles=frozenset({"fake_firmware"}),
-        health_profiles=frozenset({"fake_health"}),
-        origins=frozenset({"https://example.invalid:443"}),
-        **kwargs,
-    )
+    values: dict[str, Any] = {
+        "adapters": frozenset({"fake_adapter"}),
+        "resources_profiles": frozenset({"fake_resources"}),
+        "firmware_profiles": frozenset({"fake_firmware"}),
+        "health_profiles": frozenset({"fake_health"}),
+        "origins": frozenset({"https://example.invalid:443"}),
+        "qualified_firmware_profile": "fake_firmware",
+    }
+    return ValidationPolicy(**(values | kwargs))
 
 
 def encoded(document: dict[str, Any]) -> bytes:
@@ -176,11 +179,16 @@ def replacement(identity: str = "optional.service", **kwargs: Any) -> dict[str, 
     }
 
 
-def test_replacements_empty_by_default_and_unknown_topology_fails_closed() -> None:
+def test_replacements_empty_by_default_with_complete_topology() -> None:
     document = manifest_document()
     document["replaces"] = [replacement()]
     with pytest.raises(PluginValidationError):
-        parse_manifest(encoded(document), policy())
+        parse_manifest(encoded(document), policy(topology=(UnitTopology("optional.service"),)))
+
+
+def test_allowlisted_replacement_with_unknown_topology_fails_closed() -> None:
+    document = manifest_document()
+    document["replaces"] = [replacement()]
     allowed = Replacement("optional", "systemd", "optional.service", "fake_stock")
     with pytest.raises(PluginValidationError):
         parse_manifest(encoded(document), policy(replacement_allowlist=frozenset({allowed})))
@@ -529,3 +537,179 @@ def test_duplicate_key_in_otherwise_valid_manifest_is_refused(key: str) -> None:
     raw = raw.replace(needle + value, needle + value + b", " + needle + value, 1)
     with pytest.raises(PluginValidationError):
         parse_manifest(raw, policy())
+
+
+@pytest.mark.parametrize(
+    "config_name",
+    [
+        "bus_alias.service.d",
+        "bus_alias.service.wants",
+        "bus_alias.service.requires",
+        "bus_alias.service.upholds",
+        "bus_alias@other.service.d",
+        "bus_alias@.service.d",
+        "message_bus.service.upholds",
+        "network-.service.d",
+        "network-link.service.d",
+        "bus-proxy@.service.d",
+        "bus-.service.d",
+    ],
+)
+@pytest.mark.parametrize("prerequisite", [False, True])
+def test_dynamic_core_configuration_namespaces_protect_owners_and_prerequisites(
+    config_name: str,
+    prerequisite: bool,
+) -> None:
+    document = manifest_document()
+    document["replaces"] = [replacement()]
+    allowed = Replacement("optional", "systemd", "optional.service", "fake_stock")
+    config_path = f"/etc/systemd/system/{config_name}/override.conf"
+    nodes = [
+        UnitTopology(
+            "message_bus.service",
+            aliases=("bus_alias.service", "bus-proxy@panel.service"),
+            dependencies=("network-link.service",),
+        ),
+        UnitTopology("network-link.service"),
+        UnitTopology("optional.service", paths=(config_path,)),
+    ]
+    if prerequisite:
+        nodes[2] = UnitTopology("optional.service")
+        nodes.append(
+            UnitTopology(
+                "generic.service", dependencies=("optional.service",), paths=(config_path,)
+            )
+        )
+    with pytest.raises(PluginValidationError):
+        parse_manifest(
+            encoded(document),
+            policy(replacement_allowlist=frozenset({allowed}), topology=tuple(nodes)),
+        )
+
+
+def test_replacements_without_a_firmware_qualification_pin_are_refused() -> None:
+    document = manifest_document()
+    document["replaces"] = [replacement()]
+    base = policy()
+    unqualified = ValidationPolicy(
+        adapters=base.adapters,
+        resources_profiles=base.resources_profiles,
+        firmware_profiles=frozenset({"fake_firmware", "other_firmware"}),
+        health_profiles=base.health_profiles,
+        origins=base.origins,
+        replacement_allowlist=frozenset(
+            {Replacement("optional", "systemd", "optional.service", "fake_stock")}
+        ),
+        topology=(UnitTopology("optional.service"),),
+    )
+    with pytest.raises(PluginValidationError):
+        parse_manifest(encoded(document), unqualified)
+
+
+@pytest.mark.parametrize("origin", ["https://[2001:db8::1]", "https://[2001:db8::1]:443"])
+def test_reviewed_ipv6_origins_match_implicit_and_explicit_https_ports(origin: str) -> None:
+    document = manifest_document()
+    document["artifact"]["url"] = origin + "/demo.tar.gz"
+    ipv6_policy = replace(policy(), origins=frozenset({"https://[2001:db8::1]:443"}))
+    assert parse_manifest(encoded(document), ipv6_policy).id == "demo"
+
+
+def test_valid_manifest_accepts_exact_document_limit_and_refuses_one_more_before_hashing() -> None:
+    raw = encoded(manifest_document())
+    padded = raw + b" " * (65536 - len(raw))
+    assert parse_manifest(padded, policy()).id == "demo"
+    with patch("hashlib.sha256", side_effect=AssertionError("oversized input was hashed")):
+        with pytest.raises(PluginValidationError):
+            parse_manifest(padded + b" ", policy())
+
+
+def test_ipv6_origin_with_a_different_port_is_not_reviewed() -> None:
+    document = manifest_document()
+    document["artifact"]["url"] = "https://[2001:db8::1]:444/demo.tar.gz"
+    ipv6_policy = replace(policy(), origins=frozenset({"https://[2001:db8::1]:443"}))
+    with pytest.raises(PluginValidationError):
+        parse_manifest(encoded(document), ipv6_policy)
+
+
+@pytest.mark.parametrize("profiles", [["other_firmware"], ["fake_firmware", "other_firmware"]])
+def test_replacement_cannot_borrow_another_firmware_qualification(profiles: list[str]) -> None:
+    document = manifest_document()
+    document["replaces"] = [replacement()]
+    document["compatibility"]["firmware_profiles"] = profiles
+    allowed = Replacement("optional", "systemd", "optional.service", "fake_stock")
+    qualified = policy(
+        firmware_profiles=frozenset({"fake_firmware", "other_firmware"}),
+        replacement_allowlist=frozenset({allowed}),
+        topology=(UnitTopology("optional.service"),),
+    )
+    with pytest.raises(PluginValidationError):
+        parse_manifest(encoded(document), qualified)
+
+
+def test_exact_qualified_firmware_and_unrelated_optional_dropin_are_accepted() -> None:
+    document = manifest_document()
+    document["replaces"] = [replacement()]
+    allowed = Replacement("optional", "systemd", "optional.service", "fake_stock")
+    qualified = policy(
+        firmware_profiles=frozenset({"fake_firmware", "other_firmware"}),
+        replacement_allowlist=frozenset({allowed}),
+        topology=(
+            UnitTopology(
+                "message_bus.service",
+                aliases=("bus_alias.service",),
+                dependencies=("ordinary.service",),
+            ),
+            UnitTopology("ordinary.service"),
+            UnitTopology(
+                "optional.service", paths=("/etc/systemd/system/optional.service.d/override.conf",)
+            ),
+        ),
+    )
+    assert parse_manifest(encoded(document), qualified).firmware_profiles == ("fake_firmware",)
+
+
+@pytest.mark.parametrize("profiles", [(), ("other_firmware",), ("fake_firmware", "other_firmware")])
+def test_pure_guard_independently_binds_manifest_to_qualified_firmware(
+    profiles: tuple[str, ...],
+) -> None:
+    from custom_components.brilliant_mqtt.plugin_manifest import guard_protected_core
+
+    document = manifest_document()
+    document["replaces"] = [replacement()]
+    allowed = Replacement("optional", "systemd", "optional.service", "fake_stock")
+    qualified = policy(
+        firmware_profiles=frozenset({"fake_firmware", "other_firmware"}),
+        replacement_allowlist=frozenset({allowed}),
+        topology=(UnitTopology("optional.service"),),
+    )
+    manifest = parse_manifest(encoded(document), qualified)
+    with pytest.raises(PluginValidationError):
+        guard_protected_core(replace(manifest, firmware_profiles=profiles), qualified)
+
+
+def test_nonreplacement_manifest_can_declare_multiple_recognized_firmware_profiles() -> None:
+    document = manifest_document()
+    document["compatibility"]["firmware_profiles"] = ["fake_firmware", "other_firmware"]
+    qualified = policy(firmware_profiles=frozenset({"fake_firmware", "other_firmware"}))
+    assert parse_manifest(encoded(document), qualified).replaces == ()
+
+
+@pytest.mark.parametrize("target", ["bus_alias", "ordinary"])
+def test_dynamic_protected_unit_names_also_protect_symbolic_targets(target: str) -> None:
+    document = manifest_document()
+    document["replaces"] = [{**replacement(), "target": target}]
+    allowed = Replacement(target, "systemd", "optional.service", "fake_stock")
+    qualified = policy(
+        replacement_allowlist=frozenset({allowed}),
+        topology=(
+            UnitTopology(
+                "message_bus.service",
+                aliases=("bus_alias.service",),
+                dependencies=("ordinary.service",),
+            ),
+            UnitTopology("ordinary.service"),
+            UnitTopology("optional.service"),
+        ),
+    )
+    with pytest.raises(PluginValidationError):
+        parse_manifest(encoded(document), qualified)

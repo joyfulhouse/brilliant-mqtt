@@ -119,6 +119,7 @@ class ValidationPolicy:
     origins: frozenset[str] = frozenset()
     replacement_allowlist: frozenset[Replacement] = frozenset()
     topology: tuple[UnitTopology, ...] = ()
+    qualified_firmware_profile: str | None = None
 
 
 @dataclass(frozen=True)
@@ -142,6 +143,7 @@ class PluginManifest:
     replaces: tuple[Replacement, ...]
     manifest_sha256: str
     raw: bytes
+    firmware_profiles: tuple[str, ...] = ()
 
 
 def _fail() -> NoReturn:
@@ -245,12 +247,10 @@ def strings(value: object, allowed: frozenset[str] | None = None) -> tuple[str, 
     return result
 
 
-def https_url(value: object, origins: frozenset[str] | None = None) -> str:
-    result = text(value)
+def _https_origin(value: str, *, origin_only: bool = False) -> tuple[str, str, int]:
     try:
-        parsed = urlsplit(result)
+        parsed = urlsplit(value)
         port = parsed.port if parsed.port is not None else 443
-        origin = f"{parsed.scheme}://{parsed.hostname}:{port}"
         if (
             parsed.scheme != "https"
             or not parsed.hostname
@@ -258,13 +258,23 @@ def https_url(value: object, origins: frozenset[str] | None = None) -> str:
             or parsed.username is not None
             or parsed.password is not None
             or parsed.fragment
-            or "\\" in result
-            or any(char.isspace() for char in result)
-            or (origins is not None and origin not in origins)
+            or "\\" in value
+            or any(char.isspace() for char in value)
+            or (origin_only and (parsed.path not in ("", "/") or parsed.query))
         ):
             _fail()
     except ValueError:
         raise PluginValidationError("invalid_plugin_metadata") from None
+    return parsed.scheme, parsed.hostname, port
+
+
+def https_url(value: object, origins: frozenset[str] | None = None) -> str:
+    result = text(value)
+    origin = _https_origin(result)
+    if origins is not None and origin not in {
+        _https_origin(text(allowed), origin_only=True) for allowed in origins
+    }:
+        _fail()
     return result
 
 
@@ -275,19 +285,21 @@ def _qualified(value: object, allowed: frozenset[str]) -> str:
     return result
 
 
-def _protected_unit(value: str) -> bool:
+def _protected_unit(value: str, known_names: frozenset[str] = frozenset()) -> bool:
     stem = value.rsplit(".", 1)[0].split("@", 1)[0]
+    known_stems = {name.rsplit(".", 1)[0].split("@", 1)[0] for name in known_names}
+    protected_stems = _PROTECTED_STEMS | known_stems
     return (
-        stem in _PROTECTED_STEMS
+        stem in protected_stems
         or "watchdog" in stem
-        or (stem.endswith("-") and any(name.startswith(stem) for name in _PROTECTED_STEMS))
+        or (stem.endswith("-") and any(name.startswith(stem) for name in protected_stems))
     )
 
 
-def _unit(value: str) -> None:
+def _unit(value: str, known_names: frozenset[str] = frozenset()) -> None:
     if _UNIT.fullmatch(value) is None or ".." in value:
         _fail()
-    if _protected_unit(value):
+    if _protected_unit(value, known_names):
         _fail()
 
 
@@ -312,7 +324,7 @@ def _paths_overlap(first: str, second: str) -> bool:
     )
 
 
-def _path(value: str) -> None:
+def _path(value: str, known_names: frozenset[str] = frozenset()) -> None:
     path = _canonical_path(value)
     for directory in _UNIT_SEARCH_DIRECTORIES:
         if value == directory or directory.startswith(value.rstrip("/") + "/"):
@@ -330,10 +342,10 @@ def _path(value: str) -> None:
             _fail()
     for part in path.parts:
         unit = part
-        for suffix in (".d", ".wants", ".requires"):
+        for suffix in (".d", ".wants", ".requires", ".upholds"):
             unit = unit.removesuffix(suffix)
         if _UNIT.fullmatch(unit):
-            _unit(unit)
+            _unit(unit, known_names)
 
 
 def guard_protected_core(manifest: PluginManifest, policy: ValidationPolicy) -> None:
@@ -342,6 +354,12 @@ def guard_protected_core(manifest: PluginManifest, policy: ValidationPolicy) -> 
     No filesystem probes occur here. A profile must already have resolved real
     path links and external supervisors into this topology before qualification.
     """
+    if manifest.replaces and (
+        policy.qualified_firmware_profile is None
+        or manifest.firmware_profiles != (policy.qualified_firmware_profile,)
+        or policy.qualified_firmware_profile not in policy.firmware_profiles
+    ):
+        _fail()
     if len(policy.topology) > 128:
         _fail()
     nodes: dict[str, UnitTopology] = {}
@@ -379,11 +397,19 @@ def guard_protected_core(manifest: PluginManifest, policy: ValidationPolicy) -> 
             for path in profile_node.paths
         )
         for profile_node in policy.topology:
-            if profile_node.identity not in protected and any(
+            if profile_node.identity in protected:
+                continue
+            touches_core = any(
                 _paths_overlap(path, protected_path)
                 for path in profile_node.paths
                 for protected_path in protected_profile_paths
-            ):
+            )
+            for path in profile_node.paths:
+                try:
+                    _path(path, frozenset(protected))
+                except PluginValidationError:
+                    touches_core = True
+            if touches_core:
                 pending.append(profile_node.identity)
         if not pending:
             break
@@ -403,7 +429,7 @@ def guard_protected_core(manifest: PluginManifest, policy: ValidationPolicy) -> 
     for name in nodes:
         check_cycle(name, frozenset())
     for replacement in manifest.replaces:
-        if replacement.target in _PROTECTED_STEMS:
+        if _protected_unit(replacement.target, frozenset(protected)):
             _fail()
         _unit(replacement.identity)
         if replacement not in policy.replacement_allowlist:
@@ -425,7 +451,7 @@ def guard_protected_core(manifest: PluginManifest, policy: ValidationPolicy) -> 
             for identity in (node.identity, *node.aliases):
                 _unit(identity)
             for path in node.paths:
-                _path(path)
+                _path(path, frozenset(protected))
                 for protected_path in protected_profile_paths:
                     if _paths_overlap(path, protected_path):
                         _fail()
@@ -460,7 +486,9 @@ def _capabilities(value: object, plugin_id: str, policy: ValidationPolicy) -> No
     for key in ("network_listeners", "provider_accounts", "secrets"):
         if sequence(capabilities[key]):
             _fail()
-    strings(capabilities["network_egress"], policy.origins)
+    for origin in strings(capabilities["network_egress"]):
+        _https_origin(origin, origin_only=True)
+        https_url(origin, policy.origins)
     strings(capabilities["hardware"], frozenset({"display", "backlight", "touchscreen"}))
     ha = object_fields(capabilities["ha"], {"layout", "reads", "actions"})
     if ha["layout"] not in ("none", "configured_dashboard"):
@@ -528,7 +556,8 @@ def parse_manifest(raw: bytes, policy: ValidationPolicy = DEFAULT_POLICY) -> Plu
         _fail()
     if compatibility["python"] != "3.10":
         _fail()
-    if not strings(compatibility["firmware_profiles"], policy.firmware_profiles):
+    firmware_profiles = strings(compatibility["firmware_profiles"], policy.firmware_profiles)
+    if not firmware_profiles:
         _fail()
     integer(compatibility["manager_api"], 1, 1)
     integer(compatibility["bridge_plugin_api"], 1, 1)
@@ -586,6 +615,7 @@ def parse_manifest(raw: bytes, policy: ValidationPolicy = DEFAULT_POLICY) -> Plu
         tuple(replacements),
         hashlib.sha256(raw).hexdigest(),
         raw,
+        firmware_profiles,
     )
     guard_protected_core(result, policy)
     return result

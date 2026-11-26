@@ -163,3 +163,38 @@ def test_catalog_root_schema_is_strict(case: str) -> None:
         catalog["schema_version"] = True
     with pytest.raises(PluginValidationError):
         parse_catalog(encoded(catalog), {hashlib.sha256(raw).hexdigest(): raw}, policy())
+
+
+def test_valid_catalog_accepts_exact_document_limit_and_refuses_one_more_before_hashing() -> None:
+    from unittest.mock import patch
+
+    raw = encoded(manifest_document())
+    manifests = {hashlib.sha256(raw).hexdigest(): raw}
+    catalog_raw = encoded(catalog_document(raw))
+    padded = catalog_raw + b" " * (65536 - len(catalog_raw))
+    assert parse_catalog(padded, manifests, policy()).manifests[0].id == "demo"
+    with patch("hashlib.sha256", side_effect=AssertionError("oversized input was hashed")):
+        with pytest.raises(PluginValidationError):
+            parse_catalog(padded + b" ", manifests, policy())
+
+
+def test_catalog_rejects_valid_but_oversized_manifest_before_hashing() -> None:
+    from unittest.mock import patch
+
+    raw = encoded(manifest_document())
+    oversized = raw + b" " * (65537 - len(raw))
+    manifests = {hashlib.sha256(oversized).hexdigest(): oversized}
+    catalog_raw = encoded(catalog_document(oversized))
+    with patch("hashlib.sha256", side_effect=AssertionError("oversized input was hashed")):
+        with pytest.raises(PluginValidationError):
+            parse_catalog(catalog_raw, manifests, policy())
+
+
+def test_oversized_artifact_is_not_hashed_before_refusal() -> None:
+    from unittest.mock import patch
+
+    manifest = parse_manifest(encoded(manifest_document()), policy())
+    oversized = b"artifact extra"
+    with patch("hashlib.sha256", side_effect=AssertionError("oversized input was hashed")):
+        with pytest.raises(PluginValidationError):
+            verify_artifact_bytes(manifest, oversized)

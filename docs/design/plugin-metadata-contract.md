@@ -29,6 +29,9 @@ for artifacts. Limits are 64 MiB compressed bytes, 256 MiB expanded bytes and
 extractor implementation. Entrypoints are canonical relative paths without
 parent traversal, backslashes or command arguments. A later staging boundary
 must prove the named entry is a regular file in the verified inventory.
+Origin comparisons use scheme, host and effective port tuples, preserving
+bracketed IPv6 URL syntax and treating implicit HTTPS port 443 as explicit 443.
+An origin grant cannot contain a path other than `/`, or a query.
 
 Compatibility requires nonempty architecture and firmware-profile lists;
 architectures are `armv7l` or `aarch64`, Python is `3.10`, and manager/bridge
@@ -36,6 +39,13 @@ APIs are `1`. A compiled-in `ValidationPolicy` supplies reviewed firmware,
 runtime adapter, resource-profile and health-profile IDs and exact origins.
 All its allowlists default empty. Tests use explicit fake profiles; these are
 not shipped catalog entries or qualified firmware.
+For replacements, `ValidationPolicy.qualified_firmware_profile` binds the
+replacement allowlist and topology to exactly one reviewed firmware profile.
+It defaults to `None`, which admits no replacement. A replacing manifest must
+declare exactly that one profile; recognizing another profile ID does not
+extend this qualification. The parsed manifest preserves its profile tuple,
+and the pure guard independently checks the binding. Nonreplacement metadata
+may declare multiple recognized profiles. No real qualification is supplied.
 
 Capabilities are declarations, not runtime grants or recorded consent:
 
@@ -126,6 +136,13 @@ prerequisites.
 Shared unit-type drop-ins and hyphen-prefix drop-ins affecting the protected
 bus/bridge/watchdog families are protected too; an independently qualified
 optional unit's own drop-in is not a shared core override.
+Every canonical name, alias and prerequisite discovered in the protected
+closure also protects its unit configuration namespace, even when the profile
+does not list the corresponding unit-file paths. This includes template and
+instance families, applicable hyphen-prefix drop-ins, and `.d`, `.wants`,
+`.requires` and `.upholds` directories. Owners of those namespaces enter the
+protected closure before their prerequisites are considered, until it stops
+growing. Symbolic replacement targets use the same protected names.
 No replacement path beneath `/var/brilliant-mqtt` is permitted in this slice;
 future plugin-owned release storage is not a stock replacement target.
 
