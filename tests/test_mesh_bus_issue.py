@@ -523,3 +523,38 @@ async def test_final_commit_denies_hook_after_last_loop_eligibility_check(
         remove()
         harness.write_release.set()
         await adapter.shutdown()
+
+
+async def test_return_before_worker_cancel_replays_once_and_keeps_return_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observer, adapter = _gated_adapter()
+    ticket = AdmissionTicket()
+    held: list[tuple[bus_mod._WriteAdmission, asyncio.Task[str]]] = []
+    finish = adapter._finish_admission
+    monkeypatch.setattr(
+        adapter, "_finish_admission", lambda admission, task: held.append((admission, task))
+    )
+    caller = asyncio.create_task(
+        adapter.set_variables("ble_mesh", "p", [VarSet("on", "0")], ticket=ticket)
+    )
+    await _settle()
+    observer.release.set()
+    await asyncio.gather(*adapter._write_tasks)
+    await _settle()
+    assert ticket.settled and not caller.done()
+    boundary = ticket.returned_at
+    assert boundary is not None
+    floor = adapter.mesh_creation_floor
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    replay: list[str | BaseException] = []
+    adapter.set_mesh_settle_callback(ticket, replay.append)
+    assert replay == ["'ok'"]
+    ticket.mark_settled(WriteCancelled())
+    assert replay == ["'ok'"]
+    assert ticket.returned_at is boundary
+    assert adapter.mesh_creation_floor == floor == boundary.sequence
+    finish(*held[0])
+    await adapter.shutdown()
