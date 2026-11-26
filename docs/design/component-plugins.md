@@ -60,6 +60,31 @@ not a capability of today's bridge. HA stages via the existing `PanelShell`
 SSH/SFTP boundary with pinned host identity; normal runtime and crash recovery
 must not depend on HA, MQTT, DNS or an SSH connection being available.
 
+A separate first-party rescue service uses systemd's independent monotonic
+timer/watchdog to monitor the helper's renewable transaction and ownership
+leases. It lives outside the helper/plugin cgroups and does not share their
+worker loop. Before stock is stopped, it must acknowledge the durable intent,
+baseline and absolute recovery deadline. Proposed leases expire in five seconds
+with two-second renewals; renewals cannot extend a phase's absolute deadline.
+On helper exit, OOM, hang or lease
+expiry, systemd stops the helper and its workers; rescue verifies their complete
+quiescence before acquiring exclusive recovery authority. It then fences/kills
+the plugin cgroup and restores stock using the journal, without HA or reboot.
+No concurrent recovery writers are permitted. If it cannot establish writer
+quiescence, it fences plugin device access and signals a local failure rather
+than racing another writer. Rescue has bounded attempts and an independent
+local failure indicator plus persistent repair evidence if restoration fails;
+it never escalates to a panel reboot. Qualify this path on each target/profile,
+including termination/hang of both the helper and its candidate. A target that
+cannot guarantee this recovery trigger is ineligible.
+Rescue uses its own qualified executable/runtime in the persistent recovery
+root, independent of the helper's firmware Python and imports. It has a
+systemd-owned trigger and bounded restart/start-limit policy. Test helper
+interpreter loss, repeated helper startup failure and rescue failure itself;
+do not install if the profile lacks a surviving local recovery path. A failed
+rescue leaves plugin access fenced, records a persistent/local failure and
+requires the named on-site recovery owner; it must never loop or reboot.
+
 Only the first-party helper may change stock service state. Plugin processes
 cannot run `systemctl`, edit units/drop-ins, invoke privileged installers, reboot,
 write firmware, use the root SSH identity, or alter the helper/journal. Root
@@ -124,16 +149,17 @@ runtime:
   entrypoint: bin/kiosk
   resources_profile: display_pilot_v1
 capabilities:
-  network_egress: [{service: ha, transport: https_wss, origin: configured_ha}]
+  network_egress: []                 # HA access is mediated below
   network_listeners: []
   microphone: false
   camera: false
   display_takeover: true
   personal_media: false
   provider_accounts: []
-  bus: {reads: [own_panel_summary], writes: []}
+  ha: {layout: configured_dashboard, reads: [configured_entities], actions: []}
+  bus: {reads: [own_panel_summary], writes: [own_wired_on_intensity]}
   hardware: [display, backlight, touchscreen]
-  secrets: [ha_non_admin_token]
+  secrets: []                        # trusted HA broker retains its token
   retention: {media_disk_bytes: 0, media_lifetime_seconds: 0}
 replaces:
   - target: stock_touchscreen
@@ -193,7 +219,7 @@ Before opening third-party catalogs, require signed metadata binding publisher,
 plugin ID, manifest digest, version, artifact digest/size and expiry to an
 operator-trusted key. Require monotonic catalog revisions and persisted highest
 accepted revisions to prevent rollback/freeze; invalid clock/expiry evidence
-blocks new installs/updates. Key rotation is signed by an existing trusted key
+blocks every activation path. Key rotation is signed by an existing trusted key
 plus reviewed trust-root update; compromise recovery uses an out-of-band
 integration trust-root update. A signature establishes provenance, not safety;
 all adapters, capabilities and firmware targets still require review.
@@ -205,8 +231,35 @@ evidence. Offline panels retain the last verified revocation set and show its
 age; there is no claim of instant offline revocation. Do not introduce a
 network-fetched remote-shell emergency switch. No automatic plugin updates.
 
+One common start-admission check governs install, enable, update, rollback,
+automatic recovery and boot reactivation. It revalidates artifact and manifest
+identity, current persisted revocations, minimum safe version, required metadata
+freshness/clock evidence, firmware/API compatibility, consent and ownership.
+Persist monotonic catalog/revocation/minimum-version decisions in the protected
+recovery root, independently of release rollback, for offline use. A verified
+non-revoked artifact below the current minimum safe version is still ineligible.
+Expired/missing trust evidence or an unreliable required clock forbids any new
+plugin activation, including automatic recovery to an old plugin: restore stock
+instead. An already running plugin follows the last verified runtime policy
+until a revocation or local safety event, but metadata expiry never permits a
+restart. Do not weaken this check because HA or the catalog is unreachable.
+
 Use operator-created least-privilege HA tokens initially. No automatic user
 creation or admin token for the pilot; admin-only capture upload is unavailable.
+Non-admin is not equivalent to narrowly scoped: HA may permit broad household
+state/event reads and media browsing. The trusted HA-access broker holds the
+token; it is never delivered to the plugin. Its separate scoped IPC exposes
+only consented layout fields, entity projections and semantic actions. It
+filters snapshots/events and rejects arbitrary REST paths, WebSocket frames,
+service calls, dashboard references and media requests. The plugin has no
+direct authenticated HA HTTP/WSS path, including through media URLs, redirects
+or another local proxy. A dashboard cannot expand its own capability grant.
+Even same-origin requests require operation/entity authorization. With the
+example manifest, personal-media browsing and unrelated entity reads are denied.
+If required UI behavior cannot work within this boundary, list the missing
+capabilities for explicit consent or make the release ineligible; never label a
+raw broad token as scoped. The broker is a separate capped trusted service,
+included in helper-side resource accounting and implementation review.
 Never share bridge MQTT credentials with a plugin. Prefer brokered publication;
 if a later reviewed adapter needs direct MQTT, it requires a separate scoped
 principal and ACLs that cannot write core state/discovery/commands.
@@ -226,7 +279,8 @@ after stock restore. A retained previous release contains code, not old tokens.
 
 Extend the existing component seam; do not replace it with a second installer.
 The HA journal and panel-side journal share a transaction UUID, panel identity,
-owner ID, firmware/profile identity, authenticated release identities and phase.
+owner ID, firmware/profile and boot identities, authenticated release identities
+and phase.
 Extend the current journal schema with explicit versioned plugin/stock records;
 old records cannot be interpreted as a complete replacement baseline.
 
@@ -246,15 +300,34 @@ Proposed persistent layout (all new plugin state is below `/var`):
 /var/brilliant-mqtt/plugins/<id>/current
 /var/brilliant-mqtt/plugins/<id>/config/       # root-private persistent config
 /var/brilliant-mqtt/plugins/<id>/data/         # bounded, plugin-writable data
-/var/brilliant-mqtt/plugin-manager/journal/   # root-private durable transactions
-/var/brilliant-mqtt/plugin-manager/baselines/ # stock and prior-plugin snapshots
-/var/brilliant-mqtt/plugin-manager/system/    # recovery/unit templates
+/var/lib/brilliant-plugin-recovery/journal/   # private durable transactions
+/var/lib/brilliant-plugin-recovery/baselines/ # stock and prior-plugin snapshots
+/var/lib/brilliant-plugin-recovery/system/    # rescue/helper/unit templates
 ```
 
 Immutable releases are root-owned and not writable by plugins. Temporary IPC,
 leases and runtime secret copies live under a private `/run` subtree. The
 trusted helper and its interpreter must remain executable independently of
 plugin artifacts; qualify their availability on each supported OTA profile.
+Recovery state and rescue executables deliberately live outside the existing
+`/var/brilliant-mqtt` recursive removal root. Core uninstall must first drain
+and verify stock handback for every active, staged or failed plugin, then settle
+pending restoration before stopping the bridge or deleting any plugin assets.
+A failed/interrupted handback blocks destructive cleanup. Unresolved topic debt
+or provider revocation survives in protected recovery state and is shown as
+such; it cannot be discarded by HA entry removal. Removing an entry either
+completes handback first or leaves the independent rescue owner and a durable
+repair/re-adoption record. It cannot abandon a stock suppression.
+
+Installer admission also requires a compatible core removal/downgrade guard.
+Older managers that do not understand replacement records cannot manage this
+panel: retain independent rescue state, reject unsupported owner/protocol
+versions before mutation, and require stock handback before changing to an old
+manager or core. A legacy removal of `/var/brilliant-mqtt` cannot delete rescue;
+loss of the bridge/plugin tree expires the local lease and triggers stock
+restore. Test this using the actual legacy removal shape, not just the new API.
+Rescue removal is the final separate cleanup step after all stock restoration
+and recovery obligations are verified, never an incidental core `rm -rf`.
 
 ### Snapshot before mutation
 
@@ -277,8 +350,9 @@ changing any selector, route, unit, stock configuration or service state.
 
 Preflight requires stable active/inactive states, no pending jobs, no stock
 failure loop, available disk, working recovery hook and compatible firmware.
-Originally inactive stock remains inactive after restoration; originally masked
-stock remains masked. Do not clear an operator mask just to activate a plugin.
+Within the captured boot, originally inactive stock remains inactive after
+restoration and originally masked stock remains masked. Do not clear an
+operator mask just to activate a plugin.
 Concurrent out-of-band changes invalidate the baseline and stop admission.
 
 ### Handoff and commit
@@ -326,7 +400,7 @@ automatic restart in the pilot; one failed attempt leads to recovery, not a loop
 | Uninstall | Restore stock and core routes first, delete secrets and owned retained topics, then remove releases/units/config. Retain only consented non-sensitive preferences and sanitized recovery result. |
 | Purge | Uninstall plus remove retained preferences/media/cache; delete private baseline only after verified stock restoration and no pending recovery. |
 
-Same-firmware stock restoration means exact saved file/link/absence state and
+Same-firmware, same-boot stock restoration means exact saved file/link/absence state and
 metadata, original enablement/masks and original active/inactive state. Stop
 the plugin and prevent further side effects first; remove only manager-owned
 overrides, restore saved config, daemon-reload if required, restore enablement
@@ -335,6 +409,16 @@ health plus independent bus/bridge/load-control health, using a qualified
 profile. A saved PID is evidence of identity, not a restorable value. Expected
 restarted UI/vassal PIDs may change; protected core PIDs must remain stable
 during same-boot plugin operations. Restore entity routes from the saved map.
+
+Exact replay of runtime enablement/masks and temporary active state applies
+only to the recorded boot ID. Persistent operator policy is stored separately
+from these boot-local facts. After an ordinary reboot on the same firmware,
+retire old leases and apply persistent policy plus the firmware's normal boot
+semantics: a runtime-only mask expires, and an enabled service temporarily
+stopped in the previous boot may start normally. Do not resurrect runtime links
+or classify expected boot changes as drift. A plugin stays stopped until a
+fresh boot baseline, consent/session checks and handoff grant new ownership.
+Unknown boot identity blocks handoff; never infer it from firmware version.
 
 An originally masked/inactive service is a valid restored state and does not
 require a running health signal. Conflicting live operator changes, missing
@@ -361,9 +445,10 @@ disable plugin auto-start. Never gate a core boot on plugin health. After any
 firmware identity change (including an unexpected OTA), the local boot gate
 refuses plugin startup until it inventories the new deployment, checks stock
 topology and interpreter/API compatibility, and reconciles any surviving masks
-or overrides owned by the manager. Restore fresh vendor stock defaults first;
-if an operator's saved policy can be safely mapped by a qualified adapter,
-reapply that policy. Otherwise retain the evidence and require repair/decision.
+or overrides owned by the manager. Authenticate and inventory fresh vendor
+stock files without starting optional functions. Map the operator's saved
+persistent policy through a qualified adapter before any affected activation;
+otherwise retain the evidence and require repair/decision.
 Never enable an old masked target name on an unknown topology.
 
 An OTA profile must prove that manager-created suppression cannot strand stock
@@ -377,6 +462,17 @@ replacement is ineligible for installation. Default to stock, plugin stopped.
 HA's existing availability/firmware reapply path is a second recovery channel,
 not the only means of getting a working screen back when HA is unreachable.
 
+Authenticating/inventorying vendor files does not authorize starting them.
+Persistent operator denies (including microphone/camera masks) must be mapped
+and enforced before the corresponding new stock process can acquire devices;
+there can be no transient default-enabled capture. The pre-install firmware
+profile must prove an independently preserved deny and boot ordering across
+lost `/etc`, changed target identities and HA unavailable, without blocking
+protected core boot or guessing unknown unit names. Otherwise refuse that
+initial state/profile before installing a replacement. An unmappable deny
+leaves the affected optional function fenced and repair required; it never
+becomes permission to enable vendor defaults.
+
 Unknown firmware means no plugin reactivation. A known new firmware profile
 must authenticate vendor provenance, map changed targets/dependencies, pass a
 fresh read-only bus/API smoke check and capture a new stock baseline before an
@@ -389,7 +485,12 @@ Core updates declare the plugin API versions they retain. Under the shared
 lock, check all installed plugins before core mutation. Incompatible plugins
 must be disabled/restored before upgrade, with the outcome shown in HA; if
 restore fails, block upgrade. Core/plugin rollback restores a coherent version
-set and ownership generations, not independently selected files. Do not
+set and route semantics, not independently selected files. Every rollback,
+stock handback, re-enable, manager recovery and boot creates a fresh,
+never-reused authority epoch; never restore an old epoch with code/config or
+route snapshots. Use an independently persisted monotonic counter plus a fresh
+unpredictable nonce, outside release/config rollback. Loss/corruption of that
+authority state denies commands and requires re-admission. Do not
 remove a shared API while a compatible previous-release rollback depends on it.
 
 ## 7. Protected bus and entity ownership
@@ -417,6 +518,15 @@ runtime permission does not authorize hardware qualification commands.
 No native peripheral hosting in v1; adding it requires a separate reviewed
 ownership/deletion contract. In particular, plugin registration must not revive
 the rejected physical-Control co-management path.
+
+The kiosk's `own_wired_on_intensity` grant is a semantic request mediated by the
+bridge, not a transfer of load ownership. The trusted profile resolves it only
+to this panel's qualified LIGHT/GENERIC_ON_OFF wired peripherals and validated
+on/intensity operations (intensity only for dimmable LIGHT). It cannot select
+foreign panels, mesh, scenes, calibration or raw variables. This local IPC path
+must work when HA is unavailable and pass local-control readiness before
+handoff completes; HA API access cannot substitute. Test denied scopes offline,
+and qualify actuation only on the separately authorized safe circuit.
 
 Proposed v1 hard limits per plugin: 16 KiB messages, 64 queued events, two
 in-flight requests, five semantic requests/second (burst ten), with lower
@@ -451,6 +561,23 @@ writer and publication. Regrant starts a new epoch, never revives old data.
 Stop capture and clear sensitive retained state on denial. A plugin that
 cannot demonstrate these checks is not eligible for microphone/camera access.
 
+Epoch checks are also enforced outside the plugin. Only a trusted, dedicated
+capture-worker cgroup may open raw microphone/camera devices; the general
+plugin receives bounded streams through the consent broker, never device fds.
+On denial/mute/shutter, stale evidence or IPC loss, the independent trusted
+supervisor closes capture streams, kills/drains capture workers and the
+sensitive-mode plugin cgroup, verifies descriptor/process teardown, and closes
+provider/egress sessions at the trusted proxy. Proposed deadline is one second
+from observed denial; qualify the observation-to-stop bound on hardware too.
+Do not rely on device-cgroup changes to revoke already-open descriptors or on
+cooperative cancellation of blocked reads/sends. Regrant waits for proven
+teardown and starts a fresh process/epoch; no old descriptor/session is reused.
+Sensitive data is confined to disposable memory and epoch-scoped storage;
+delete queued/raw/derived/history data within that deadline, or fence all access
+and keep the capability denied with repair required until deletion is verified.
+The privacy profile must cover malicious/blocked workers that ignore epochs;
+if external cessation cannot be enforced, microphone/camera stay unavailable.
+
 ## 8. Runtime limits and net resource qualification
 
 Every plugin has its own unprivileged UID, systemd unit and cgroup, separate
@@ -464,12 +591,12 @@ directives or unenforced cgroup limits; merely rendering a unit is not proof.
 
 Recommended provisional pilot ceilings (not measurements or exemptions):
 
-| Budget | Helper | One replacement plugin | Aggregate plugins |
+| Budget | Manager services combined | One replacement plugin | Aggregate plugins |
 |---|---:|---:|---:|
-| MemoryMax | 24 MiB | 96 MiB | 128 MiB parent slice |
-| CPUQuota | 2% | 10% | 15% parent slice |
+| MemoryMax | 64 MiB | 96 MiB | 128 MiB parent slice |
+| CPUQuota | 5% | 10% | 15% parent slice |
 | Nice | 10 | 10 | children inherit policy |
-| TasksMax | 16 | 32 | 48 |
+| TasksMax | 32 | 32 | 48 |
 | Plugin-writable persistent data | journal/baseline reserve separately bounded | 64 MiB | 128 MiB |
 
 Only one replacement is enabled during the pilot. Budgets include child
@@ -481,11 +608,25 @@ inferred from stock savings. These proposed numbers require operator choice
 and actual workload qualification. If kiosk/STT cannot fit, it stays unavailable
 until a revised measured budget is reviewed. Do not raise caps automatically.
 
-Network grants name exact origins/protocols and listeners. Enforce through a
-reviewed proxy or network namespace policy; a systemd unit alone does not
-enforce HTTPS hostnames, DNS rebinding or redirect restrictions. Reject private
-or unexpected resolved/redirect destinations unless explicitly consented for
-local HA/STT/receiver use. Credentials bind to exact origin. Authenticated
+The manager total reserves independent ceilings for rescue (16 MiB, 1% CPU,
+8 tasks), helper (24 MiB, 2%, 12 tasks) and HA broker (24 MiB, 2%, 12 tasks).
+They never share the plugin slice or a helper/broker OOM failure domain with
+rescue. Verify rescue can meet its deadline under maximum allowed plugin load;
+otherwise reject the profile or review revised measured budgets.
+
+Network grants name exact origins/protocols and listeners. Hostname-based
+HTTPS/WSS grants require a trusted application proxy that enforces exact
+scheme/host/port, TLS identity, DNS/rebinding checks, redirects, approved API
+operations and per-epoch credential/session handling. Direct plugin egress is
+default-deny; namespace/firewall rules permit only the proxy path. A namespace
+alone cannot distinguish virtual hosts on the same IP/port or enforce HTTP
+redirect/origin policy. Separately reviewed raw-IP protocol grants require a
+specific transport adapter, identity policy and explicit consent; they cannot
+be used to bypass HTTPS policy. Reject private or unexpected destinations
+unless explicitly consented for local HA/STT/receiver use. Credentials bind to
+exact origin. Proxy work is capped and included in manager resource accounting;
+additional proxy/capture workers require an explicit sub-budget within the
+manager total or a reviewed budget change before listing. Authenticated
 receiver identity is required before personal media leaves for Cast; disabling
 TLS verification is not authentication. No open Internet grant by default.
 
@@ -497,7 +638,7 @@ Resource acceptance uses paired, same-panel, same-firmware workload windows:
    all plugin children, decoder/indexer/network workers and downstream core
    cost. Measure idle, active, peak, startup and privacy-denied workloads.
 3. For CPU time and comparable memory populations, report
-   `net cost = plugin + helper + added core work - stock cost actually removed`.
+    `net cost = plugin + all manager services + added core work - stock cost actually removed`.
    Do not subtract all Emperor children or double-count shared pages. Use
    process-tree PSS where possible and cgroup peak memory for hard containment;
    compare whole-panel memory to catch shared-page/accounting effects. Preserve
@@ -603,8 +744,9 @@ its own rework/review; accepting this design does not accept its current diff.
    the schema, helper and firmware profiles; contributors supply packaging,
    exact replacement declarations and evidence. No panel changes in this phase.
 2. Implement the strict catalog/manifest validator, isolated staging, versioned
-   journal extension, local helper, UID/IPC boundary and HA consent behind a
-   default-off feature flag. Use fakes for all stock and SSH operations.
+   journal extension, local helper and independent rescue, core-removal guard,
+   scoped HA broker, UID/IPC boundary and HA consent behind a default-off
+   feature flag. Use fakes for all stock and SSH operations.
 3. Qualify one firmware adapter and local boot recovery before offering a
    replacement. Kiosk is the recommended first candidate only after resolving
    its protected-bus conflict; there is no unconditional approved pilot today.
@@ -624,6 +766,24 @@ revocation, expanded capabilities, secret rotation/deletion, sandbox escape
 attempts, resource enforcement, privacy revoke/regrant during blocked workers,
 late display writes, replayed commands, stale leases and retained cleanup.
 Prove protected units/paths never mutate even through aliases/dependencies.
+Include helper exit/OOM/hang during handoff and after commit with HA offline;
+independent rescue must meet the same-boot recovery deadline without reboot.
+Core uninstall, HA entry deletion and legacy removal with active/staged/failed
+plugins must preserve rescue state until handback. Test an ordinary reboot with
+a runtime-only mask and an enabled-but-temporarily-stopped target. OTA tests
+must cover a persistent operator deny, newly enabled vendor default, lost
+`/etc` and changed target identity, asserting no transient device acquisition.
+Delay a never-delivered unexpired command through A -> B -> rollback to A:
+it must fail while a new-epoch command succeeds. With the example HA grant,
+layout rendering must work while unrelated state, personal-media browsing and
+unapproved services are denied over both REST and WebSocket.
+Test privacy denial during blocked capture/send, including workers ignoring
+cancellation; prove external termination, session closure and data deletion
+before regrant. Cover minimum-safe-version increases without a digest
+revocation, expired trust metadata and bad clock evidence for every activation
+path. Network tests reject same-IP alternate Host/SNI, direct-egress bypass,
+DNS rebinding and cross-origin redirects. Kiosk's own-wired semantic requests
+must pass with HA unavailable while mesh/foreign/calibration requests fail.
 
 Live evidence must identify exact firmware/profile/release digests, original
 states, successful stock handback on failure and uninstall, measured net/peak
@@ -647,6 +807,7 @@ permission. These recommended defaults make subsequent PRs reviewable.
 | Pilot owner/panel | Operator names an on-site recovery owner, maintainer and one non-Office pilot panel before scheduling. | No panel is selected or contacted by this design. Owner must be able to restore locally if recovery fails. |
 | UI safety and offline behavior | Bus untouched; local control and stock fallback work without HA. | Approve a specific safe test circuit separately; qualify UI watchdog and display ownership first. |
 | Consent and retention | Per-panel explicit grants; mic/camera/remote media off; transient media only. | Any cache retention or destination expansion requires a visible grant and bounded deletion policy. |
+| HA access authority | Broker-held non-admin token; plugin sees only consented entities, layout fields and actions. | Upstream kiosk must support this mediated mode. Broad direct token access is ineligible under the example grants. |
 | Updates and OTA | Manual pinned plugin updates; unknown firmware leaves plugin stopped and authentic stock restored where safely supported. | Recovery-hook proof is an installation gate; no auto-reenable after OTA. |
 | Legacy voice | Explicit adoption only; no automatic stock-state assumption or new replacement install without a qualified adapter. | Choose migration timing after helper/bus boundary/voice restore tests. Existing legacy use is not qualification. |
 
