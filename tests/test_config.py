@@ -689,3 +689,56 @@ def test_ambilight_invalid_interval_raises() -> None:
                 "AMBILIGHT_INTERVAL_S": "0",
             }
         )
+
+
+def test_atmosphere_config_env() -> None:
+    s = Settings.from_env(
+        {
+            "BRILLIANT_PANEL": "office",
+            "MQTT_HOST": "10.0.0.1",
+            "MQTT_USERNAME": "u",
+            "MQTT_PASSWORD": "p",
+            "ATMOSPHERE_ENABLED": "1",
+            "ATMOSPHERE_CAST_HOST": "192.0.2.25",
+            "ATMOSPHERE_CAST_PORT": "8009",
+            "ATMOSPHERE_AMBILED_BRIGHTNESS_PCT": "85",
+            "ATMOSPHERE_PERSONAL_ALBUM_URL": "https://photos.app.goo.gl/AbCdEfGh12345",
+        }
+    )
+    assert s.atmosphere_enabled is True
+    assert s.atmosphere_cast_host == "192.0.2.25"
+    assert s.atmosphere_cast_port == 8009
+    assert s.atmosphere_ambiled_brightness_pct == 85
+    assert s.atmosphere_personal_album_url == "https://photos.app.goo.gl/AbCdEfGh12345"
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "pattern"),
+    [
+        ("ATMOSPHERE_CAST_PORT", "0", "ATMOSPHERE_CAST_PORT"),
+        ("ATMOSPHERE_CAST_PORT", "70000", "ATMOSPHERE_CAST_PORT"),
+        ("ATMOSPHERE_AMBILED_BRIGHTNESS_PCT", "101", "ATMOSPHERE_AMBILED_BRIGHTNESS_PCT"),
+        ("ATMOSPHERE_AMBILED_BRIGHTNESS_PCT", "-1", "ATMOSPHERE_AMBILED_BRIGHTNESS_PCT"),
+        (
+            "ATMOSPHERE_PERSONAL_ALBUM_URL",
+            "http://127.0.0.1/private",
+            "ATMOSPHERE_PERSONAL_ALBUM_URL",
+        ),
+        (
+            "ATMOSPHERE_PERSONAL_ALBUM_URL",
+            "https://evil.example.test/album",
+            "ATMOSPHERE_PERSONAL_ALBUM_URL",
+        ),
+    ],
+)
+def test_atmosphere_invalid_config_raises(key: str, value: str, pattern: str) -> None:
+    with pytest.raises(ValueError, match=pattern):
+        Settings.from_env(
+            {
+                "BRILLIANT_PANEL": "office",
+                "MQTT_HOST": "10.0.0.1",
+                "MQTT_USERNAME": "u",
+                "MQTT_PASSWORD": "p",
+                key: value,
+            }
+        )

@@ -213,6 +213,7 @@ class VirtualPeripheralSpec:
     peripheral_type: int
     initial_variables: dict[str, Any]
     settable_variables: frozenset[str]
+    room_ids: tuple[str, ...] = ()
 
 
 class VirtualPeripheralHostProtocol(Protocol):

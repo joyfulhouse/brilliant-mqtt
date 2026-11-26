@@ -52,6 +52,14 @@ positively off. `AMBILIGHT_INTERVAL_S` defaults to `1.0` seconds and accepts
 finite values from `0.25` to `10` seconds. Setting `AMBILIGHT_ENABLED=0`
 retires the feature's previously owned MQTT discovery and retained state.
 
+On-panel Atmosphere ambient TV photography is also opt-in: set
+`ATMOSPHERE_ENABLED=1` and `ATMOSPHERE_CAST_HOST=<tv-ip>` (plus optional
+`ATMOSPHERE_GEMINI_API_KEY`, `ATMOSPHERE_PEXELS_API_KEY`, or
+`ATMOSPHERE_PERSONAL_ALBUM_URL`). It hosts a native `Atmosphere` virtual
+dimmer on the touchscreen (slider `1%..100%` maps next-photo delay `300s..5s`),
+couples optional AmbiLED at `85%`, and gates microphone listening strictly on
+the panel's camera privacy shutter being open (`privacy_toggle == "0"`).
+
 | Area | What you get |
 |---|---|
 | Lighting & switches | Panel loads and BLE-mesh loads as HA lights/switches, with brightness |

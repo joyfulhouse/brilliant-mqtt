@@ -23,6 +23,13 @@ from brilliant_mqtt.ambilight import (
     GStreamerCameraAdapter,
     retire_ambilight_topics,
 )
+from brilliant_mqtt.atmosphere import (
+    AlsaMicrophoneAdapter,
+    AtmosphereController,
+    CastV2PhotoClient,
+    HttpAtmosphereCurator,
+    retire_atmosphere_topics,
+)
 from brilliant_mqtt.bridge import Bridge, HotPollReadTimeout, WriteThrottle
 from brilliant_mqtt.bus import (
     BusStartFencedError,
@@ -230,6 +237,7 @@ async def _run_session(
     scene_bridge: SceneBridge | None = None
     virtual_slider_controller: VirtualSliderController | None = None
     ambilight_controller: AmbilightController | None = None
+    atmosphere_controller: AtmosphereController | None = None
     mqtt_connected = False
     phase_marker_failure_logged = False
     try:
@@ -461,6 +469,66 @@ async def _run_session(
         else:
             await retire_ambilight_topics(mqtt, settings.panel, owned_topics)
 
+        if settings.atmosphere_enabled:
+            try:
+                atm_dir = (
+                    Path(settings.motion_desired_state_dir)
+                    if settings.motion_desired_state_dir
+                    else None
+                )
+                atm_state_path = atm_dir / "atmosphere.json" if atm_dir else None
+                atm_cache_path = atm_dir / "atmosphere-album-cache.json" if atm_dir else None
+
+                async def _on_atm_ambiled(turn_on: bool) -> None:
+                    if ambilight_controller is not None:
+                        await ambilight_controller.on_mqtt_command(
+                            f"brilliant/{settings.panel}/ambilight/set_enabled",
+                            "ON" if turn_on else "OFF",
+                        )
+
+                atmosphere_controller = AtmosphereController(
+                    mqtt=mqtt,
+                    panel=settings.panel,
+                    display=CastV2PhotoClient(
+                        settings.atmosphere_cast_host,
+                        settings.atmosphere_cast_port,
+                    ),
+                    mic=AlsaMicrophoneAdapter(
+                        device=settings.atmosphere_mic_device,
+                        privacy_off=panel_bridge.is_privacy_off,
+                        privacy_epoch=panel_bridge.camera_privacy_epoch,
+                    ),
+                    curator=HttpAtmosphereCurator(
+                        gemini_api_key=settings.atmosphere_gemini_api_key,
+                        gemini_model=settings.atmosphere_gemini_model,
+                        pexels_api_key=settings.atmosphere_pexels_api_key,
+                        personal_album_url=settings.atmosphere_personal_album_url,
+                        stt_url=settings.atmosphere_stt_url,
+                        curate_url=settings.atmosphere_curate_url,
+                        album_cache_path=atm_cache_path,
+                    ),
+                    bus=bus,
+                    host_factory=lambda vspec, on_ext: HostedVirtualPeripheralAdapter(
+                        vspec, on_ext
+                    ),
+                    peripheral_id=settings.atmosphere_peripheral_id,
+                    display_name=settings.atmosphere_name,
+                    room_ids=(settings.atmosphere_room_id,) if settings.atmosphere_room_id else (),
+                    ambiled_peripheral_id=settings.atmosphere_ambiled_peripheral_id,
+                    ambiled_brightness_pct=settings.atmosphere_ambiled_brightness_pct,
+                    on_ambiled_coupled=_on_atm_ambiled,
+                    state_path=atm_state_path,
+                    owned_topics=owned_topics,
+                    privacy_off=panel_bridge.is_privacy_off,
+                    privacy_epoch=panel_bridge.camera_privacy_epoch,
+                )
+                await atmosphere_controller.start()
+            except Exception:
+                log.exception("atmosphere controller startup failed; rebuilding session")
+                raise
+        else:
+            await retire_atmosphere_topics(mqtt, settings.panel, owned_topics)
+
         tick = settings.hot_poll_seconds if settings.hot_poll_seconds > 0 else _IDLE_TICK_S
         next_resync = time.monotonic() + settings.resync_seconds
         # Set after a first hot-poll read timeout: the earliest monotonic time
@@ -642,6 +710,11 @@ async def _run_session(
                 await virtual_slider_controller.shutdown()
             except Exception:
                 log.exception("virtual slider controller shutdown failed during cleanup")
+        if atmosphere_controller is not None:
+            try:
+                await atmosphere_controller.shutdown()
+            except Exception:
+                log.exception("atmosphere controller shutdown failed during cleanup")
         if ambilight_controller is not None:
             try:
                 await ambilight_controller.shutdown()
