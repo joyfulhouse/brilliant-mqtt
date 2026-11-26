@@ -11,6 +11,7 @@ import os
 import re
 import secrets
 import shlex
+import socket
 import subprocess
 import sys
 import tarfile
@@ -2734,6 +2735,61 @@ def test_broker_reachability_script_distinguishes_dns_and_refusal() -> None:
     assert panel_ops.interpret_broker_reachability("not-a-cause\n") == "connect"
 
 
+@pytest.mark.parametrize("failure", ["open", "timeout"])
+def test_broker_reachability_dual_stack_fallback_survives_first_address_failure(
+    failure: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Exercise the real generated script with a disabled or blackholed IPv6 path."""
+    clock = [10.0]
+    attempts: list[int] = []
+    sockets: list[object] = []
+    closed: list[object] = []
+    budgets: list[float] = []
+    addresses = [
+        (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2001:db8::1", 1883, 0, 0)),
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.1", 1883)),
+    ]
+
+    class ProbeSocket:
+        def __init__(self, family: int, _kind: int, _proto: int) -> None:
+            attempts.append(family)
+            if family == socket.AF_INET6 and failure == "open":
+                raise OSError("IPv6 disabled")
+            self.family = family
+            self.timeout = 0.0
+            sockets.append(self)
+
+        def settimeout(self, value: float) -> None:
+            self.timeout = value
+            budgets.append(value)
+
+        def connect(self, _address: object) -> None:
+            if self.family == socket.AF_INET6:
+                clock[0] += self.timeout
+                raise TimeoutError
+
+        def close(self) -> None:
+            closed.append(self)
+
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *_args, **_kwargs: addresses)
+    monkeypatch.setattr(socket, "socket", ProbeSocket)
+    monkeypatch.setattr("time.monotonic", lambda: clock[0])
+    command = panel_ops.broker_reachability_command("broker.example", 1883, timeout_seconds=0.4)
+    script = command.split("\n", 1)[1].rsplit("\n", 1)[0]
+    exec(script, {})
+
+    assert capsys.readouterr().out.strip() == "ok"
+    assert attempts == [socket.AF_INET6, socket.AF_INET]
+    assert sockets == closed
+    assert all(0 < budget <= 0.4 + 1e-9 for budget in budgets)
+    assert clock[0] - 10.0 < 0.4
+    if failure == "timeout":
+        assert len(budgets) == 2
+        assert sum(budgets) <= 0.4 + 1e-9
+
+
 def _run_reachability_with_fake_dns(
     mode: str,
     tmp_path: Path,
@@ -2838,8 +2894,8 @@ def test_broker_reachability_script_connects_ipv6_and_aaaa_first(tmp_path: Path)
         float(line.removeprefix("timeout ")) for line in aaaa_log if line.startswith("timeout ")
     ]
     assert len(timeouts) == 2
-    assert timeouts[1] < timeouts[0]
-    assert timeouts[0] <= 0.4
+    assert 0 < timeouts[0] <= 0.2
+    assert 0 < timeouts[1] <= 0.4
 
 
 def test_snapshot_layout_probe_accepts_is_enabled_without_stdout(tmp_path: Path) -> None:
