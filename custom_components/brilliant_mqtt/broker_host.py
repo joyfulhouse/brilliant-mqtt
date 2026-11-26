@@ -6,6 +6,7 @@ import ipaddress
 import re
 
 _DNS_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$", re.IGNORECASE)
+_IPV6_ZONE = re.compile(r"[a-zA-Z0-9_.~-]+")
 
 
 def panel_unreachable_broker_host_reason(host: str) -> str | None:
@@ -24,9 +25,9 @@ def panel_unreachable_broker_host_reason(host: str) -> str | None:
     if candidate == "local.hass.io" or candidate.endswith(".local.hass.io"):
         return "hass_internal_dns"
     single_label = "." not in candidate
-    # Known Home Assistant-internal names only. Ordinary hyphenated LAN labels
-    # such as mqtt-broker are accepted; a panel may resolve them.
-    if candidate.startswith("a0d7b954-") or (single_label and candidate.startswith("core-")):
+    # Known Home Assistant-internal single-label names only. Dotted LAN names
+    # and ordinary hyphenated labels may resolve from a panel.
+    if single_label and candidate.startswith(("a0d7b954-", "core-")):
         return "addon_internal_name"
     return None
 
@@ -52,6 +53,10 @@ def format_broker_endpoint(host: str, port: int) -> str:
 
 def _is_diagnostic_broker_host(host: str) -> bool:
     """True for a DNS name or IP literal, never a URL, query, or userinfo form."""
+    bare = host[1:-1] if host.startswith("[") and host.endswith("]") else host
+    # ipaddress accepts opaque zone text; diagnostics allow only URI-unreserved scopes.
+    if "%" in bare and _IPV6_ZONE.fullmatch(bare.partition("%")[2]) is None:
+        return False
     if host.startswith("[") and host.endswith("]"):
         try:
             ipaddress.ip_address(host[1:-1])

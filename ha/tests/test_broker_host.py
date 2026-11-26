@@ -4,10 +4,15 @@ from __future__ import annotations
 
 import pytest
 
+from custom_components.brilliant_mqtt.broker import BrokerKind, BrokerProfile
 from custom_components.brilliant_mqtt.broker_host import (
     format_broker_endpoint,
     panel_unreachable_broker_host_reason,
 )
+from custom_components.brilliant_mqtt.broker_validation import _annotate_broker_endpoint
+from custom_components.brilliant_mqtt.errors import OperationError, OperationStage
+from custom_components.brilliant_mqtt.flow.schemas import normalize_broker_input
+from custom_components.brilliant_mqtt.flow.support import _operation_failure
 
 
 @pytest.mark.parametrize(
@@ -17,8 +22,10 @@ from custom_components.brilliant_mqtt.broker_host import (
         (" Core-Mosquitto ", "addon_internal_name"),
         ("core-ssh", "addon_internal_name"),
         ("a0d7b954-mosquitto", "addon_internal_name"),
+        ("a0d7b954-mosquitto.", "addon_internal_name"),
         ("A0D7B954-esphome", "addon_internal_name"),
         ("homeassistant.local.hass.io", "hass_internal_dns"),
+        ("a0d7b954-mosquitto.local.hass.io", "hass_internal_dns"),
         ("LOCAL.HASS.IO", "hass_internal_dns"),
         ("localhost", "loopback"),
         ("localhost.", "loopback"),
@@ -44,6 +51,8 @@ def test_panel_unreachable_broker_hosts(host: str, reason: str) -> None:
         "my-broker",
         "b0c1d2e3-addon",
         "core-mosquitto.lan",
+        "a0d7b954-mosquitto.lan",
+        " A0D7B954-ESPHome.Example.Test. ",
         "2001:db8::1",
     ],
 )
@@ -84,3 +93,40 @@ def test_format_broker_endpoint_omits_malformed_diagnostic_text() -> None:
         assert host not in surface
         assert error.redacted_dict()["broker_endpoint"] == ""
     assert sentinel not in format_broker_endpoint("mqtt.iot.example", 1883)
+
+
+@pytest.mark.parametrize("bracketed", [False, True])
+@pytest.mark.parametrize("suffix", ["?token=synthetic-sentinel", "#synthetic-sentinel"])
+def test_scoped_ipv6_omits_malformed_zone_from_public_diagnostics(
+    bracketed: bool,
+    suffix: str,
+) -> None:
+    host = f"fe80::1%eth0{suffix}"
+    if bracketed:
+        host = f"[{host}]"
+    fields = normalize_broker_input(
+        BrokerKind.EXISTING_BROKER,
+        {
+            "mqtt_host": host,
+            "mqtt_port": 1883,
+            "mqtt_username": "fleet-user",
+            "mqtt_password": "fleet-password",
+        },
+    )
+    error = _annotate_broker_endpoint(
+        OperationError.for_code(OperationStage.FLEET_AUTH, "broker_connect_failed"),
+        BrokerProfile.from_mapping(fields),
+    )
+
+    assert "synthetic-sentinel" not in repr(_operation_failure(error).placeholders())
+    assert "synthetic-sentinel" not in repr(error.redacted_dict())
+    assert error.broker_endpoint == ""
+
+
+@pytest.mark.parametrize("scope", ["eth0", "enp0s3.100", "eth_0-1", "3"])
+@pytest.mark.parametrize("bracketed", [False, True])
+def test_scoped_ipv6_preserves_valid_zone_in_diagnostics(scope: str, bracketed: bool) -> None:
+    host = f"fe80::1%{scope}"
+    if bracketed:
+        host = f"[{host}]"
+    assert format_broker_endpoint(host, 1883) == f"[fe80::1%{scope}]:1883"
