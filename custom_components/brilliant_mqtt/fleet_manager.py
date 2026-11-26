@@ -85,6 +85,7 @@ from .panel_provisioner import (
     staged_release_from_journal,
     stored_snapshot_from_panel,
 )
+from .plugin_catalog import configured_plugin_catalog
 from .provisioning_journal import (
     ProvisioningJournal,
     ProvisioningOperation,
@@ -1152,6 +1153,7 @@ class FleetManager:
     ) -> None:
         self.hass = hass
         self.entry = entry
+        self.plugin_catalog = configured_plugin_catalog(entry.options)
         # One-shot: a migration-restoration setup must not SSH any panel (the
         # legacy HA-mirror retirement audit runs again on the next ordinary setup).
         self._defer_setup_panel_contact = defer_setup_panel_contact
