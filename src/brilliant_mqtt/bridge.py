@@ -279,6 +279,9 @@ class Bridge:
         self._mesh: MeshRegistry | None = None
         self._mesh_driver: MeshDriver | None = None
         self._mesh_commands: MeshCommands | None = None
+        self.on_mesh_capacity_recovered: Callable[[], Awaitable[None]] | None = None
+        self._mesh_recovery_pending = False
+        self._mesh_recovery_running = False
         self._mesh_route_owners: dict[str, MeshSettlement] = {}
         self._mesh_descriptors: dict[MeshSettlement, tuple[EntityDescriptor, ...]] = {}
         self._mesh_routing = MeshRouting(
@@ -293,12 +296,14 @@ class Bridge:
                 derive_motion=deriver is not None,
                 motion_hold_s=deriver.hold_s if deriver is not None else 60,
                 native_motion_passthrough=motion_native_passthrough,
+                is_mesh_leader=lambda: self._include is None or self._include(_MESH_DEVICE_ID),
             )
             self._mesh_driver = MeshDriver(self._mesh, mqtt, panel=panel, sleep=self._sleep)
             self._mesh_driver.cleanup = self._cleanup_mesh
             self._mesh_commands = MeshCommands(self._mesh, self._mesh_driver, bus)
             self._mesh.revoked = self._mesh_revoked
             self._mesh.changed = self._mesh_status_changed
+            self._mesh.recovered = self._mesh_capacity_recovered
             self._mesh.retained_ids = self._mesh_retained_ids
             mqtt.set_mesh_owner_resolver(self._resolve_mesh_owner)
         self._wired: dict[str, _WiredSlot] = {}
@@ -335,6 +340,34 @@ class Bridge:
         registry = self._mesh
         if registry is not None and registry.enabled and self._panel == _MESH_PANEL:
             self._queue_mesh_availability("offline")
+
+    def _mesh_capacity_recovered(self) -> None:
+        self._mesh_recovery_pending = True
+
+    async def _drain_mesh_recovery(self) -> None:
+        if self._mesh_recovery_running:
+            return
+        self._mesh_recovery_running = True
+        try:
+            # Coalesce only real recovery notifications received during an
+            # existing sweep; ordinary captures never request another sweep.
+            while self._mesh_recovery_pending:
+                registry = self._mesh
+                callback = self.on_mesh_capacity_recovered
+                if (
+                    callback is None
+                    or registry is None
+                    or not registry.enabled
+                    or registry.disabled
+                    or not registry.bus.mesh_admission_open
+                    or self._include is not None
+                    and not self._include(_MESH_DEVICE_ID)
+                ):
+                    return
+                self._mesh_recovery_pending = False
+                await callback()
+        finally:
+            self._mesh_recovery_running = False
 
     def _queue_mesh_availability(self, payload: str) -> asyncio.Task[None]:
         registry = self._mesh
@@ -911,6 +944,7 @@ class Bridge:
             await self._flush_retired_mesh()
             await self._enforce_desired(devices)
             await self._repair_mesh_availability()
+            await self._drain_mesh_recovery()
 
     async def reconcile_after_reconnect(self) -> None:
         """Retire session-local wired evidence before reading a new bus generation."""
@@ -974,6 +1008,7 @@ class Bridge:
         self._subscribed.difference_update(topics)
         if self._mesh is not None:
             self._mesh.close()
+        self._mesh_recovery_pending = False
         mesh_repairs = self._mesh_routing.withdraw()
         self._mesh_route_owners.clear()
         self._mesh_descriptors.clear()
@@ -1053,6 +1088,7 @@ class Bridge:
             await self._flush_retired_mesh()
             await self._enforce_desired(devices)
             await self._repair_mesh_availability()
+            await self._drain_mesh_recovery()
 
     def _motion_default_wants(self, device: BrilliantDevice) -> dict[str, str]:
         """Config-driven motion defaults for *device*, overlaid under recorded intent.
@@ -1426,6 +1462,7 @@ class Bridge:
         if device.device_id == _MESH_DEVICE_ID:
             await self._repair_mesh(device.peripheral_id, force=False)
             await self._flush_retired_mesh()
+            await self._drain_mesh_recovery()
             return
         if self._wired_feedback_enabled:
             self._observe_privacy(device)

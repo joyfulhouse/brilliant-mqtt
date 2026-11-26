@@ -76,6 +76,7 @@ class MeshRegistry:
         derive_motion: bool = False,
         motion_hold_s: float = 60,
         native_motion_passthrough: bool = False,
+        is_mesh_leader: Callable[[], bool] = lambda: True,
     ) -> None:
         self.bus = bus
         self.clock = clock
@@ -83,12 +84,14 @@ class MeshRegistry:
         self._derive_motion = derive_motion
         self._motion_hold_s = motion_hold_s
         self._native_motion_passthrough = native_motion_passthrough
+        self._is_mesh_leader = is_mesh_leader
         self.enabled = False
         self.disabled = False
         self.inventory_ready = False
         self.inventory_count = 0
         self._inventory_sequence = -1
         self.changed: Callable[[], None] = lambda: None
+        self.recovered: Callable[[], None] = lambda: None
         self.retained_ids: Callable[[], frozenset[str]] = frozenset
         self._disposed = False
         self._floor = -1
@@ -168,8 +171,17 @@ class MeshRegistry:
             self.effects(owner, owner.dispatch(event))
 
     def _write_allowed(self, ticket: AdmissionTicket, peripheral_id: str) -> bool:
+        if (
+            not self.enabled
+            or self.disabled
+            or not self.bus.mesh_admission_open
+            or not self._is_mesh_leader()
+        ):
+            return False
         owner = ticket.mesh_owner
-        return owner is not None and self.current(peripheral_id) is owner and self.live(owner)
+        # Resident configuration has no load slot. Load command ingress binds
+        # its original owner before this shared adapter guard is reached.
+        return owner is None or self.current(peripheral_id) is owner and self.live(owner)
 
     def _admitted(self, boundary: CaptureProvenance) -> bool:
         return (
@@ -216,6 +228,7 @@ class MeshRegistry:
                 self.disabled = False
                 logger.info("MESH_CAPACITY_RECOVERED count=%d", self.inventory_count)
                 self.changed()
+                self.recovered()
             self.inventory_ready = True
             for pid, binding in tuple(self._bindings.items()):
                 if pid not in ids:

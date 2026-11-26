@@ -511,6 +511,9 @@ class _SessionBus:
         self.write_timeout_latched = False
         return latched
 
+    def consume_mesh_fatal(self) -> bool:
+        return False
+
     def try_supersede(self, ticket: AdmissionTicket, new_payload: list[VarSet]) -> bool:
         return False
 
@@ -1255,6 +1258,48 @@ class TestWriteTimeoutLatchSource:
 
         assert "panel_poll" not in harness.events
         assert harness.events[-1] == "mqtt_disconnect"
+
+
+async def test_mesh_sink_fatal_rebuilds_before_healthy_unchanged_leader_tick(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from brilliant_mqtt.mesh_ingress import MeshIngress
+    from tests.fakes import _RawDevice, _RawPeripheral
+
+    harness, adapter, _ = _real_bus_session(monkeypatch)
+    calls = 0
+
+    def sink(event: MeshIngress) -> None:
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("one-shot sink failure")
+
+    adapter.register_mesh_sink(sink, want_fields=lambda pid: frozenset({"on"}))
+    adapter._dispatch_raw_device(_RawDevice("ble_mesh", {"load": _RawPeripheral("1")}))
+    assert not adapter.mesh_admission_open
+    assert calls == 1
+    with pytest.raises(RuntimeError, match="mesh.*rebuilding session"):
+        await asyncio.wait_for(main_mod._run_session(_hot_poll_settings(mesh=True), None, None), 1)
+    assert harness.events.count("leader_start") == 1
+    assert "leader_tick" not in harness.events
+    assert "panel_poll" not in harness.events
+    assert harness.events[-1] == "mqtt_disconnect"
+
+
+async def test_mesh_fatal_preserves_retained_ledger_failure_priority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness, adapter, _ = _real_bus_session(monkeypatch)
+    adapter.fail_mesh(RuntimeError("sink failed"))
+    failure = RetainedLedgerError("durable ledger failed")
+    monkeypatch.setattr(
+        retained_topics_mod.RetainedTopicLedger, "consume_failure", lambda self: failure
+    )
+    with pytest.raises(RetainedLedgerError) as caught:
+        await asyncio.wait_for(main_mod._run_session(_hot_poll_settings(), None, None), 1)
+    assert caught.value is failure
+    assert adapter.consume_mesh_fatal()
+    assert "leader_tick" not in harness.events
 
 
 class TestHotPollReadTimeoutPolicy:
