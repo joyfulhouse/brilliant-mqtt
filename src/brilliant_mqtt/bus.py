@@ -18,6 +18,7 @@ import asyncio
 import logging
 import math
 import secrets
+import threading
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable, Iterable, Mapping
@@ -36,6 +37,7 @@ from brilliant_mqtt.mesh_ingress import (
     MeshScopeUnknown,
     MeshSink,
 )
+from brilliant_mqtt.mesh_settlement import MeshSettlement
 from brilliant_mqtt.mesh_settlement_types import MeshMetadata
 from brilliant_mqtt.model import (
     BrilliantDevice,
@@ -599,10 +601,12 @@ class RpcBusAdapter:
         # outlived a prior session's bounded teardown can never touch a newer
         # session's bookkeeping (#88).
         self._session = 0
+        self._generation_lock = threading.Lock()
         # Local ordering only: incremented exactly where raw observations are
         # captured and where a native write is issued. A processor reconnect
         # starts a new incomparable source generation.
         self._capture_generation = 0
+        self._applied_capture_generation = 0
         self._capture_sequence = 0
         self._capture_source = secrets.token_hex(16)
         self._mesh_sinks: list[MeshSink] = []
@@ -698,8 +702,15 @@ class RpcBusAdapter:
             raise BusStartFencedError(
                 f"prior bus resource shutdown still pending ({len(unresolved_closes)} task(s))"
             )
-        self._session += 1
-        self._advance_capture_generation()
+        with self._generation_lock:
+            self._session += 1
+            self._capture_generation += 1
+            self._shutting_down = True
+            self._applied_capture_generation = self._capture_generation
+        self._privacy_revocation = None
+        self._field_eras.clear()
+        self._mesh_failed = False
+        self._mesh_fatal = False
         # Not ready until this start() commits: _require_started keeps gating on
         # _own_device_id, so owning _obs/_proc early (below) never opens a window
         # for a caller to use a half-started adapter.
@@ -716,7 +727,9 @@ class RpcBusAdapter:
         return self._session
 
     def _advance_capture_generation(self) -> None:
-        self._capture_generation += 1
+        """Advance a loop-owned source boundary without resetting its sequence."""
+        with self._generation_lock:
+            self._capture_generation += 1
         self._privacy_revocation = None
         self._field_eras.clear()
 
@@ -727,6 +740,21 @@ class RpcBusAdapter:
     @property
     def mesh_admission_open(self) -> bool:
         return not self._mesh_failed and not self._shutting_down
+
+    def mesh_owner_live(self, owner: MeshSettlement) -> bool:
+        """Live authorization for capture, timer, issue and publication effects.
+
+        Registry current-binding and capacity checks are additional loop-owned
+        checks. This fence observes a foreign reconnect before loop fan-out.
+        """
+        with self._generation_lock:
+            return (
+                not self._shutting_down
+                and not self._mesh_failed
+                and owner.active
+                and owner.source == self._capture_source
+                and owner.generation == self._capture_generation
+            )
 
     def consume_mesh_fatal(self) -> bool:
         failed = self._mesh_fatal
@@ -848,7 +876,8 @@ class RpcBusAdapter:
 
     @property
     def capture_generation(self) -> int:
-        return self._capture_generation
+        with self._generation_lock:
+            return self._capture_generation
 
     @property
     def own_device_id(self) -> str | None:
@@ -890,7 +919,7 @@ class RpcBusAdapter:
     def _next_capture_provenance(self, origin: str = "capture") -> CaptureProvenance:
         self._capture_sequence += 1
         return CaptureProvenance(
-            self._capture_generation,
+            self.capture_generation,
             self._capture_sequence,
             incarnation=self._capture_source,
             origin=origin,
@@ -1002,7 +1031,17 @@ class RpcBusAdapter:
             # The lib does not document the callback's invocation thread, so marshal
             # the work onto the loop and scope it to this session (#88).
             def reconnect_hook(*args: Any, **kwargs: Any) -> None:
-                loop.call_soon_threadsafe(self._on_proc_reconnect, session)
+                generation = self._publish_reconnect(session)
+                if generation is None:
+                    return
+                try:
+                    same_loop = asyncio.get_running_loop() is loop
+                except RuntimeError:
+                    same_loop = False
+                if same_loop:
+                    self._apply_reconnect(session, generation)
+                else:
+                    loop.call_soon_threadsafe(self._apply_reconnect, session, generation)
 
             proc.add_reconnect_callback(reconnect_hook)
 
@@ -1013,8 +1052,9 @@ class RpcBusAdapter:
             # Commit: the session is fully live. Open admission (writes/dispatch/
             # reconnect) and mark readiness LAST so no earlier failure leaves a
             # half-started adapter usable.
-            self._shutting_down = False
-            self._own_device_id = own_device_id
+            with self._generation_lock:
+                self._shutting_down = False
+                self._own_device_id = own_device_id
             logger.info("bus connected; owning device id=%s", own_device_id)
         except BaseException:
             # Unwind whatever was constructed/started — however far we got
@@ -1319,10 +1359,29 @@ class RpcBusAdapter:
         """
         if session is None:
             session = self._session
-        if self._shutting_down or session != self._session:
+        generation = self._publish_reconnect(session)
+        if generation is not None:
+            self._apply_reconnect(session, generation)
+
+    def _publish_reconnect(self, session: int) -> int | None:
+        """The native hook's linearization point; no callbacks under this lock."""
+        with self._generation_lock:
+            if self._shutting_down or session != self._session:
+                return None
+            self._capture_generation += 1
+            return self._capture_generation
+
+    def _apply_reconnect(self, session: int, generation: int) -> None:
+        with self._generation_lock:
+            if self._shutting_down or session != self._session:
+                return
+            generation = max(generation, self._capture_generation)
+        if generation <= self._applied_capture_generation:
             return
+        self._applied_capture_generation = generation
         logger.warning("bus processor reconnected; re-subscribing and re-reconciling")
-        self._advance_capture_generation()
+        self._privacy_revocation = None
+        self._field_eras.clear()
         self._mesh_control(MeshGeneration(self._next_capture_provenance("lifecycle")))
         self._note_push()
         self._note_reconnect()
@@ -1956,7 +2015,8 @@ class RpcBusAdapter:
         then close the observer/processor — so no tracked callback can keep
         reconciling/publishing against a session whose bus is already gone.
         """
-        self._shutting_down = True
+        with self._generation_lock:
+            self._shutting_down = True
         await self._settle_writes()
         await self._settle_pending()
         # A cancelled _drain_pushes lands its CancelledError inside the awaited
@@ -1964,6 +2024,7 @@ class RpcBusAdapter:
         # explicitly rather than relying on task self-cleanup.
         self._pending_pushes.clear()
         self._push_tasks.clear()
+        self._mesh_sinks.clear()
         await self._close_bus_resources()
 
 

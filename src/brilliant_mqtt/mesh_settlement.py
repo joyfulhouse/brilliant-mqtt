@@ -60,6 +60,18 @@ _MATCH_AGE_S = 10.0
 class MeshSettlement:
     """One loop-confined owner. Public state is frozen and demand-materialized."""
 
+    @property
+    def source(self) -> str:
+        return self._source
+
+    @property
+    def generation(self) -> int:
+        return self._generation
+
+    @property
+    def active(self) -> bool:
+        return self._phase is not Phase.INACTIVE
+
     def __init__(
         self,
         metadata: MeshMetadata,
