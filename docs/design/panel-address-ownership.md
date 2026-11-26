@@ -94,17 +94,22 @@ including a named intent bound to a removed owner. It still constructs healthy
 sibling runtimes. Background recovery skips deferred retained finalizations;
 explicit rollback processes its named transaction, not unrelated finalizations.
 
-Before writing any named marker, apply this admission matrix:
+Before any marker or contact, inspect the exact retained row under the operation
+lock. An existing scoped `recovery_record` makes finalize refuse, including
+`rollback_failed` and `restored` before cleanup. Rollback may only resume that
+exact record or refuse; never reset or duplicate it. Only proven completion and
+durable scoped-record removal allow normal finalize admission. Otherwise:
 
 | Active slot | Named rollback | Named finalize |
 | --- | --- | --- |
-| Empty or different transaction | Retained scoped record | Own retained marker |
+| Empty or different panel identity | Retained scoped record | Own retained marker |
 | Same transaction, ROLLBACK | Continue active record in place | Refuse |
-| Same transaction, any other operation | Refuse | Refuse |
+| Same panel identity, any other active record | Refuse | Refuse |
 
 Refusal is typed `provisioning_recovery_required`, with no marker write or new
-authority. In v1, the existing active path alone settles same-transaction
-updates/installs/upgrades; no competing scoped rollback or handoff can be added.
+authority. Different transaction IDs alone never prove independent panels.
+In v1, the existing active path alone settles that panel's updates/installs/
+upgrades; no competing scoped rollback or handoff can be added.
 A scoped journal view stores optional `recovery_record` in its retained row;
 phase/error/evidence/completion writes touch only that row. Omit login on disk;
 resolve it from the bound live owner before dispatch. Cold reload resumes
@@ -138,5 +143,6 @@ Invalid storage retains existing refusal rules.
 TDD reuses S2/S8 crash/concurrency repros against production readers/setup and
 offline fakes. Include legacy compatibility, same-value cancellation/wakeup,
 occupied-slot sibling rollback, same-transaction refusal/single authority,
-in-place rollback, migration refusal and marker schemas. Local static/focused
+in-place rollback, scoped-finalize refusal through cleanup, migration refusal
+and marker schemas. Local static/focused
 gates and CI full suites are required. Live validation remains outstanding.
