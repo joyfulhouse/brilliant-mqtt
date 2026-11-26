@@ -8,6 +8,7 @@ import hmac
 import json
 import os
 import re
+import socket
 import stat
 import time
 from collections.abc import Awaitable, Callable, Sequence
@@ -34,6 +35,8 @@ from brilliant_mqtt.setup_protocol import (
 )
 
 _CONNECT_DETAIL = "MQTT connection failed"
+_DNS_DETAIL = "MQTT name resolution failed"
+_REFUSED_DETAIL = "MQTT connection refused"
 _SETTINGS_DETAIL = "Panel configuration invalid"
 _PUBLISH_DETAIL = "MQTT publish failed"
 _SUBSCRIBE_DETAIL = "MQTT subscription failed"
@@ -193,6 +196,35 @@ async def _wait_for(
     operation.result()
 
 
+def _failure_for_connect(error: BaseException) -> _Failure:
+    """Classify a broker connect failure without copying exception text."""
+    pending = [error]
+    seen: set[int] = set()
+    saw_refused = False
+    saw_timeout = False
+    while pending and len(seen) < 32:
+        current = pending.pop()
+        identity = id(current)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        if isinstance(current, socket.gaierror):
+            return _Failure(PreflightStage.FLEET_AUTH, "mqtt_dns", _DNS_DETAIL)
+        if isinstance(current, ConnectionRefusedError):
+            saw_refused = True
+        elif isinstance(current, TimeoutError):
+            saw_timeout = True
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None and not current.__suppress_context__:
+            pending.append(current.__context__)
+    if saw_refused:
+        return _Failure(PreflightStage.FLEET_AUTH, "mqtt_refused", _REFUSED_DETAIL)
+    if saw_timeout:
+        return _Failure(PreflightStage.FLEET_AUTH, "mqtt_timeout", _TIMEOUT_DETAIL)
+    return _Failure(PreflightStage.FLEET_AUTH, "mqtt_connect", _CONNECT_DETAIL)
+
+
 async def _mqtt_operation(
     stage: PreflightStage,
     code: str,
@@ -206,6 +238,8 @@ async def _mqtt_operation(
     except asyncio.TimeoutError as error:
         raise _Failure(stage, "mqtt_timeout", _TIMEOUT_DETAIL) from error
     except Exception as error:
+        if code == "mqtt_connect":
+            raise _failure_for_connect(error) from error
         raise _Failure(stage, code, detail) from error
 
 
@@ -464,7 +498,7 @@ async def async_run_preflight(
             mqtt.on_message(on_message)
             mqtt.on_payload_decode_error(on_payload_decode_error)
         except Exception as error:
-            raise _Failure(PreflightStage.FLEET_AUTH, "mqtt_connect", _CONNECT_DETAIL) from error
+            raise _failure_for_connect(error) from error
         await _mqtt_operation(
             PreflightStage.FLEET_AUTH,
             "mqtt_connect",

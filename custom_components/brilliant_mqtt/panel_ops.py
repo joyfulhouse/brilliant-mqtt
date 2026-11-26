@@ -1627,6 +1627,90 @@ async def prove_unactivated_capture(
         raise PanelOpError("baseline_candidate_present")
 
 
+_BROKER_REACHABILITY = frozenset({"ok", "dns", "connection_refused", "timeout", "connect"})
+
+
+def broker_reachability_command(host: str, port: int, *, timeout_seconds: float = 5.0) -> str:
+    """Build a read-only panel probe for broker DNS and TCP reachability."""
+    if (
+        not isinstance(host, str)
+        or not host
+        or len(host) > 253
+        or any(ord(char) < 33 or ord(char) == 127 for char in host)
+        or type(port) is not int
+        or not 1 <= port <= 65535
+        or type(timeout_seconds) is not float
+        or not 0.1 <= timeout_seconds <= 30.0
+    ):
+        raise PanelOpError("broker_reachability_invalid")
+    return (
+        f"{_PANEL_PYTHON} - <<'BRILLIANT_BROKER_REACH'\n"
+        "import socket\n"
+        "import time\n"
+        f"host = {host!r}\n"
+        f"port = {port!r}\n"
+        f"timeout = {timeout_seconds!r}\n"
+        "def classify():\n"
+        "    try:\n"
+        "        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)\n"
+        "    except socket.gaierror:\n"
+        "        return 'dns'\n"
+        "    if not infos:\n"
+        "        return 'dns'\n"
+        "    saw_refused = False\n"
+        "    saw_timeout = False\n"
+        "    deadline = time.monotonic() + timeout\n"
+        "    for index, info in enumerate(infos):\n"
+        "        remaining = deadline - time.monotonic()\n"
+        "        if remaining <= 0:\n"
+        "            saw_timeout = True\n"
+        "            break\n"
+        "        sock = None\n"
+        "        try:\n"
+        "            sock = socket.socket(info[0], info[1], info[2])\n"
+        "            # Reserve a share of the bounded budget for every later address.\n"
+        "            sock.settimeout(remaining / (len(infos) - index))\n"
+        "            sock.connect(info[4])\n"
+        "        except ConnectionRefusedError:\n"
+        "            saw_refused = True\n"
+        "        except TimeoutError:\n"
+        "            saw_timeout = True\n"
+        "        except OSError:\n"
+        "            pass\n"
+        "        else:\n"
+        "            return 'ok'\n"
+        "        finally:\n"
+        "            if sock is not None:\n"
+        "                sock.close()\n"
+        "    if saw_refused:\n"
+        "        return 'connection_refused'\n"
+        "    if saw_timeout:\n"
+        "        return 'timeout'\n"
+        "    return 'connect'\n"
+        "print(classify())\n"
+        "BRILLIANT_BROKER_REACH"
+    )
+
+
+def interpret_broker_reachability(stdout: str) -> str:
+    """Map one probe line to an allowlisted cause. Unexpected output fails closed."""
+    token = stdout.strip()
+    if token not in _BROKER_REACHABILITY:
+        return "connect"
+    return token
+
+
+async def probe_broker_reachability(
+    shell: PanelShell,
+    host: str,
+    port: int,
+) -> str:
+    """Resolve and TCP-connect to the broker from the panel. Read-only."""
+    command = broker_reachability_command(host, port)
+    result = await _provisioning_run(shell, command, "broker_reachability_failed")
+    return interpret_broker_reachability(result.stdout)
+
+
 async def baseline_retained(shell: PanelShell) -> bool:
     result = await _provisioning_run(
         shell,
