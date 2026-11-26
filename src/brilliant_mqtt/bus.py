@@ -1348,6 +1348,8 @@ class RpcBusAdapter:
                 ticket._cancel_waiting = None
 
     def _finish_admission(self, admission: _WriteAdmission, task: asyncio.Task[str]) -> None:
+        if not admission.issued:
+            admission.ticket.mark_settled(WriteCancelled())
         self._settle_write(task, admission=admission)
         if not admission.acquired.done():
             admission.acquired.set_result(None)
@@ -1418,10 +1420,14 @@ class RpcBusAdapter:
                     admission.values,
                     device_id=admission.device_id,
                 )
+                receipt = _normalize_receipt(response)
+                admission.ticket.mark_settled(receipt, self._next_capture_provenance())
             except asyncio.CancelledError:
+                admission.ticket.mark_settled(WriteCancelled(), self._next_capture_provenance())
                 logger.info("set_variables(%s) cancelled at session teardown", record.label)
                 raise
-            except Exception:
+            except Exception as error:
+                admission.ticket.mark_settled(error, self._next_capture_provenance())
                 if record.detached:
                     logger.warning(
                         "detached set_variables(%s) failed after %.1fs (queue wait %.3fs)",
@@ -1433,7 +1439,6 @@ class RpcBusAdapter:
                 raise
             finally:
                 cap.cancel()
-        receipt = _normalize_receipt(response)
         if record.detached:
             logger.warning(
                 "detached set_variables(%s) completed after %.1fs (queue wait %.3fs); receipt: %s",
