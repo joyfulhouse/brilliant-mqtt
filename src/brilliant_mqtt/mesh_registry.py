@@ -205,9 +205,15 @@ class MeshRegistry:
         if isinstance(event, MeshCapture):
             self._capture(event)
         elif isinstance(event, MeshScopeUnknown):
+            self.bus.advance_mesh_creation_floor(boundary)
+            if boundary.sequence > self._inventory_sequence:
+                self._inventory_sequence = boundary.sequence
+                self.inventory_ready = False
+                self.changed()
             for owner in self.owners:
                 self.dispatch(owner, ScopeUnknown(self.envelope(owner, boundary)))
         elif isinstance(event, MeshPeripheralAbsent):
+            self.bus.advance_mesh_creation_floor(boundary)
             binding = self._bindings.get(event.peripheral_id)
             if binding is not None:
                 self._absence(binding, boundary)
@@ -215,6 +221,7 @@ class MeshRegistry:
             if boundary.sequence <= self._inventory_sequence:
                 return
             self._inventory_sequence = boundary.sequence
+            self.bus.advance_mesh_creation_floor(boundary)
             self.inventory_count = event.count or len(event.peripheral_ids or ())
             ids = event.peripheral_ids
             if (
@@ -360,13 +367,18 @@ class MeshRegistry:
             binding.owner.metadata
         )
         if binding is None or changed:
+            shadowed = binding is not None and any(
+                boundary.sequence <= binding.owner.field_watermark(name) for name in _FIELDS
+            )
             if binding is not None:
                 self._revoke(binding.owner, boundary)
                 self.bus.advance_mesh_creation_floor(boundary)
             retired = self._retired.pop(pid, None)
             if retired is not None:
                 self._revoke(retired, boundary)
-            seed = boundary.sequence >= self.bus.mesh_creation_floor
+            # A shadowed replacement starts unknown behind a fresh birth floor;
+            # other already-started captures cannot rewind its fields or binding.
+            seed = not shadowed and boundary.sequence >= self.bus.mesh_creation_floor
             birth = boundary if seed else self.bus.reserve_mesh_boundary("binding")
             # Reservation can apply reconnect fanout inline and replace the binding.
             if not self._admitted(birth) or (

@@ -170,6 +170,11 @@ new slot atomically from its own validated source snapshot; its floor excludes
 all other work started before the change. It cannot seed request-confirmation
 evidence from a retired command. Freshness rejection of field evidence still
 does not suppress repair of a currently admitted binding.
+If an admitted capability change comes from a capture shadowed by newer field
+evidence, the successor uses a fresh existing binding reservation and starts
+unknown. It inherits neither that older capture nor the previous owner's
+evidence. Other reads already started before replacement cannot rewind the
+successor; a trusted post-replacement capture restores state.
 
 Topology has a separate per-device creation floor. A reliable explicit removal,
 complete inventory removal or binding change advances it; no older-started
@@ -181,6 +186,9 @@ inventory absence. This permits dropping per-ID tombstones after cleanup
 without retaining every peripheral name ever seen. Reappearance requires a
 newer admitted inventory/explicit creation event; stale async state callbacks
 cannot create slots or routes.
+Authoritative absence advances this existing creation floor even for an ID
+without a slot. Each winning complete inventory also advances the floor; its
+own captures remain eligible, and known owners retain independent field merges.
 
 Successful full-device reads also emit an immutable `Inventory` event with
 read-start provenance, successful/complete scope and returned
@@ -199,6 +207,9 @@ topology path with a bounded diagnostic, never an authoritative empty inventory.
 Transport exception/timeout has no inventory/absence contribution. ScopeUnknown
 does not replace newer explicit target evidence; it cannot cause a target echo
 from older evidence. Test all four shapes through actual `get_all()`.
+Its existing creation/inventory ordering fence also excludes older first
+sightings before any slot exists. Until a later complete inventory, readiness
+stays offline; known topology/routes and independent auxiliary merges remain.
 
 For each owned peripheral missing from a complete inventory, reduce versioned
 absence for its fields and primary-confirmation evidence, subject to each
@@ -627,6 +638,12 @@ than leaving a stale descriptor last on the broker. Withdrawal sets desired
 membership to absent synchronously; reacquisition can replace that intent
 without racing an unconditional compensating cleanup. Test delayed old SUBACK
 across reacquisition and retyping, then command delivery without another resync.
+Failed withdrawal membership cleanup remains eligible on existing acquisition,
+poll and reconcile triggers even if no owner or retired slot remains. Repair
+rechecks current owners before retrying that cleanup. Bounded topic lookups and
+outstanding-withdrawal work indexes derive only from existing routing records
+and disappear with them. Ordinary unchanged, fully applied desires reuse their
+completed worker; force repair and genuine outstanding debt still run.
 
 Capture ingress happens before availability/discovery publishes, so a newer
 push during a routing await already updates the slot. Reconcile never resumes

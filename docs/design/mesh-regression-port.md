@@ -457,3 +457,68 @@ consumer gates do not establish HA-core template rendering: the stock-Jinja
 limitation in [mesh-write-feedback.md](../reference/mesh-write-feedback.md)
 still applies. Live CPU delta (agent <=2 percentage points, bus <=0.5) and
 physical responsiveness remain outstanding under #225.
+
+## PR #297 Review Corrections, Round 1
+
+The earlier final-integration results above describe the initial implementation
+head, `ace2edbfa6b53016f2dcbb892af5de56a1e3f119`. Round-one adversarial review
+found that the mapped late-acceptance/matching-value test checked only the last
+wire state, losing the original zero-publication-before-expiry and exactly-one
+OFF-at-expiry assertions. That port now records the target-state-topic offset
+after acceptance, requires an empty complete slice through the matching
+observation, then compares the complete expiry slice to the one expected
+idle/OFF document. Existing deadline, owner and timer assertions remain. Two
+permanent injection schedules reject both an early OFF followed by pending and
+a duplicate terminal OFF. They live in `tests/test_mesh_review_corrections.py`,
+so the exact historical selection remains 148 cases and all 75 mapping rows
+and baseline evidence remain intact.
+
+The same correction module covers ordinary and capacity retirement of an
+already-unknown load; delayed capability replacement in both primary
+polarities and with newer auxiliary evidence; authoritative unknown-ID absence
+at deletion, scoped-None and complete-inventory boundaries; failed ownerless
+withdrawal cleanup, repeated failure and reappearance; and healthy-broker
+routing work at 10 and 40 loads. A shadowed capability replacement accepts its
+metadata but starts unknown behind a fresh existing binding reservation.
+A second already-started read cannot rewind that successor's binding or fields,
+including after newer explicit field removal. Post-replacement trusted capture
+restores state. No command, pending request or old evidence is migrated.
+
+Correction TDD evidence is recorded separately under S9 as
+`pr297-r1-red-final.log` (13 semantic failures, one passing control, before
+production edits), `pr297-r1-successor-red.log` (two additional delayed-read
+failures against the initial correction), and `pr297-r1-orphan-race-red.log`
+(one synchronous-reappearance failure against the initial correction).
+Earlier fixture-signature and typing corrections are not semantic RED claims.
+The additional routing-index churn assertions are postimplementation supporting
+proof. No baseline XML/log or original reviewer probe was overwritten.
+
+The correction focused selection passes **1,895 cases across 63 files**,
+including **24 correction cases**, and the exact historical selection again
+passes **148 cases**. The seven unchanged reviewer runtime probes pass; an
+external wrapper around the two unchanged sensitivity probes requires their
+invalid sequences to raise an assertion. Healthy stable pushes perform zero
+routing-record enumeration and create zero topic-repair workers. Three
+unchanged polls visit 99 routing records at 10 loads and 369 at 40 loads, one
+shared readiness pass per poll, with zero new topic-repair workers. Bounded
+routing work indexes disappear with their corresponding records through
+retirement, withdrawal, reappearance and distinct-ID churn. These are local
+operation counts, not on-panel CPU acceptance. Final correction commands,
+results and payload proof are recorded in `S9/pr297-r1-implementer-handoff.md`.
+
+The controller-confirmed scope-unknown extension adds cold/warm schedules for
+successful missing and incomplete parent reads, with native-exception controls.
+Before the extension's source fix, four semantic failures and two passing
+controls are recorded in `pr297-r1-scope-unknown-red-corrected-fixture.log`.
+These boundaries now advance the existing creation/inventory ordering and hold
+readiness offline until a later complete inventory. Known topology/routes and
+unshadowed auxiliary merges survive; transport exceptions contribute no floor.
+Both unchanged controller runtime probes pass alongside the original seven.
+
+The correction connected-schedule run passes 150 cases. Its 40-load resource
+proof preserves 4,040 captures, zero native normalization/Variable allocation,
+80 blocked renders and exactly the initial own-device/mesh reads; it records
+279 total renders after the explicit flush. The earlier 267 total remains a
+historical result, not a bound or a claim repeated by this run. HA static checks
+and all 798 affected payload-consumer cases pass before the deterministic build
+pair; the default-temp compatibility selection passes 293 cases.

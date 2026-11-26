@@ -270,6 +270,7 @@ class MeshDriver:
                     fields: dict[str, object] = json.loads(owner.encode(self.registry.clock()))
                     if (
                         owner.view.terminal is None
+                        and not (owner.retired and owner.view.ordinary_debt is not None)
                         and not lane.force
                         and fields == lane.last_fields
                     ):

@@ -7,6 +7,7 @@ and wire assertions are the settlement oracle. No fake makes settlement choices.
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator, Awaitable, Callable, MutableMapping
 from dataclasses import FrozenInstanceError
 from types import MappingProxyType
@@ -42,6 +43,7 @@ from tests.test_bridge import (
     MESH_PID,
     MESH_SET_TOPIC,
     _BlockingStatePublishMqtt,
+    _mesh_feedback_payload,
     _mesh_states,
 )
 from tests.test_bus_adapter import _gated_adapter
@@ -209,13 +211,18 @@ async def test_late_acceptance_then_matching_value_confirms(rig: Rig) -> None:
     rig.clock.advance(3)
     await rig.accept()
     rig.assert_pending(deadline=1083)
+    offset = len(_mesh_states(rig.mqtt))
     rig.clock.advance(74)
     await turns()
     rig.assert_pending()
     await rig.report("0")
     rig.assert_pending()
+    assert _mesh_states(rig.mqtt)[offset:] == []
     await rig.expire(6)
     rig.assert_terminal("idle", "OFF")
+    assert [json.loads(payload) for _, payload, _ in _mesh_states(rig.mqtt)[offset:]] == [
+        _mesh_feedback_payload("OFF")
+    ]
     assert not pending(rig.bridge)
     assert not rig.timers()
 

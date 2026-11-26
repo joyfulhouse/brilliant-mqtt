@@ -45,13 +45,23 @@ class MeshRouting:
         self.fail = fail
         self.publish = publish
         self.records: dict[str, TopicRepair] = {}
+        self._topics_by_peripheral: dict[str, set[str]] = {}
+        self._withdrawn: set[str] = set()
 
     @property
     def peripheral_ids(self) -> frozenset[str]:
+        return frozenset(self._topics_by_peripheral)
+
+    def topics(self, peripheral_id: str) -> tuple[str, ...]:
+        """Bounded work lookup; entries exist only while their records exist."""
+        return tuple(self._topics_by_peripheral.get(peripheral_id, ()))
+
+    @property
+    def withdrawn_peripheral_ids(self) -> frozenset[str]:
         return frozenset(
-            record.peripheral_id
-            for record in self.records.values()
-            if record.peripheral_id is not None
+            pid
+            for topic in self._withdrawn
+            if (pid := self.records[topic].peripheral_id) is not None
         )
 
     def repaired(
@@ -86,6 +96,8 @@ class MeshRouting:
                 else None,
             )
             self.records[topic] = record
+            if record.peripheral_id is not None:
+                self._topics_by_peripheral.setdefault(record.peripheral_id, set()).add(topic)
         else:
             previous = record.desired
             if record.desired != desired or force:
@@ -97,6 +109,17 @@ class MeshRouting:
                 if record.worker is not None and not record.revoking:
                     record.revoking = True
                     record.worker.cancel()
+        if desired.owner is self and desired.forget:
+            self._withdrawn.add(topic)
+        else:
+            self._withdrawn.discard(topic)
+        if (
+            not force
+            and record.applied is record.desired
+            and record.worker is not None
+            and record.worker.done()
+        ):
+            return record.worker
         if record.worker is None or record.worker.done():
             record.worker = asyncio.create_task(self._run(topic, record), name="mesh-topic-repair")
             record.worker.add_done_callback(self._retrieve)
@@ -177,7 +200,23 @@ class MeshRouting:
                 record.applied = desired
                 if desired.forget:
                     self.records.pop(topic, None)
+                    self._withdrawn.discard(topic)
+                    if record.peripheral_id is not None:
+                        topics = self._topics_by_peripheral[record.peripheral_id]
+                        topics.discard(topic)
+                        if not topics:
+                            self._topics_by_peripheral.pop(record.peripheral_id)
                 return
+
+    async def retry_withdrawn(self) -> None:
+        """Retry only outstanding withdrawal work after current desires are repaired."""
+        await self.join(
+            tuple(
+                self.request(topic, self.records[topic].desired)
+                for topic in tuple(self._withdrawn)
+                if topic in self.records
+            )
+        )
 
     def withdraw(self) -> tuple[asyncio.Task[None], ...]:
         """Revoke shared publications immediately; only membership cleanup remains."""

@@ -490,6 +490,17 @@ class Bridge:
             for owner in tuple(self._mesh.retired.values()):
                 await self._mesh_driver.flush(owner)
 
+    async def _repair_withdrawn_mesh(self) -> None:
+        registry = self._mesh
+        if registry is None or not registry.enabled or not registry.bus.mesh_admission_open:
+            return
+        # Synchronous ingress can admit reappearance while the existing sweep
+        # awaits unrelated work. Repair its current desire before old cleanup.
+        for pid in self._mesh_routing.withdrawn_peripheral_ids:
+            if registry.current(pid) is not None:
+                await self._repair_mesh(pid, force=False)
+        await self._mesh_routing.retry_withdrawn()
+
     async def _repair_mesh(self, peripheral_id: str, *, force: bool) -> None:
         registry = self._mesh
         if registry is None:
@@ -523,8 +534,9 @@ class Bridge:
                     continue
                 self._mesh_route_owners[topic] = owner
                 desired[topic] = DesiredTopic(owner, current, membership=True)
-            for topic, record in tuple(self._mesh_routing.records.items()):
-                if record.peripheral_id == peripheral_id and topic not in desired:
+            for topic in self._mesh_routing.topics(peripheral_id):
+                record = self._mesh_routing.records[topic]
+                if topic not in desired:
                     desired[topic] = DesiredTopic(
                         owner,
                         current,
@@ -572,8 +584,8 @@ class Bridge:
             return
         records = [
             (topic, record)
-            for topic, record in tuple(self._mesh_routing.records.items())
-            if record.peripheral_id == peripheral_id
+            for topic in self._mesh_routing.topics(peripheral_id)
+            if (record := self._mesh_routing.records.get(topic)) is not None
         ]
         records.sort(key=lambda item: item[1].desired.membership is None)
         for topic, record in records:
@@ -942,6 +954,7 @@ class Bridge:
         )
         if self._feedback_alive(lifecycle):
             await self._flush_retired_mesh()
+            await self._repair_withdrawn_mesh()
             await self._enforce_desired(devices)
             await self._repair_mesh_availability()
             await self._drain_mesh_recovery()
@@ -1086,6 +1099,7 @@ class Bridge:
                     return
         if self._feedback_alive(lifecycle):
             await self._flush_retired_mesh()
+            await self._repair_withdrawn_mesh()
             await self._enforce_desired(devices)
             await self._repair_mesh_availability()
             await self._drain_mesh_recovery()
