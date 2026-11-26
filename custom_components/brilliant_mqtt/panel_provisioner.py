@@ -2520,21 +2520,25 @@ class PanelProvisioner:
     ) -> None:
         """Persist operator intent before asking the existing runner to execute it."""
         async with self._lock:
+            await self._async_run_named_operation(
+                self._async_rollback_locked(transaction_id, expected_owner)
+            )
 
-            async def run() -> None:
-                try:
-                    async with asyncio.timeout(RECOVERY_TIMEOUT_SECONDS):
-                        await self._async_rollback_locked(transaction_id, expected_owner)
-                except TimeoutError:
-                    raise PanelProvisioningError("rollback_deadline_exceeded") from None
+    async def _async_run_named_operation(self, operation: Awaitable[None]) -> None:
+        async def run() -> None:
+            try:
+                async with asyncio.timeout(RECOVERY_TIMEOUT_SECONDS):
+                    await operation
+            except TimeoutError:
+                raise PanelProvisioningError("rollback_deadline_exceeded") from None
 
-            outcome = await _settle(run())
-            if outcome.cancellation is not None:
-                raise outcome.cancellation
-            if outcome.error is not None:
-                if isinstance(outcome.error, PanelProvisioningError):
-                    raise outcome.error
-                raise PanelProvisioningError("recovery_failed") from None
+        outcome = await _settle(run())
+        if outcome.cancellation is not None:
+            raise outcome.cancellation
+        if outcome.error is not None:
+            if isinstance(outcome.error, PanelProvisioningError):
+                raise outcome.error
+            raise PanelProvisioningError("recovery_failed") from None
 
     async def _async_rollback_locked(
         self, transaction_id: UUID, expected_owner: PanelOwner | None
@@ -2586,20 +2590,27 @@ class PanelProvisioner:
     ) -> None:
         """Explicit intentional loss of the rollback guarantee, with durable intent."""
         async with self._lock:
-            current = await self._journal.async_load()
-            retained = await self._journal.async_retained(transaction_id)
-            if retained is None:
-                return
-            await self._async_admit_connection(retained.record.panel_request)
-            if retained.recovery_record is not None or (
-                current is not None and self._same_panel(current, retained.record)
-            ):
-                raise PanelProvisioningError("provisioning_recovery_required")
-            if retained.finalization_origin == "ownerless_restored":
-                raise PanelProvisioningError("ownerless_finalize_reauthentication_required")
-            retained = await self._async_bind_named(retained, expected_owner)
-            await self._journal.async_retained_state(transaction_id, "finalizing")
-            await self._async_finalize(retained)
+            await self._async_run_named_operation(
+                self._async_finalize_locked(transaction_id, expected_owner)
+            )
+
+    async def _async_finalize_locked(
+        self, transaction_id: UUID, expected_owner: PanelOwner | None
+    ) -> None:
+        current = await self._journal.async_load()
+        retained = await self._journal.async_retained(transaction_id)
+        if retained is None:
+            raise PanelProvisioningError("baseline_incomplete")
+        await self._async_admit_connection(retained.record.panel_request)
+        if retained.recovery_record is not None or (
+            current is not None and self._same_panel(current, retained.record)
+        ):
+            raise PanelProvisioningError("provisioning_recovery_required")
+        if retained.finalization_origin == "ownerless_restored":
+            raise PanelProvisioningError("ownerless_finalize_reauthentication_required")
+        retained = await self._async_bind_named(retained, expected_owner)
+        await self._journal.async_retained_state(transaction_id, "finalizing")
+        await self._async_finalize(retained)
 
     async def _async_assert_ownerless(self, expected: RetainedRollback) -> None:
         await self._async_admit_connection(expected.record.panel_request)

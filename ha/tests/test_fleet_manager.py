@@ -3050,6 +3050,7 @@ async def test_concurrent_rebinds_serialize_and_stale_snapshot_fails(
 
 async def test_rebind_waits_for_shared_ssh_operation_before_any_write_or_audit(
     hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An old-panel SSH operation must finish before identity ownership can move."""
     entry = _fleet_entry(_panel("office", "SHA256:office", subentry_id="panel-office"))
@@ -3066,51 +3067,70 @@ async def test_rebind_waits_for_shared_ssh_operation_before_any_write_or_audit(
         await fleet.async_setup()
         expected = PanelConfig.from_subentry(entry.subentries["panel-office"])
         manager = fleet.panels["panel-office"]
+        listener_started, listener_release = asyncio.Event(), asyncio.Event()
+        prepare = fleet._async_prepare_provisioning_locked
+
+        async def held_listener() -> None:
+            listener_started.set()
+            await listener_release.wait()
+            await prepare()
+
+        monkeypatch.setattr(fleet, "_async_prepare_provisioning_locked", held_listener)
         await fleet._ssh_lock.acquire()
+        owns_ssh_lock = True
         try:
-            with (
-                patch(
-                    "custom_components.brilliant_mqtt.fleet_manager.async_verify_host_identity",
-                    verified,
-                ),
-                patch(
-                    "custom_components.brilliant_mqtt.fleet_manager.async_wait_config_entry_persisted",
-                    persisted,
-                ),
-                patch.object(manager, "_fire") as audit,
-            ):
-                rebind = asyncio.create_task(
-                    fleet.async_rebind_panel(
-                        "panel-office",
-                        expected,
-                        host="replacement.example.com",
-                        root_password="replacement-secret",
-                        candidate=candidate,
+            try:
+                with (
+                    patch(
+                        "custom_components.brilliant_mqtt.fleet_manager.async_verify_host_identity",
+                        verified,
+                    ),
+                    patch(
+                        "custom_components.brilliant_mqtt.fleet_manager.async_wait_config_entry_persisted",
+                        persisted,
+                    ),
+                    patch.object(manager, "_fire") as audit,
+                ):
+                    rebind = asyncio.create_task(
+                        fleet.async_rebind_panel(
+                            "panel-office",
+                            expected,
+                            host="replacement.example.com",
+                            root_password="replacement-secret",
+                            candidate=candidate,
+                        )
                     )
-                )
-                await asyncio.sleep(0)
+                    await asyncio.sleep(0)
 
-                assert not rebind.done()
-                verified.assert_not_awaited()
-                persisted.assert_not_awaited()
-                audit.assert_not_called()
+                    assert not rebind.done()
+                    verified.assert_not_awaited()
+                    persisted.assert_not_awaited()
+                    audit.assert_not_called()
 
-                fleet._ssh_lock.release()
-                await rebind
+                    fleet._ssh_lock.release()
+                    owns_ssh_lock = False
+                    await rebind
+                    async with asyncio.timeout(5):
+                        await listener_started.wait()
 
-                verified.assert_awaited_once_with(
-                    "replacement.example.com",
-                    candidate,
-                )
-                persisted.assert_awaited_once_with(
-                    hass,
-                    entry,
-                    subentry_id="panel-office",
-                )
-                audit.assert_called_once()
+                    verified.assert_awaited_once_with(
+                        "replacement.example.com",
+                        candidate,
+                    )
+                    persisted.assert_awaited_once_with(
+                        hass,
+                        entry,
+                        subentry_id="panel-office",
+                    )
+                    audit.assert_called_once()
+            finally:
+                if owns_ssh_lock:
+                    fleet._ssh_lock.release()
+                    owns_ssh_lock = False
+            assert fleet._ssh_lock.locked(), "test cleanup must preserve the listener's lock"
         finally:
-            if fleet._ssh_lock.locked():
-                fleet._ssh_lock.release()
+            listener_release.set()
+            await hass.async_block_till_done()
         await fleet.async_shutdown()
 
 
@@ -3196,6 +3216,7 @@ async def test_rebind_rechecks_the_panel_snapshot_after_waiting_for_ssh(
         expected = PanelConfig.from_subentry(entry.subentries["panel-office"])
         manager = fleet.panels["panel-office"]
         await fleet._ssh_lock.acquire()
+        owns_ssh_lock = True
         try:
             with (
                 patch(
@@ -3227,6 +3248,7 @@ async def test_rebind_rechecks_the_panel_snapshot_after_waiting_for_ssh(
                     title="Renamed while queued",
                 )
                 fleet._ssh_lock.release()
+                owns_ssh_lock = False
 
                 with pytest.raises(EntryDataError, match="panel_snapshot_changed"):
                     await rebind
@@ -3243,8 +3265,9 @@ async def test_rebind_rechecks_the_panel_snapshot_after_waiting_for_ssh(
                 assert fleet._panel_configs["panel-office"] == expected
                 assert manager.store.data[CONF_NAME] == "Renamed while queued"
         finally:
-            if fleet._ssh_lock.locked():
+            if owns_ssh_lock:
                 fleet._ssh_lock.release()
+                owns_ssh_lock = False
         await fleet.async_shutdown()
 
 
@@ -3267,6 +3290,7 @@ async def test_rebind_rechecks_duplicate_ownership_after_waiting_for_ssh(
         expected = PanelConfig.from_subentry(entry.subentries["panel-office"])
         manager = fleet.panels["panel-office"]
         await fleet._ssh_lock.acquire()
+        owns_ssh_lock = True
         try:
             with (
                 patch(
@@ -3299,6 +3323,7 @@ async def test_rebind_rechecks_duplicate_ownership_after_waiting_for_ssh(
                 )
                 duplicate_entry.add_to_hass(hass)
                 fleet._ssh_lock.release()
+                owns_ssh_lock = False
 
                 with pytest.raises(
                     EntryDataError,
@@ -3315,8 +3340,9 @@ async def test_rebind_rechecks_duplicate_ownership_after_waiting_for_ssh(
                     expected.identity_fingerprint
                 )
         finally:
-            if fleet._ssh_lock.locked():
+            if owns_ssh_lock:
                 fleet._ssh_lock.release()
+                owns_ssh_lock = False
         await fleet.async_shutdown()
 
 

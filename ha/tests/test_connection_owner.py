@@ -660,8 +660,11 @@ async def test_fleet_starts_healthy_sibling_while_affected_owner_is_deferred(
     monkeypatch.setattr(fm, "async_purge_stale_discovery_configs", AsyncMock())
     fleet = fm.FleetManager(hass, entry)
     await fleet.async_setup()
-    assert set(fleet.panels) == {kitchen.subentry_id}
-    setup.assert_awaited_once()
+    expected_panels = {kitchen.subentry_id}
+    if state in {"restore_requested", "finalizing"}:
+        expected_panels.add(office.subentry_id)
+    assert set(fleet.panels) == expected_panels
+    assert setup.await_count == len(expected_panels)
     assert fleet._recovery_task is None
     issue_id = (
         _issue_id(owner.owner)
@@ -669,6 +672,48 @@ async def test_fleet_starts_healthy_sibling_while_affected_owner_is_deferred(
         else fm._provisioning_repair_issue_id(record.transaction_id)
     )
     assert ir.async_get(hass).async_get_issue(DOMAIN, issue_id) is not None
+    if state in {"restore_requested", "finalizing"}:
+        from functools import partial
+
+        from homeassistant.config_entries import ConfigEntryState
+        from homeassistant.core import ServiceCall
+        from homeassistant.helpers import entity_registry as er
+
+        from custom_components.brilliant_mqtt import _resolve_target_managers
+        from custom_components.brilliant_mqtt.connection_owner import async_resolve_panel_owner
+        from tests.test_panel_provisioner import _Harness
+
+        entry.runtime_data = fleet
+        entry.mock_state(hass, ConfigEntryState.LOADED)
+        entity = er.async_get(hass).async_get_or_create(
+            "binary_sensor",
+            DOMAIN,
+            "current-office",
+            config_entry=entry,
+            config_subentry_id=office.subentry_id,
+        )
+        call = ServiceCall(
+            hass=hass,
+            domain=DOMAIN,
+            service="canary_rollback",
+            data={"entity_id": entity.entity_id, "name": str(record.transaction_id)},
+        )
+        selected = _resolve_target_managers(hass, call)
+        assert selected == [fleet.panels[office.subentry_id]]
+        harness = _Harness()
+        monkeypatch.setattr(harness, "journal", owner.journal)
+        provisioner = harness.provisioner()
+        monkeypatch.setattr(
+            provisioner, "_named_owner_resolver", partial(async_resolve_panel_owner, hass)
+        )
+        monkeypatch.setattr(provisioner, "_async_recover_scoped", AsyncMock())
+        monkeypatch.setattr(provisioner, "_async_finalize", AsyncMock())
+        monkeypatch.setattr(fm, "_get_recovery_provisioner", lambda _hass: provisioner)
+        await selected[0].async_canary_operation(
+            "rollback" if state == "restore_requested" else "finalize", str(record.transaction_id)
+        )
+        retained = await owner.journal.async_retained(record.transaction_id)
+        assert retained is not None and retained.record.panel_request.bound_owner == owner.owner
     await fleet.async_shutdown()
 
 
@@ -784,6 +829,240 @@ async def test_named_rollback_bounds_authorization_before_any_marker(
             await provisioner.async_rollback(record.transaction_id)
     assert await journal.async_retained(record.transaction_id) == before
     assert not provisioner._lock.locked()
+
+
+async def test_named_finalize_bounds_authorization_before_any_marker(
+    hass: HomeAssistant, durable_connection_storage: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+
+    from custom_components.brilliant_mqtt import panel_provisioner as pp
+    from custom_components.brilliant_mqtt.connection_state import PanelOwner
+    from custom_components.brilliant_mqtt.provisioning_journal import StoredPanelRequest
+    from tests.test_panel_provisioner import _Harness
+
+    record = replace(
+        _record(),
+        prior_snapshot=replace(
+            _record().prior_snapshot, baseline=RollbackBaseline("c" * 32, "d" * 64, {})
+        ),
+    )
+    journal = ProvisioningJournal(hass)
+    await journal.async_arm(record)
+    before = await journal.async_retained(record.transaction_id)
+    harness = _Harness()
+    monkeypatch.setattr(harness, "journal", journal)
+    provisioner = harness.provisioner()
+
+    async def blocked(_request: StoredPanelRequest) -> PanelOwner:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(provisioner, "_named_owner_resolver", blocked)
+    monkeypatch.setattr(pp, "RECOVERY_TIMEOUT_SECONDS", 0.01)
+    async with asyncio.timeout(5):
+        with pytest.raises(pp.PanelProvisioningError, match="rollback_deadline_exceeded"):
+            await provisioner.async_finalize(record.transaction_id)
+    assert await journal.async_retained(record.transaction_id) == before
+    assert not provisioner._lock.locked()
+    assert not any(event[0] == "shell_factory" for event in harness.events)
+
+
+async def test_queued_explicit_finalize_refuses_disappeared_target(
+    hass: HomeAssistant, durable_connection_storage: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+
+    from custom_components.brilliant_mqtt.panel_provisioner import PanelProvisioningError
+    from tests.test_panel_provisioner import _Harness
+
+    record = replace(
+        _record(),
+        prior_snapshot=replace(
+            _record().prior_snapshot, baseline=RollbackBaseline("c" * 32, "d" * 64, {})
+        ),
+    )
+    journal = ProvisioningJournal(hass)
+    await journal.async_arm(record)
+    harness = _Harness()
+    monkeypatch.setattr(harness, "journal", journal)
+    provisioner = harness.provisioner()
+    await provisioner._lock.acquire()
+    task = asyncio.create_task(provisioner.async_finalize(record.transaction_id))
+    await asyncio.sleep(0)
+    await journal.async_retained_state(record.transaction_id, "finalizing")
+    await journal.async_remove_retained(record.transaction_id)
+    provisioner._lock.release()
+    with pytest.raises(PanelProvisioningError, match="baseline_incomplete"):
+        await task
+    assert not any(event[0] == "shell_factory" for event in harness.events)
+
+
+async def test_named_finalize_cancellation_keeps_lock_until_remote_write_settles(
+    hass: HomeAssistant, durable_connection_storage: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+
+    from tests.test_panel_provisioner import _Harness
+
+    record = replace(
+        _record(),
+        prior_snapshot=replace(
+            _record().prior_snapshot, baseline=RollbackBaseline("c" * 32, "d" * 64, {})
+        ),
+    )
+    journal = ProvisioningJournal(hass)
+    await journal.async_arm(record)
+    harness = _Harness()
+    monkeypatch.setattr(harness, "journal", journal)
+    provisioner = harness.provisioner()
+    monkeypatch.setattr(provisioner, "_shell_factory", Mock(return_value=harness.shell))
+    monkeypatch.setattr(provisioner, "_credential_resolver", AsyncMock(return_value="fresh-login"))
+    started, release, settled = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def remote_write(*_args: Any) -> None:
+        started.set()
+        await release.wait()
+        settled.set()
+
+    monkeypatch.setattr(harness.operations, "finalize_baseline", remote_write)
+    task = asyncio.create_task(provisioner.async_finalize(record.transaction_id))
+    await started.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    try:
+        assert not task.done()
+        assert provisioner._lock.locked()
+        assert not settled.is_set()
+    finally:
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert settled.is_set()
+    assert await journal.async_retained(record.transaction_id) is None
+
+
+@pytest.mark.parametrize("replace_id", [False, True])
+@pytest.mark.parametrize("during_removal", [False, True])
+async def test_commit_id_drift_preserves_intent_through_retirement(
+    hass: HomeAssistant,
+    durable_connection_storage: None,
+    monkeypatch: pytest.MonkeyPatch,
+    replace_id: bool,
+    during_removal: bool,
+) -> None:
+    from uuid import uuid4
+
+    from custom_components.brilliant_mqtt import connection_owner as co
+
+    panel = _subentry()
+    entry = _fleet_entry(hass, panel)
+    stored = entry.subentries[panel.subentry_id]
+    owner = co.PanelConnectionOwner(hass, entry, stored)
+    finish = ProvisioningJournal.async_finish_connection_change
+    remove = Store.async_remove
+    notified = Mock()
+    monkeypatch.setattr(owner, "_enqueue_runtime", notified)
+
+    def drift() -> None:
+        data = dict(stored.data)
+        if replace_id:
+            data["connection_commit_id"] = str(uuid4())
+        else:
+            data.pop("connection_commit_id")
+        hass.config_entries.async_update_subentry(entry, stored, data=data)
+
+    async def finish_with_drift(journal: ProvisioningJournal, intent: Any, **kwargs: Any) -> None:
+        if not during_removal:
+            drift()
+        await finish(journal, intent, **kwargs)
+
+    async def remove_with_drift(store: Store) -> None:
+        if store.key == JOURNAL_STORAGE_KEY and during_removal:
+            drift()
+        await remove(store)
+
+    monkeypatch.setattr(ProvisioningJournal, "async_finish_connection_change", finish_with_drift)
+    monkeypatch.setattr(Store, "async_remove", remove_with_drift)
+    with pytest.raises(co.ConnectionOwnershipError):
+        await owner.async_commit(host="moved.office.test", password="fresh-login")
+    pending = await owner.journal.async_connection_intents()
+    assert len(pending) == 1
+    assert pending[0].owner == owner.owner
+    assert stored.data[CONF_HOST] == "moved.office.test"
+    assert stored.data[CONF_ROOT_PASSWORD] == "fresh-login"
+    notified.assert_not_called()
+
+
+async def test_commit_retirement_requires_current_commit_id_on_disk(
+    hass: HomeAssistant, durable_connection_storage: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from custom_components.brilliant_mqtt import connection_owner as co
+    from custom_components.brilliant_mqtt import fleet_manager as fm
+
+    panel = _subentry()
+    entry = _fleet_entry(hass, panel)
+    owner = co.PanelConnectionOwner(hass, entry, entry.subentries[panel.subentry_id])
+    finish = ProvisioningJournal.async_finish_connection_change
+    drifted = False
+
+    async def disk_drift(journal: ProvisioningJournal, intent: Any, **kwargs: Any) -> None:
+        nonlocal drifted
+        path = Path(hass.config.path(".storage", "core.config_entries"))
+        raw = json.loads(await hass.async_add_executor_job(path.read_text))
+        stored = next(item for item in raw["data"]["entries"] if item["entry_id"] == entry.entry_id)
+        subentry = next(
+            item for item in stored["subentries"] if item["subentry_id"] == panel.subentry_id
+        )
+        subentry["data"].pop("connection_commit_id")
+        await hass.async_add_executor_job(path.write_text, json.dumps(raw))
+        drifted = True
+        monkeypatch.setattr(fm, "_CONFIG_ENTRY_PERSISTENCE_TIMEOUT_SECONDS", 0.01)
+        await finish(journal, intent, **kwargs)
+
+    monkeypatch.setattr(ProvisioningJournal, "async_finish_connection_change", disk_drift)
+    notify = Mock()
+    monkeypatch.setattr(owner, "_enqueue_runtime", notify)
+    with pytest.raises(co.ConnectionOwnershipError, match="address_change_incomplete"):
+        await owner.async_commit(host="moved.office.test", password="fresh-login")
+    assert drifted
+    assert len(await owner.journal.async_connection_intents()) == 1
+    notify.assert_not_called()
+
+
+async def test_cancelled_retirement_with_disk_drift_restores_pending_evidence(
+    hass: HomeAssistant, durable_connection_storage: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+
+    from custom_components.brilliant_mqtt import connection_owner as co
+    from custom_components.brilliant_mqtt import fleet_manager as fm
+
+    panel = _subentry()
+    entry = _fleet_entry(hass, panel)
+    owner = co.PanelConnectionOwner(hass, entry, entry.subentries[panel.subentry_id])
+    remove = ProvisioningJournal._async_remove
+
+    async def cancel_after_drift(journal: ProvisioningJournal) -> None:
+        await remove(journal)
+        path = Path(hass.config.path(".storage", "core.config_entries"))
+        raw = json.loads(await hass.async_add_executor_job(path.read_text))
+        stored = next(item for item in raw["data"]["entries"] if item["entry_id"] == entry.entry_id)
+        subentry = next(
+            item for item in stored["subentries"] if item["subentry_id"] == panel.subentry_id
+        )
+        subentry["data"].pop("connection_commit_id")
+        await hass.async_add_executor_job(path.write_text, json.dumps(raw))
+        monkeypatch.setattr(fm, "_CONFIG_ENTRY_PERSISTENCE_TIMEOUT_SECONDS", 0.01)
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(ProvisioningJournal, "_async_remove", cancel_after_drift)
+    notify = Mock()
+    monkeypatch.setattr(owner, "_enqueue_runtime", notify)
+    with pytest.raises(asyncio.CancelledError):
+        await owner.async_commit(host="moved.office.test", password="fresh-login")
+    assert len(await owner.journal.async_connection_intents()) == 1
+    notify.assert_not_called()
 
 
 async def test_pending_intent_login_is_redacted_from_active_save_failure(

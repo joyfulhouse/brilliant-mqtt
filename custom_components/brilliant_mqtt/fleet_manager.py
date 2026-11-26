@@ -1491,20 +1491,6 @@ class FleetManager:
                     await _async_report_ownership_unproven(
                         self.hass, retained.record, original_code="restart_recovery"
                     )
-                    for panel_id, data in (
-                        [
-                            (panel.subentry_id, panel.data)
-                            for panel in self.entry.subentries.values()
-                        ]
-                        if self.entry.subentries
-                        else [(self.entry.entry_id, self.entry.data)]
-                    ):
-                        if (
-                            data.get(CONF_PANEL) == retained.record.panel_request.slug
-                            and data.get(CONF_SSH_HOST_KEY)
-                            == retained.record.panel_request.public_key
-                        ):
-                            self._deferred_panel_ids.add(panel_id)
                     continue
                 password = retained.compensation_password(record)
                 if retained.state == "restore_requested" and (

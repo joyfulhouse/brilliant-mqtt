@@ -255,6 +255,19 @@ class PanelConnectionOwner:
         removal_started = False
         issue_reconciliation_failed = False
         cancellation: asyncio.CancelledError | None = None
+
+        def assert_commit() -> None:
+            self.assert_current(proposed)
+            if self.live_data().get(CONNECTION_COMMIT_ID) != intent.commit_id:
+                raise ConnectionOwnershipError("parent_changed")
+
+        async def validate_commit() -> None:
+            assert_commit()
+            await async_wait_config_entry_persisted(
+                self.hass, self.entry, subentry_id=self.owner.subentry_id
+            )
+            assert_commit()
+
         try:
             await self.journal.async_begin_connection_change(intent)
             await self.journal.async_retarget_connection(intent)
@@ -272,15 +285,10 @@ class PanelConnectionOwner:
                 assert self.owner.subentry_id is not None
                 current = self.entry.subentries[self.owner.subentry_id]
                 self.hass.config_entries.async_update_subentry(self.entry, current, data=data)
-            await async_wait_config_entry_persisted(
-                self.hass, self.entry, subentry_id=self.owner.subentry_id
-            )
-            self.assert_current(proposed)
-            if self.live_data().get(CONNECTION_COMMIT_ID) != intent.commit_id:
-                raise ConnectionOwnershipError("parent_changed")
+            await validate_commit()
             removal_started = True
             await self.journal.async_finish_connection_change(
-                intent, validate_owner=lambda: self.assert_current(proposed)
+                intent, validate_owner=validate_commit
             )
             committed = True
         except asyncio.CancelledError as error:
@@ -291,8 +299,7 @@ class PanelConnectionOwner:
             )
             if committed:
                 try:
-                    self.assert_current(proposed)
-                    committed = self.live_data().get(CONNECTION_COMMIT_ID) == intent.commit_id
+                    assert_commit()
                 except ConnectionOwnershipError:
                     committed = False
                 if not committed:

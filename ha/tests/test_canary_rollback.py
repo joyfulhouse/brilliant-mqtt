@@ -2192,7 +2192,7 @@ async def test_restart_during_ownerless_recovery_stays_durable_and_resumable(
     assert "SECRET" not in json.dumps(settled._to_storage())
 
 
-async def test_stuck_journal_blocks_unrelated_panels_with_actionable_code_and_serializes(
+async def test_stuck_journal_blocks_new_updates_and_serializes_independent_finalize(
     hass: HomeAssistant, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from uuid import UUID
@@ -2233,9 +2233,22 @@ async def test_stuck_journal_blocks_unrelated_panels_with_actionable_code_and_se
     identity = _identity_for(record)
     provisioner._identity_fetcher = AsyncMock(return_value=identity)
 
-    # Unrelated operations are refused with an actionable, typed reason.
-    with pytest.raises(PanelProvisioningError, match="provisioning_recovery_required"):
-        await provisioner.async_finalize(other.transaction_id)
+    active_before = await journal.async_load()
+    ownerless_before = await journal.async_retained(record.transaction_id)
+    await provisioner.async_finalize(other.transaction_id)
+    assert await journal.async_load() == active_before
+    assert await journal.async_retained(record.transaction_id) == ownerless_before
+    assert await journal.async_retained(other.transaction_id) is None
+
+    # Arm a new independent baseline to exercise the queued finalization below.
+    next_snapshot = await panel_ops.capture_baseline(back, await panel_ops.snapshot_panel(back))
+    other = replace(
+        other, transaction_id=uuid4(), prior_snapshot=stored_snapshot_from_panel(next_snapshot)
+    )
+    await journal.async_arm(other)
+    await journal.async_retained_state(other.transaction_id, "soak")
+
+    # New provisioning still needs the one active slot and refuses with a typed reason.
     async with provisioner._lock:
         with pytest.raises(PanelProvisioningError, match="provisioning_recovery_required"):
             async with provisioner.async_managed_update(

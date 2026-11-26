@@ -7,7 +7,7 @@ import base64
 import binascii
 import logging
 import re
-from collections.abc import Callable, Coroutine, Mapping
+from collections.abc import Awaitable, Callable, Coroutine, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -1506,7 +1506,10 @@ class ProvisioningJournal:
                 await self._async_retained_save(changed)
 
     async def async_finish_connection_change(
-        self, intent: ConnectionIntent, *, validate_owner: Callable[[], None] | None = None
+        self,
+        intent: ConnectionIntent,
+        *,
+        validate_owner: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         async with self._coordinator.lock:
             await self._async_reload()
@@ -1559,7 +1562,7 @@ class ProvisioningJournal:
             intents = dict(self._coordinator.intents)
             del intents[intent.commit_id]
             if validate_owner is not None:
-                validate_owner()
+                await validate_owner()
             original_intents = dict(self._coordinator.intents)
             try:
                 if active is None and not intents:
@@ -1577,7 +1580,13 @@ class ProvisioningJournal:
                             key: item.to_storage() for key, item in intents.items()
                         },
                     }
-                if verified.error is not None or verified.result != expected:
+                proven = verified.error is None and verified.result == expected
+                if proven and validate_owner is not None:
+                    try:
+                        await validate_owner()
+                    except BaseException:
+                        proven = False
+                if not proven:
                     await self._async_save_envelope(active, original_intents)
                 raise
             except Exception:
@@ -1585,8 +1594,8 @@ class ProvisioningJournal:
                 raise
             if validate_owner is not None:
                 try:
-                    validate_owner()
-                except Exception:
+                    await validate_owner()
+                except BaseException:
                     intents[intent.commit_id] = intent
                     await self._async_save_envelope(active, intents)
                     raise
