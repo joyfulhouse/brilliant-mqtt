@@ -455,11 +455,16 @@ async def test_named_rollback_recovery_rejects_foreign_owner(
             is not None
         )
     else:
-        provisioner = _Harness().provisioner()
+        harness = _Harness()
+        provisioner = harness.provisioner()
         provisioner._journal = journal
         provisioner._credential_resolver = partial(fleet_manager._async_rollback_credential, hass)
-        with pytest.raises(PanelProvisioningError, match="rollback_credentials_unavailable"):
+        provisioner._recovery_authorizer = partial(
+            fleet_manager._async_authorize_recorded_recovery, hass
+        )
+        with pytest.raises(PanelProvisioningError, match="provisioning_recovery_required"):
             await provisioner.async_recover()
+        assert not any(event[0] == "shell_factory" for event in harness.events)
     assert await journal.async_load() == before
     assert await journal.async_retained(record.transaction_id) == retained_before
 

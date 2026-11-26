@@ -1490,7 +1490,11 @@ class FleetManager:
                     from .connection_owner import async_resolve_panel_owner
 
                     try:
-                        if retained.record.panel_request.bound_owner is None:
+                        # A restore interrupted before scoped publication needs a fresh action.
+                        if (
+                            retained.state == "restore_requested"
+                            or retained.record.panel_request.bound_owner is None
+                        ):
                             raise EntryDataError("provisioning_ownership_mismatch")
                         await async_resolve_panel_owner(self.hass, retained.record.panel_request)
                     except ValueError:
@@ -1499,15 +1503,7 @@ class FleetManager:
                         )
                         continue
                 password = retained.compensation_password(record)
-                if retained.state == "restore_requested" and (
-                    record is None or password is not None
-                ):
-                    if password is None:
-                        password = await _async_rollback_credential(
-                            self.hass, retained.record.panel_request
-                        )
-                    if password is None:
-                        raise EntryDataError("rollback_credentials_unavailable")
+                if retained.state == "restore_requested" and password is not None:
                     await journal.async_begin_restore(retained.record.transaction_id, password)
                     record = await journal.async_load()
                 elif (

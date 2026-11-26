@@ -828,16 +828,21 @@ async def test_original_named_owner_removal_defers_scoped_dispatch(
     assert await journal.async_retained(record.transaction_id) is not None
 
 
-@pytest.mark.parametrize("state", ["restore_requested", "finalizing"])
-async def test_removed_owner_of_bound_legacy_marker_preserves_sibling_startup(
+@pytest.mark.parametrize(
+    ("state", "owner_removed"),
+    [("restore_requested", True), ("finalizing", True), ("restore_requested", False)],
+)
+async def test_unresolved_bound_legacy_marker_preserves_sibling_startup(
     hass: HomeAssistant,
     durable_connection_storage: None,
     monkeypatch: pytest.MonkeyPatch,
     state: str,
+    owner_removed: bool,
 ) -> None:
     from homeassistant.helpers import issue_registry as ir
 
     from custom_components.brilliant_mqtt import fleet_manager as fm
+    from custom_components.brilliant_mqtt.connection_owner import PanelConnectionOwner
     from custom_components.brilliant_mqtt.connection_state import PanelOwner
     from custom_components.brilliant_mqtt.const import DOMAIN
     from custom_components.brilliant_mqtt.manager import PanelManager
@@ -850,7 +855,8 @@ async def test_removed_owner_of_bound_legacy_marker_preserves_sibling_startup(
         fingerprint=_OTHER_FINGERPRINT,
         public_key=_OTHER_PUBLIC_KEY,
     )
-    entry = _fleet_entry(hass, kitchen)
+    office = _subentry()
+    entry = _fleet_entry(hass, kitchen) if owner_removed else _fleet_entry(hass, office, kitchen)
     journal = ProvisioningJournal(hass)
     record = replace(
         _record(),
@@ -862,9 +868,12 @@ async def test_removed_owner_of_bound_legacy_marker_preserves_sibling_startup(
     await journal.async_retained_state(record.transaction_id, state)
     row = await journal.async_retained(record.transaction_id)
     assert row is not None
-    before = await journal.async_bind_retained(
-        row, PanelOwner(entry.entry_id, "removed-office", "office", record.panel_request.public_key)
+    original_owner = (
+        PanelOwner(entry.entry_id, "removed-office", "office", record.panel_request.public_key)
+        if owner_removed
+        else PanelConnectionOwner(hass, entry, entry.subentries[office.subentry_id]).owner
     )
+    before = await journal.async_bind_retained(row, original_owner)
     setup = AsyncMock()
     monkeypatch.setattr(PanelManager, "async_setup", setup)
     monkeypatch.setattr(PanelManager, "async_shutdown", AsyncMock())
@@ -874,8 +883,11 @@ async def test_removed_owner_of_bound_legacy_marker_preserves_sibling_startup(
     fleet = fm.FleetManager(hass, entry)
     try:
         await fleet.async_setup()
-        assert set(fleet.panels) == {kitchen.subentry_id}
-        setup.assert_awaited_once()
+        expected_panels = {kitchen.subentry_id}
+        if not owner_removed:
+            expected_panels.add(office.subentry_id)
+        assert set(fleet.panels) == expected_panels
+        assert setup.await_count == len(expected_panels)
         assert fleet._recovery_task is None
         assert await journal.async_retained(record.transaction_id) == before
         assert await journal.async_load() is None
@@ -885,21 +897,51 @@ async def test_removed_owner_of_bound_legacy_marker_preserves_sibling_startup(
             )
             is not None
         )
+        if not owner_removed:
+            from homeassistant.config_entries import ConfigEntryState
+            from homeassistant.core import ServiceCall
+            from homeassistant.helpers import entity_registry as er
+
+            from custom_components.brilliant_mqtt import _resolve_target_managers
+
+            entry.runtime_data = fleet
+            entry.mock_state(hass, ConfigEntryState.LOADED)
+            entity = er.async_get(hass).async_get_or_create(
+                "binary_sensor",
+                DOMAIN,
+                "bound-office",
+                config_entry=entry,
+                config_subentry_id=office.subentry_id,
+            )
+            call = ServiceCall(
+                hass=hass,
+                domain=DOMAIN,
+                service="canary_rollback",
+                data={"entity_id": entity.entity_id, "name": str(record.transaction_id)},
+            )
+            assert _resolve_target_managers(hass, call) == [fleet.panels[office.subentry_id]]
     finally:
         await fleet.async_shutdown()
 
 
-@pytest.mark.parametrize("state", ["restore_requested", "finalizing"])
-async def test_removed_owner_of_bound_legacy_marker_preserves_unrelated_recovery(
+@pytest.mark.parametrize(
+    ("state", "owner_removed"),
+    [("restore_requested", True), ("finalizing", True), ("restore_requested", False)],
+)
+async def test_unresolved_bound_legacy_marker_preserves_unrelated_recovery(
     hass: HomeAssistant,
     durable_connection_storage: None,
     monkeypatch: pytest.MonkeyPatch,
     state: str,
+    owner_removed: bool,
 ) -> None:
     from functools import partial
     from uuid import uuid4
 
-    from custom_components.brilliant_mqtt.connection_owner import async_resolve_panel_owner
+    from custom_components.brilliant_mqtt.connection_owner import (
+        PanelConnectionOwner,
+        async_resolve_panel_owner,
+    )
     from custom_components.brilliant_mqtt.connection_state import PanelOwner
     from custom_components.brilliant_mqtt.fleet_manager import _async_rollback_credential
     from tests.test_config_flow import _OTHER_FINGERPRINT, _OTHER_PUBLIC_KEY
@@ -912,7 +954,8 @@ async def test_removed_owner_of_bound_legacy_marker_preserves_unrelated_recovery
         fingerprint=_OTHER_FINGERPRINT,
         public_key=_OTHER_PUBLIC_KEY,
     )
-    entry = _fleet_entry(hass, kitchen)
+    office = _subentry()
+    entry = _fleet_entry(hass, kitchen) if owner_removed else _fleet_entry(hass, office, kitchen)
     journal = ProvisioningJournal(hass)
     record = replace(
         _record(),
@@ -923,11 +966,15 @@ async def test_removed_owner_of_bound_legacy_marker_preserves_unrelated_recovery
     await journal.async_arm(record)
     row = await journal.async_retained(record.transaction_id)
     assert row is not None
-    await journal.async_bind_retained(
-        row, PanelOwner(entry.entry_id, "removed-office", "office", record.panel_request.public_key)
+    original_owner = (
+        PanelOwner(entry.entry_id, "removed-office", "office", record.panel_request.public_key)
+        if owner_removed
+        else PanelConnectionOwner(hass, entry, entry.subentries[office.subentry_id]).owner
     )
+    await journal.async_bind_retained(row, original_owner)
     await journal.async_retained_state(record.transaction_id, state)
     before = await journal.async_retained(record.transaction_id)
+    assert before is not None
     active = replace(
         _record(),
         transaction_id=uuid4(),
@@ -960,6 +1007,16 @@ async def test_removed_owner_of_bound_legacy_marker_preserves_unrelated_recovery
     assert await journal.async_retained(record.transaction_id) == before
     assert await journal.async_load() == active
     assert not any(event[0] == "shell_factory" for event in harness.events)
+    if not owner_removed:
+        scoped_recover = AsyncMock()
+        monkeypatch.setattr(provisioner, "_async_recover_scoped", scoped_recover)
+        await provisioner.async_rollback(record.transaction_id, expected_owner=original_owner)
+        scoped_recover.assert_awaited_once()
+        after = await journal.async_retained(record.transaction_id)
+        assert after is not None and after.recovery_record is not None
+        assert after.record == before.record
+        assert after.recovery_record.panel_request.bound_owner == original_owner
+        assert await journal.async_load() == active
 
 
 async def test_fresh_verified_notification_retry_uses_committed_tuple_without_new_intent(
@@ -1450,8 +1507,12 @@ async def test_scoped_restored_evidence_still_refuses_finalize_before_cleanup(
     assert await journal.async_retained(target.transaction_id) == before
 
 
+@pytest.mark.parametrize("reader", ["explicit", "cold_recovery"])
 async def test_same_transaction_active_rollback_continues_without_scoped_reseed(
-    hass: HomeAssistant, durable_connection_storage: None, monkeypatch: pytest.MonkeyPatch
+    hass: HomeAssistant,
+    durable_connection_storage: None,
+    monkeypatch: pytest.MonkeyPatch,
+    reader: str,
 ) -> None:
     from tests.test_panel_provisioner import _Harness, _release_link_snapshot
 
@@ -1463,16 +1524,26 @@ async def test_same_transaction_active_rollback_continues_without_scoped_reseed(
     active = await journal.async_load()
     assert active is not None and active.operation is ProvisioningOperation.ROLLBACK
     harness = _Harness()
-    monkeypatch.setattr(harness, "journal", journal)
+    monkeypatch.setattr(harness, "journal", ProvisioningJournal(hass))
     provisioner = harness.provisioner()
     execute = AsyncMock()
     monkeypatch.setattr(provisioner, "_async_recover_record", execute)
-    with patch.object(
-        ProvisioningJournal,
-        "async_begin_scoped_restore",
-        AsyncMock(side_effect=AssertionError("no reseed")),
+    with (
+        patch.object(
+            ProvisioningJournal,
+            "async_begin_scoped_restore",
+            AsyncMock(side_effect=AssertionError("no scoped reseed")),
+        ),
+        patch.object(
+            ProvisioningJournal,
+            "async_begin_restore",
+            AsyncMock(side_effect=AssertionError("no global reseed")),
+        ),
     ):
-        await provisioner.async_rollback(target.transaction_id)
+        if reader == "explicit":
+            await provisioner.async_rollback(target.transaction_id)
+        else:
+            await provisioner.async_recover()
     execute.assert_awaited_once()
     assert execute.call_args.args[0] == active
     assert await journal.async_load() == active

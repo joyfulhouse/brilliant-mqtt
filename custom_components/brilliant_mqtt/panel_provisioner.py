@@ -1971,7 +1971,8 @@ class PanelProvisioner:
             elif retained.state == "restore_requested":
                 password = retained.compensation_password(await self._journal.async_load())
                 if password is None:
-                    password = await self._resolve_credential(retained.record.panel_request)
+                    # Fresh explicit named authorization must publish scoped recovery first.
+                    continue
                 await self._journal.async_begin_restore(retained.record.transaction_id, password)
         record = await self._journal.async_load()
         if record is not None:
