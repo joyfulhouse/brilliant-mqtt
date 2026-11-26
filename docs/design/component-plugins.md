@@ -85,8 +85,12 @@ do not install if the profile lacks a surviving local recovery path. A failed
 rescue leaves plugin access fenced, records a persistent/local failure and
 requires the named on-site recovery owner; it must never loop or reboot.
 
-Only the first-party helper may change stock service state. Plugin processes
-cannot run `systemctl`, edit units/drop-ins, invoke privileged installers, reboot,
+The first-party helper is the sole normal stock-state writer. The independent
+first-party rescue is its only permitted successor, after verified helper
+fencing/quiescence and exclusive recovery takeover. All other writers are
+denied. The helper-failure acceptance test must exercise that identity transfer.
+Plugin processes cannot run `systemctl`, edit units/drop-ins, invoke privileged
+installers, reboot,
 write firmware, use the root SSH identity, or alter the helper/journal. Root
 installation code is part of the reviewed trusted computing base; sandboxing a
 runtime cannot make arbitrary root install hooks safe. No manifest-supplied
@@ -535,6 +539,26 @@ must work when HA is unavailable and pass local-control readiness before
 handoff completes; HA API access cannot substitute. Test denied scopes offline,
 and qualify actuation only on the separately authorized safe circuit.
 
+HA loss and MQTT broker loss are separate qualification cases. Today
+`src/brilliant_mqtt/__main__.py` connects MQTT before starting the bus adapter;
+MQTT reader failure can rebuild the session and close that adapter. Therefore
+an HA-offline pass with a healthy broker cannot qualify the local IPC lifetime.
+The proposed v1 default is bounded stock handback when local IPC/control
+readiness is unavailable: refuse activation if the broker is unreachable at
+startup; on broker loss after commit, expire local-control readiness within
+five seconds and hand back once to qualified stock UI within the 180-second
+recovery bound, independently of bridge, HA and MQTT. Verify stock's local
+wired controls through the firmware profile without waiting for bridge health
+or a broker acknowledgement. This fallback profile admits only baseline stock
+UI states whose saved persistent policy and current boot state permit a working
+stock handback; a masked/inactive baseline that cannot meet it is ineligible
+and remains unmodified. Fence queued commands with a fresh authority epoch
+on reconnect. Remain stock-owned until explicit enable; never cycle kiosk
+automatically, restart the protected bus or claim readiness during the gap.
+A future option may retain the same bridge bus adapter with a broker-independent
+lifetime, but requires a separately reviewed core change and outage evidence;
+this design does not claim that today's bridge already supports it.
+
 Proposed v1 hard limits per plugin: 16 KiB messages, 64 queued events, two
 in-flight requests, five semantic requests/second (burst ten), with lower
 profile-specific bus-write limits. Core traffic has priority. Overflow drops
@@ -791,6 +815,11 @@ revocation, expired trust metadata and bad clock evidence for every activation
 path. Network tests reject same-IP alternate Host/SNI, direct-egress bypass,
 DNS rebinding and cross-origin redirects. Kiosk's own-wired semantic requests
 must pass with HA unavailable while mesh/foreign/calibration requests fail.
+Separately test broker unreachable at startup and broker loss after commit,
+with HA unavailable too. For v1, assert refused activation or one bounded stock
+handback with independent stock-control readiness, no MQTT wait, no reboot/bus
+restart, no false kiosk readiness, no automatic retry cycle and stale-command
+rejection on reconnect. Use fakes first; live actuation needs separate approval.
 
 Live evidence must identify exact firmware/profile/release digests, original
 states, successful stock handback on failure and uninstall, measured net/peak
