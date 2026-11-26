@@ -243,3 +243,22 @@ async def test_dispose_removes_registrations_and_prevents_accidental_reacquisiti
     assert adapter._mesh_write_guard is None
     with pytest.raises(RuntimeError, match="disposed"):
         registry.acquire()
+
+
+async def test_native_retype_with_same_normalized_kind_replaces_lifetime(
+    registry_rig: tuple[MeshRegistry, _RawDevice],
+) -> None:
+    registry, raw = registry_rig
+    adapter = cast(RpcBusAdapter, registry.bus)
+    assert raw.peripherals is not None
+    raw.peripherals["load"].peripheral_type = 45
+    registry.acquire()
+    await adapter.get_all()
+    old = registry.current("load")
+    assert old is not None
+    raw.peripherals["load"].peripheral_type = 40
+    await adapter.get_all()
+    current = registry.current("load")
+    assert current is not None and current is not old
+    assert not old.active
+    assert current.metadata.peripheral_type == 40

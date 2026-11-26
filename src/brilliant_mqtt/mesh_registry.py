@@ -212,6 +212,7 @@ class MeshRegistry:
             metadata.device_id,
             metadata.peripheral_id,
             metadata.kind,
+            metadata.peripheral_type,
             metadata.binding_dimmable,
             metadata.binding_max_intensity,
         )
