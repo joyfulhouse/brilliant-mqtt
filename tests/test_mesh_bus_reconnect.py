@@ -104,3 +104,16 @@ async def test_replaced_session_hook_cannot_invalidate_successor(
     await asyncio.sleep(0)
     assert adapter.capture_generation == generation
     await adapter.shutdown()
+
+
+async def test_public_local_boundaries_share_read_push_issue_sequence_domain() -> None:
+    adapter = RpcBusAdapter(clock=lambda: 7)
+    first = adapter.reserve_mesh_boundary("mqtt")
+    adapter._on_proc_reconnect()
+    second = adapter.reserve_mesh_boundary("timer")
+    assert first.incarnation == second.incarnation == adapter.capture_source
+    assert second.source_generation > first.source_generation
+    assert second.sequence > first.sequence
+    assert (first.origin, second.origin) == ("mqtt", "timer")
+    assert first.captured_at == second.captured_at == 7
+    await adapter.shutdown()

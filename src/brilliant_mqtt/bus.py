@@ -366,7 +366,14 @@ class _PendingPeripheral:
     peripheral id.
     """
 
-    __slots__ = ("capture_provenance", "peripheral_id", "snapshot", "normalized", "hardware_count")
+    __slots__ = (
+        "capture_provenance",
+        "peripheral_id",
+        "snapshot",
+        "normalized",
+        "hardware_count",
+        "metadata_carrier",
+    )
 
     def __init__(
         self,
@@ -380,6 +387,7 @@ class _PendingPeripheral:
         self.capture_provenance = capture_provenance
         self.hardware_count = hardware_count
         self.normalized: BrilliantDevice | None = None
+        self.metadata_carrier: BrilliantDevice | None = None
 
 
 def _snapshot_peripheral(raw: Any, names: frozenset[str] | None = None) -> _PeripheralSnapshot:
@@ -624,6 +632,7 @@ class RpcBusAdapter:
         self._change_cbs: list[
             tuple[Callable[[BrilliantDevice], Awaitable[None]], bool, Callable[[str], bool] | None]
         ] = []
+        self._mesh_metadata_cbs: set[Callable[[BrilliantDevice], Awaitable[None]]] = set()
         self._reconnect_cbs: list[Callable[[], Awaitable[None]]] = []
         # Re-issues this session's subscription; bound as a closure in start()
         # so the reconnect path never needs panel imports of its own.
@@ -879,6 +888,8 @@ class RpcBusAdapter:
                 return False
             admission.issued = True
             admission.ticket._issued_at = boundary
+            admission.ticket._on_issued = None
+            admission.ticket._on_refused = None
             return True
 
     def _native_return(self, admission: _WriteAdmission, outcome: str | BaseException) -> None:
@@ -949,7 +960,7 @@ class RpcBusAdapter:
         *,
         complete: bool,
         mask: _PeripheralMask | None = None,
-    ) -> None:
+    ) -> MeshMetadata:
         reliable = complete or (
             mask is not None
             and mask.reliable
@@ -999,6 +1010,22 @@ class RpcBusAdapter:
                 ),
                 (sink,),
             )
+        return metadata
+
+    @staticmethod
+    def _mesh_carrier(
+        metadata: MeshMetadata, boundary: CaptureProvenance, *, complete: bool
+    ) -> BrilliantDevice:
+        """Routing metadata only; typed ingress/owner owns all observed state."""
+        return BrilliantDevice(
+            metadata.device_id,
+            metadata.peripheral_id,
+            metadata.name,
+            metadata.kind,
+            peripheral_type=metadata.peripheral_type,
+            capture_provenance=boundary,
+            capture_complete=complete,
+        )
 
     @property
     def capture_generation(self) -> int:
@@ -1051,6 +1078,10 @@ class RpcBusAdapter:
             origin=origin,
             captured_at=self._clock(),
         )
+
+    def reserve_mesh_boundary(self, origin: str) -> CaptureProvenance:
+        """Reserve a loop-local caller/lifecycle/timer/MQTT event in the bus domain."""
+        return self._next_capture_provenance(origin)
 
     def _field_capture(
         self,
@@ -1329,6 +1360,7 @@ class RpcBusAdapter:
             else tuple((pid, None) for pid in peripherals)
         )
         holders: list[_PendingPeripheral] = []
+        legacy_variables = any(cb not in self._mesh_metadata_cbs for cb, _ in admitted)
         for pid, mask in candidates:
             if mask is not None and mask.deleted:
                 if pid not in peripherals:
@@ -1338,9 +1370,15 @@ class RpcBusAdapter:
             if not scopes or pid not in peripherals:
                 continue
             fields = frozenset().union(*(names for _, names in scopes))
-            snapshot = _snapshot_peripheral(peripherals[pid], fields | {"display_name"})
-            self._mesh_capture(pid, snapshot, boundary, scopes, complete=False, mask=mask)
-            holders.append(_PendingPeripheral(pid, snapshot, boundary, 0))
+            snapshot = _snapshot_peripheral(
+                peripherals[pid], None if legacy_variables else fields | {"display_name"}
+            )
+            metadata = self._mesh_capture(
+                pid, snapshot, boundary, scopes, complete=False, mask=mask
+            )
+            holder = _PendingPeripheral(pid, snapshot, boundary, 0)
+            holder.metadata_carrier = self._mesh_carrier(metadata, boundary, complete=False)
+            holders.append(holder)
         if not self.mesh_admission_open:
             return
         for cb, coalesce in admitted:
@@ -1395,6 +1433,11 @@ class RpcBusAdapter:
                     if self._shutting_down or session != self._session:
                         return
                     try:
+                        if device_id == "ble_mesh" and cb in self._mesh_metadata_cbs:
+                            carrier = pending_peripheral.metadata_carrier
+                            if carrier is not None:
+                                await cb(carrier)
+                                continue
                         # Normalize inside the guard so a normalize failure logs
                         # and skips this peripheral (as main's broad handler
                         # catch did) instead of killing the worker and silently
@@ -1588,14 +1631,9 @@ class RpcBusAdapter:
                     snapshot = _snapshot_peripheral(
                         raw_device.peripherals[pid], fields | {"display_name"}
                     )
-                    self._mesh_capture(pid, snapshot, boundary, scopes, complete=True)
+                    metadata = self._mesh_capture(pid, snapshot, boundary, scopes, complete=True)
                     if self.mesh_admission_open:
-                        devices.append(
-                            replace(
-                                normalize_peripheral(device_id, pid, snapshot),
-                                capture_provenance=boundary,
-                            )
-                        )
+                        devices.append(self._mesh_carrier(metadata, boundary, complete=True))
                 continue
             raw_peripherals = dict(raw_device.peripherals)
             self._capture_privacy_revocation(device_id, boundary, raw_peripherals.values())
@@ -1626,14 +1664,11 @@ class RpcBusAdapter:
             return None
         if device_id == "ble_mesh" and self._mesh_sinks:
             scopes = self._mesh_fields(peripheral_id)
-            if not scopes:
-                return None
-            fields = frozenset().union(*(names for _, names in scopes))
-            snapshot = _snapshot_peripheral(raw, fields | {"display_name"})
-            self._mesh_capture(peripheral_id, snapshot, boundary, scopes, complete=True)
-            if not self.mesh_admission_open:
-                return None
-            raw = snapshot
+            if scopes:
+                # Scoped reads are also an explicit compatibility data request,
+                # including resident slider backup/read-back without a load owner.
+                raw = _snapshot_peripheral(raw)
+                self._mesh_capture(peripheral_id, raw, boundary, scopes, complete=True)
         return replace(
             normalize_peripheral(device_id, peripheral_id, raw),
             capture_provenance=self._field_capture(
@@ -1651,6 +1686,7 @@ class RpcBusAdapter:
         *,
         coalesce_pushes: bool = True,
         want_device: Callable[[str], bool] | None = None,
+        mesh_metadata_only: bool = False,
     ) -> None:
         """Register a change callback fired by :meth:`_dispatch_raw_device`.
 
@@ -1664,6 +1700,8 @@ class RpcBusAdapter:
         Bridge/mesh-agnostic — it only ever calls an opaque ``str -> bool``.
         """
         self._change_cbs.append((cb, coalesce_pushes, want_device))
+        if mesh_metadata_only:
+            self._mesh_metadata_cbs.add(cb)
 
     def consume_write_timeout(self) -> bool:
         """Return and clear the outbound-write timeout latch."""

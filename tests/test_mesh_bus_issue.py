@@ -357,3 +357,45 @@ async def test_bounded_teardown_detaches_straggler_waiter_without_native_outcome
     assert ticket.returned_at is not None
     assert harness.adapter.outstanding_mesh_ticket("p") is None
     assert not harness.adapter._write_locks["ble_mesh"].locked()
+
+
+async def test_real_native_acceptance_and_masked_contradiction_precede_waiter_resume(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from brilliant_mqtt.mesh_ingress import MeshCapture
+    from brilliant_mqtt.mesh_settlement_types import Observe
+    from tests.fakes import _RawDevice, _RawPeripheral
+    from tests.test_mesh_bus_ingress import delta, notify
+
+    observer, adapter = _gated_adapter()
+    owner = owner_for(adapter)
+    ticket = bind(adapter, owner)
+
+    def ingress(event: object) -> None:
+        if isinstance(event, MeshCapture):
+            owner.dispatch(Observe(envelope(owner, event.provenance), event.capture))
+
+    remove = adapter.register_mesh_sink(ingress, want_fields=lambda _pid: frozenset({"on"}))
+    held: list[tuple[bus_mod._WriteAdmission, asyncio.Task[str]]] = []
+    original = adapter._finish_admission
+    monkeypatch.setattr(
+        adapter, "_finish_admission", lambda admission, task: held.append((admission, task))
+    )
+    caller = asyncio.create_task(
+        adapter.set_variables("ble_mesh", "p", [VarSet("on", "0")], ticket=ticket)
+    )
+    await _settle()
+    observer.release.set()
+    await asyncio.gather(*adapter._write_tasks)
+    await _settle()
+    assert owner.view.phase is Phase.ACCEPTED
+    assert owner.view.status == "pending"
+    assert not caller.done()
+    await notify(adapter, _RawDevice("ble_mesh", {"p": _RawPeripheral("1")}), [delta("p", "on")])
+    assert owner.view.status == "contradicted"
+    assert owner.render(adapter._clock())["state"] == "ON"
+    assert not caller.done()
+    original(*held[0])
+    assert await caller == "'ok'"
+    remove()
+    await adapter.shutdown()

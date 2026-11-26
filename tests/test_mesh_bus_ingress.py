@@ -23,13 +23,15 @@ class Native:
 
     async def get_device(self, device_id: str) -> object:
         self.reads.append(device_id)
+        if device_id != "ble_mesh":
+            return _RawDevice(device_id, {})
         self.started.set()
         await self.release.wait()
-        if device_id == "ble_mesh" and isinstance(self.raw, BaseException):
+        if isinstance(self.raw, BaseException):
             raise self.raw
-        return self.raw if device_id == "ble_mesh" else _RawDevice(device_id, {})
+        return self.raw
 
-    async def get_peripheral(self, device_id: str, peripheral_id: str) -> None:
+    async def get_peripheral(self, device_id: str, peripheral_id: str) -> _RawPeripheral | None:
         return None
 
     async def shutdown(self) -> None:
@@ -220,13 +222,10 @@ async def test_read_start_provenance_survives_reconnect_and_scoped_absence() -> 
     native.release.clear()
     read = asyncio.create_task(adapter.get_all())
     await native.started.wait()
-    native.release.set()
-    # The first read is own; let it finish and reserve the mesh read boundary.
-    for _ in range(4):
-        await asyncio.sleep(0)
     old_generation = adapter.capture_generation
     adapter._on_proc_reconnect()
     clock.advance(5)
+    native.release.set()
     await read
     captures = [event for event in seen if isinstance(event, MeshCapture)]
     assert captures[0].provenance.source_generation == old_generation
@@ -236,4 +235,127 @@ async def test_read_start_provenance_survives_reconnect_and_scoped_absence() -> 
     await adapter.get_peripheral("ble_mesh", "missing")
     assert isinstance(seen[-1], MeshPeripheralAbsent)
     assert seen[-1].provenance.sequence > previous
+    await adapter.shutdown()
+
+
+async def test_capture_sink_failure_closes_mesh_admission_but_keeps_wired_service() -> None:
+    from brilliant_mqtt.commands import VarSet
+    from brilliant_mqtt.write_admission import AdmissionTicket, WriteCancelled
+    from tests.test_write_admission import _Harness
+
+    harness = _Harness()
+
+    def fail(_event: object) -> None:
+        raise RuntimeError("sink")
+
+    harness.adapter.register_mesh_sink(fail, want_fields=lambda _pid: frozenset({"on"}))
+    await notify(
+        harness.adapter, _RawDevice("ble_mesh", {"p": _RawPeripheral()}), [delta("p", "on")]
+    )
+    assert not harness.adapter.mesh_admission_open
+    assert harness.adapter.consume_mesh_fatal()
+    ticket = AdmissionTicket()
+    with pytest.raises(WriteCancelled):
+        await harness.adapter.set_variables("ble_mesh", "p", [VarSet("on", "0")], ticket=ticket)
+    assert ticket.settled
+    assert ticket.returned_at is None
+    assert harness.observer.calls == []
+    harness.observer.release_all = True
+    assert await harness.adapter.set_variables("own-device", "p", [VarSet("on", "0")]) == "'ok'"
+    await harness.adapter.shutdown()
+
+
+async def test_mesh_reads_pushes_and_writes_never_scan_or_allocate_wired_eras() -> None:
+    from collections.abc import Iterator
+
+    from brilliant_mqtt.commands import VarSet
+
+    class NoMeshAccess(dict[tuple[str, str, str], int]):
+        def __iter__(self) -> Iterator[tuple[str, str, str]]:
+            raise AssertionError("mesh era scan")
+
+        def __setitem__(self, key: tuple[str, str, str], value: int) -> None:
+            raise AssertionError("mesh era allocation")
+
+    adapter, native, _ = adapter_for(_RawDevice("ble_mesh", {"p": _RawPeripheral()}))
+    adapter._field_eras = NoMeshAccess({("own", "wired", "on"): 4})
+    captured: list[Any] = []
+    adapter.register_mesh_sink(captured.append, want_fields=lambda _pid: frozenset({"on"}))
+    await adapter.get_all()
+    assert native.reads == ["own", "ble_mesh"]
+    await notify(adapter, _RawDevice("ble_mesh", {"p": _RawPeripheral()}), [delta("p", "on")])
+    from tests.fakes import _GatedRpcObserver
+
+    writer = _GatedRpcObserver()
+    writer.release.set()
+    adapter._obs = writer
+    assert await adapter.set_variables("ble_mesh", "p", [VarSet("on", "0")]) == "'ok'"
+    assert len(adapter._field_eras) == 1
+    await adapter.shutdown()
+
+
+async def test_registered_mesh_reads_and_opted_callbacks_use_metadata_carriers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from brilliant_mqtt.model import BrilliantDevice
+
+    raw = _RawDevice("ble_mesh", {"p": _RawPeripheral()})
+    adapter, _, _ = adapter_for(raw)
+    events: list[object] = []
+    delivered: list[BrilliantDevice] = []
+    adapter.register_mesh_sink(events.append, want_fields=lambda _pid: frozenset({"on"}))
+
+    async def callback(device: BrilliantDevice) -> None:
+        delivered.append(device)
+
+    adapter.on_change(callback, mesh_metadata_only=True)
+
+    def forbid(*args: object, **kwargs: object) -> Any:
+        raise AssertionError("mesh ingress normalized variables")
+
+    monkeypatch.setattr(bus_mod, "normalize_peripheral", forbid)
+    monkeypatch.setattr(bus_mod, "Variable", forbid)
+    result = await adapter.get_all()
+    assert len(result) == 1
+    assert result[0].variables == {}
+    assert result[0].peripheral_id == "p"
+    await notify(adapter, raw, [delta("p", "on")])
+    await asyncio.gather(*adapter._pending_tasks)
+    assert len(delivered) == 1
+    assert delivered[0].variables == {}
+    await adapter.shutdown()
+
+
+async def test_registered_mesh_preserves_explicit_legacy_callback_variables() -> None:
+    from brilliant_mqtt.model import BrilliantDevice
+
+    peripheral = _RawPeripheral()
+    peripheral.variables["power"] = _RawVariable("42")
+    raw = _RawDevice("ble_mesh", {"p": peripheral})
+    adapter, _, _ = adapter_for(raw)
+    adapter.register_mesh_sink(lambda _event: None, want_fields=lambda _pid: frozenset({"on"}))
+    delivered: list[BrilliantDevice] = []
+
+    async def callback(device: BrilliantDevice) -> None:
+        delivered.append(device)
+
+    adapter.on_change(callback)
+    await notify(adapter, raw, [delta("p", "on")])
+    await asyncio.gather(*adapter._pending_tasks)
+    assert delivered[0].variables["on"].value == "1"
+    assert delivered[0].variables["power"].value == "42"
+    await adapter.shutdown()
+
+
+async def test_resident_slider_scoped_read_retains_real_config_without_load_owner() -> None:
+    class ScopedNative(Native):
+        async def get_peripheral(self, device_id: str, peripheral_id: str) -> _RawPeripheral:
+            return _RawPeripheral("encoded-config", "slider_config")
+
+    adapter, _, _ = adapter_for(None)
+    adapter._obs = ScopedNative(None)
+    adapter.register_mesh_sink(lambda _event: None, want_fields=lambda _pid: None)
+    device = await adapter.get_peripheral("ble_mesh", "switch_config:mac")
+    assert device is not None
+    assert device.variables["slider_config"].value == "encoded-config"
     await adapter.shutdown()

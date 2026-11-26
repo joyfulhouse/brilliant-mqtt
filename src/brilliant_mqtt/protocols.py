@@ -11,15 +11,70 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from brilliant_mqtt.commands import VarSet
 from brilliant_mqtt.model import BrilliantDevice, CaptureProvenance
 from brilliant_mqtt.write_admission import AdmissionTicket, WriteClass, WriteResult
 
+if TYPE_CHECKING:
+    from brilliant_mqtt.mesh_ingress import MeshIngress
+    from brilliant_mqtt.mesh_settlement import MeshSettlement
+
 
 class CommandSubscribeError(RuntimeError):
     """A command-topic SUBSCRIBE failed at the MQTT adapter boundary."""
+
+
+class MeshBusClient(Protocol):
+    """Synchronous mesh extension alongside the shared async BusClient.
+
+    All methods except the native reconnect hook are loop-confined. Callback
+    registration returns an idempotent removal function owned by the registry.
+    """
+
+    @property
+    def capture_source(self) -> str: ...
+    @property
+    def capture_generation(self) -> int: ...
+    @property
+    def capture_sequence(self) -> int: ...
+    @property
+    def mesh_admission_open(self) -> bool: ...
+    @property
+    def mesh_creation_floor(self) -> int: ...
+    def reserve_mesh_boundary(self, origin: str) -> CaptureProvenance: ...
+    def mesh_owner_live(self, owner: MeshSettlement) -> bool: ...
+    def consume_mesh_fatal(self) -> bool: ...
+    def advance_mesh_creation_floor(self, boundary: CaptureProvenance) -> None: ...
+    def outstanding_mesh_ticket(self, peripheral_id: str) -> AdmissionTicket | None: ...
+    def on_change(
+        self,
+        cb: Callable[[BrilliantDevice], Awaitable[None]],
+        *,
+        coalesce_pushes: bool = True,
+        want_device: Callable[[str], bool] | None = None,
+        mesh_metadata_only: bool = False,
+    ) -> None: ...
+    def register_mesh_sink(
+        self,
+        callback: Callable[[MeshIngress], None],
+        *,
+        want_fields: Callable[[str], frozenset[str] | None],
+        want_inventory: Callable[[], bool] = ...,
+    ) -> Callable[[], None]: ...
+    def register_mesh_write_guard(
+        self, guard: Callable[[AdmissionTicket, str], bool]
+    ) -> Callable[[], None]: ...
+    def bind_mesh_ticket(
+        self,
+        ticket: AdmissionTicket,
+        owner: MeshSettlement,
+        *,
+        on_issue: Callable[[CaptureProvenance], None],
+        on_settle: Callable[[str | BaseException], None],
+        on_refused: Callable[[], None],
+    ) -> None: ...
 
 
 class BusClient(Protocol):

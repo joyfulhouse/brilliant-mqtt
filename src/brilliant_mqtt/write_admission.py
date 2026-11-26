@@ -94,6 +94,12 @@ class AdmissionTicket:
     def clear_settle_callback(self) -> None:
         self._on_settled = None
 
+    def clear_callbacks(self) -> None:
+        """Release lifecycle listeners without erasing identity or native history."""
+        self._on_issued = None
+        self._on_settled = None
+        self._on_refused = None
+
     def mark_settled(
         self, outcome: str | BaseException, provenance: CaptureProvenance | None = None
     ) -> None:
@@ -104,9 +110,10 @@ class AdmissionTicket:
         self._notify_settled(outcome)
 
     def _notify_settled(self, outcome: str | BaseException) -> None:
-        if self._on_settled is not None:
+        callback, self._on_settled = self._on_settled, None
+        if callback is not None:
             try:
-                self._on_settled(outcome)
+                callback(outcome)
             except Exception as error:
                 logging.getLogger("brilliant_mqtt.bus").warning(
                     "WRITE_SETTLE_CALLBACK_FAILED %s", type(error).__name__

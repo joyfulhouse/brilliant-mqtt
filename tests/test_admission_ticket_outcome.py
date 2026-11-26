@@ -32,3 +32,17 @@ def test_return_provenance_precedes_listener_and_is_first_outcome_owned() -> Non
     assert seen == [("'ok'", boundary)]
     assert ticket.returned_at == boundary
     assert ticket.accepted_at == boundary
+
+
+def test_finished_listener_is_removed_and_explicit_lifecycle_clear_is_complete() -> None:
+    ticket = AdmissionTicket()
+    seen: list[str | BaseException] = []
+    ticket.set_settle_callback(seen.append)
+    ticket.mark_settled("receipt")
+    assert ticket._on_settled is None
+    ticket.set_issue_callback(lambda _boundary: None)
+    ticket.clear_callbacks()
+    assert ticket._on_issued is None
+    assert ticket._on_refused is None
+    assert ticket._on_settled is None
+    assert ticket.outcome == "receipt"
