@@ -26,6 +26,48 @@ from tests.mesh_regression_support import turns
 from tests.test_mesh_registry import registry_rig as registry_rig
 
 
+@pytest.mark.parametrize("blocked_child", [False, True])
+async def test_external_worker_cancellation_finishes_without_registry_revocation(
+    registry_rig: tuple[MeshRegistry, _RawDevice],
+    blocked_child: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry, _ = registry_rig
+    mqtt = FakeMqtt()
+    entered, release, cancelled = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def publish(topic: str, payload: str, retain: bool = False, qos: int = 0) -> None:
+        entered.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    if blocked_child:
+        monkeypatch.setattr(mqtt, "publish", publish)
+    driver = MeshDriver(registry, mqtt, panel="mesh")
+    try:
+        registry.acquire()
+        await cast(RpcBusAdapter, registry.bus).get_all()
+        owner = registry.current("load")
+        assert owner is not None
+        if blocked_child:
+            await entered.wait()
+        else:
+            await driver.flush(owner)
+        worker = driver._lanes[owner].worker
+        assert worker is not None
+        worker.cancel()
+        done, _ = await asyncio.wait({worker}, timeout=0.05)
+        assert worker in done
+        assert driver.tasks == ()
+        assert cancelled.is_set() is blocked_child
+    finally:
+        registry.close()
+        await driver.shutdown()
+
+
 @pytest.mark.parametrize("typed_request", [False, True])
 async def test_latest_owner_publication_and_identical_capture_suppression(
     registry_rig: tuple[MeshRegistry, _RawDevice],

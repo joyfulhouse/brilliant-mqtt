@@ -117,6 +117,22 @@ def accepted() -> tuple[MeshSettlement, object]:
     return slot, ticket
 
 
+def test_refused_preparation_does_not_become_abandoned_native_work() -> None:
+    from brilliant_mqtt.mesh_settlement_types import AdmissionRefused
+
+    slot = owner()
+    observe(slot, 2, 0, on="0")
+    ticket = begin(slot, seq=3)
+    issue(slot, ticket, seq=4)
+    slot.dispatch(AdmissionRefused(env(slot, 5, 2), slot.view.command_id, ticket))
+    assert slot.view.phase is Phase.QUIET
+    assert slot.view.deadline is None
+    assert slot.view.completion_hold is None
+    assert slot.view.terminal is None
+    assert slot.render(2)["state"] == "OFF"
+    assert slot.view.status == "idle"
+
+
 def expire(slot: MeshSettlement, seq: int, at: float) -> tuple[object, ...]:
     window = slot.view.window
     assert window is not None

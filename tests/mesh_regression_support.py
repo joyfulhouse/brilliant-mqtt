@@ -12,6 +12,7 @@ from typing import Protocol, cast
 from brilliant_mqtt import bus as bus_mod
 from brilliant_mqtt.bridge import Bridge
 from brilliant_mqtt.bus import RpcBusAdapter
+from brilliant_mqtt.mesh_settlement import MeshSettlement
 from brilliant_mqtt.model import CaptureProvenance
 from brilliant_mqtt.write_admission import AdmissionTicket
 from tests.fakes import FakeClock, FakeSleeper, _GatedRpcObserver, _RawDevice
@@ -36,6 +37,37 @@ def settlement(ticket: AdmissionTicket) -> SettlementTicket:
 async def turns(count: int = 20) -> None:
     for _ in range(count):
         await asyncio.sleep(0)
+
+
+def owners(bridge: Bridge) -> dict[str, MeshSettlement]:
+    registry = bridge.mesh_registry
+    assert registry is not None
+    return {owner.metadata.peripheral_id: owner for owner in registry.owners}
+
+
+def pending(bridge: Bridge) -> dict[str, MeshSettlement]:
+    return {pid: owner for pid, owner in owners(bridge).items() if owner.view.window is not None}
+
+
+def timers(bridge: Bridge) -> dict[str, asyncio.Task[None]]:
+    driver = bridge.mesh_driver
+    assert driver is not None
+    return driver.timers
+
+
+def publishers(bridge: Bridge) -> dict[asyncio.Task[None], str]:
+    driver = bridge.mesh_driver
+    assert driver is not None
+    return driver.children
+
+
+def commands(bridge: Bridge) -> dict[str, int]:
+    return {pid: owner.view.command_id for pid, owner in owners(bridge).items()}
+
+
+def last_observed(owner: MeshSettlement) -> float | None:
+    evidence = dict(owner.view.evidence)
+    return min((item.captured_at for item in evidence.values()), default=None)
 
 
 class _ObserverBase:
@@ -113,7 +145,7 @@ class Rig:
         await turns()
 
     def timers(self) -> Mapping[str, asyncio.Task[None]]:
-        return self.bridge._mesh_confirm_tasks
+        return timers(self.bridge)
 
     def assert_pending(self, target: str = "0", deadline: float | None = None) -> None:
         state = self.state()

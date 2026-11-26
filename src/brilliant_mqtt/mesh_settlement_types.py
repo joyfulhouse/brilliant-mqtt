@@ -213,6 +213,15 @@ class WorkerCancelled:
 
 
 @dataclass(frozen=True)
+class AdmissionRefused:
+    """Prepared issue never acquired actual native authorization."""
+
+    envelope: Envelope
+    command_id: int
+    ticket: object
+
+
+@dataclass(frozen=True)
 class Completion:
     envelope: Envelope
     ticket: object
@@ -311,6 +320,7 @@ Event = (
     | CallerTimeout
     | NativeOutcome
     | WorkerCancelled
+    | AdmissionRefused
     | Completion
     | Expire
     | Revoke

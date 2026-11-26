@@ -14,6 +14,7 @@ from collections.abc import Mapping
 from brilliant_mqtt import mesh_settlement_render
 from brilliant_mqtt.mapping import AUX_SPECS
 from brilliant_mqtt.mesh_settlement_types import (
+    AdmissionRefused,
     ArmExpiry,
     AuxAccepted,
     AuxCancelled,
@@ -375,6 +376,15 @@ class MeshSettlement:
             self._native_outcome(event, effects)
         elif isinstance(event, WorkerCancelled):
             self._cancel(event, effects)
+        elif isinstance(event, AdmissionRefused):
+            if self._owns(event.command_id, event.ticket):
+                self._issue = None
+                if (
+                    self._completion_hold is not None
+                    and self._completion_hold.ticket is event.ticket
+                ):
+                    self._completion_hold = None
+                self._cancel(WorkerCancelled(envelope, event.command_id, event.ticket), effects)
         elif isinstance(event, Expire):
             self._expire(event, effects)
         elif isinstance(event, Revoke):

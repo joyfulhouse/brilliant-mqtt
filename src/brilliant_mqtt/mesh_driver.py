@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
+from types import MappingProxyType
 
 from brilliant_mqtt.discovery import state_topic
 from brilliant_mqtt.mesh_registry import MeshRegistry
@@ -82,6 +83,13 @@ class MeshDriver:
             for owner, lane in self._lanes.items()
             if lane.child is not None and not lane.child.done()
         }
+
+    def published_fields(self, owner: MeshSettlement) -> Mapping[str, object] | None:
+        """Read-only actual diff-cache fields, for publication diagnostics."""
+        lane = self._lanes.get(owner)
+        if lane is None or lane.last_fields is None:
+            return None
+        return MappingProxyType(lane.last_fields)
 
     def _lane(self, owner: MeshSettlement) -> _Lane:
         lane = self._lanes.get(owner)
@@ -203,6 +211,16 @@ class MeshDriver:
             lane.child = None
         return True
 
+    async def _cleanup(self, owner: MeshSettlement) -> bool:
+        if self.cleanup is None:
+            return True
+        try:
+            await self.cleanup(owner)
+        except Exception as error:
+            logger.warning("MESH_CLEANUP_FAILED %s", type(error).__name__)
+            return False
+        return True
+
     async def _run(self, owner: MeshSettlement, lane: _Lane) -> None:
         try:
             while self.registry.live(owner, publication=True):
@@ -217,7 +235,9 @@ class MeshDriver:
                         and owner.view.ordinary_debt is None
                         and self.cleanup is not None
                     ):
-                        await self.cleanup(owner)
+                        if not await self._cleanup(owner):
+                            lane.idle.set()
+                            continue
                     if not self.registry.live(owner, publication=True):
                         return
                     fields: dict[str, object] = json.loads(owner.encode(self.registry.clock()))
@@ -245,9 +265,15 @@ class MeshDriver:
                         and owner.view.ordinary_debt is None
                         and self.cleanup is not None
                     ):
-                        await self.cleanup(owner)
+                        if not await self._cleanup(owner):
+                            lane.idle.set()
+                            continue
                 except asyncio.CancelledError:
+                    if not lane.revoking and lane.child is not None:
+                        lane.child.cancel()
                     if not await self._join_child(lane):
+                        return
+                    if not lane.revoking:
                         return
                     lane.revoking = False
                     if not self.registry.live(owner, publication=True):
@@ -278,6 +304,13 @@ class MeshDriver:
             or owner.view.in_flight is not token
         ):
             return
+        if token.terminal is not None:
+            logger.warning(
+                "mesh write %s for %s (receipt: %s)",
+                token.terminal.reason,
+                owner.metadata.peripheral_id,
+                owner.view.receipt,
+            )
         try:
             await self.mqtt.publish(
                 state_topic(self.panel, owner.metadata.peripheral_id), payload, retain=True

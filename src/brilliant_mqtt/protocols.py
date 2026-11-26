@@ -212,6 +212,10 @@ class BusClient(Protocol):
 class MqttClient(Protocol):
     """Adapter for the central MQTT broker."""
 
+    def set_mesh_owner_resolver(self, resolver: Callable[[str], object | None]) -> None:
+        """Capture the exact opaque mesh owner at original local ingress."""
+        ...
+
     def consume_reader_failure(self) -> bool:
         """Return True exactly once if the inbound reader ended without this adapter
         cancelling it."""

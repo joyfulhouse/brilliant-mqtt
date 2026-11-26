@@ -8,14 +8,16 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable, MutableMapping
+from dataclasses import FrozenInstanceError
 from types import MappingProxyType
 from typing import cast
 
 import pytest
 
 from brilliant_mqtt import bus as bus_mod
-from brilliant_mqtt.bridge import Bridge, _CommandSupersession
+from brilliant_mqtt.bridge import Bridge
 from brilliant_mqtt.commands import VarSet
+from brilliant_mqtt.mesh_settlement_types import OutcomeKind, Phase
 from brilliant_mqtt.model import BrilliantDevice, CaptureProvenance
 from brilliant_mqtt.write_admission import (
     AdmissionTicket,
@@ -26,7 +28,16 @@ from brilliant_mqtt.write_admission import (
     command_admission,
 )
 from tests.fakes import FakeClock, FakeSleeper, _RawDevice, _RawPeripheral, _RawVariable
-from tests.mesh_regression_support import Rig, settlement, turns
+from tests.mesh_regression_support import (
+    Rig,
+    commands,
+    last_observed,
+    owners,
+    pending,
+    publishers,
+    settlement,
+    turns,
+)
 from tests.test_bridge import (
     MESH_PID,
     MESH_SET_TOPIC,
@@ -151,11 +162,11 @@ async def test_fresh_contradiction_after_native_return_is_not_lost(rig: Rig) -> 
     assert delivered == [(True, True)]
     assert rig.mqtt.publish_started.is_set()
     assert not rig.mqtt.release_publish.is_set()
-    assert rig.bridge._mesh_feedback[MESH_PID].status == "contradicted"
+    assert owners(rig.bridge)[MESH_PID].view.status == "contradicted"
     rig.mqtt.release_publish.set()
     await turns()
     rig.assert_terminal("contradicted", "ON")
-    assert not rig.bridge._pending_mesh
+    assert not pending(rig.bridge)
     assert not rig.timers()
 
 
@@ -169,8 +180,8 @@ async def test_expiry_does_not_wait_for_rearm_publish(rig: Rig) -> None:
     rig.bridge._wall_clock = lambda: -1_000_000
     await rig.expire()
     assert not rig.mqtt.release_publish.is_set()
-    assert not rig.bridge._pending_mesh
-    assert rig.bridge._mesh_feedback[MESH_PID].status == "unconfirmed"
+    assert not pending(rig.bridge)
+    assert owners(rig.bridge)[MESH_PID].view.status == "unconfirmed"
     rig.mqtt.release_publish.set()
     await turns()
     rig.assert_terminal("unconfirmed", None)
@@ -183,8 +194,8 @@ async def test_late_acceptance_rearms_then_is_contradicted(rig: Rig) -> None:
     await rig.accept()
     rig.assert_pending(deadline=1090)
     assert rig.sleeper.requested == [80, 80]
-    assert rig.bridge._pending_mesh[MESH_PID].receipt == "'ok'"
-    assert rig.bridge._pending_mesh[MESH_PID].last_observed_at is None
+    assert pending(rig.bridge)[MESH_PID].view.receipt == "'ok'"
+    assert last_observed(pending(rig.bridge)[MESH_PID]) is None
     await rig.report("1")
     rig.assert_terminal("contradicted", "ON")
     before = len(_mesh_states(rig.mqtt))
@@ -205,7 +216,7 @@ async def test_late_acceptance_then_matching_value_confirms(rig: Rig) -> None:
     rig.assert_pending()
     await rig.expire(6)
     rig.assert_terminal("idle", "OFF")
-    assert not rig.bridge._pending_mesh
+    assert not pending(rig.bridge)
     assert not rig.timers()
 
 
@@ -216,7 +227,7 @@ async def test_late_failure_publishes_failed_with_observed_state(rig: Rig) -> No
     await rig.accept()
     rig.assert_terminal("failed", "ON")
     assert len(_mesh_states(rig.mqtt)) == 1
-    assert not rig.bridge._pending_mesh
+    assert not pending(rig.bridge)
     assert not rig.timers()
     await rig.expire()
     assert len(_mesh_states(rig.mqtt)) == 1
@@ -243,14 +254,14 @@ async def test_late_timeout_or_cancellation_resumes_contradiction(
     rig.observer.release.clear()
     monkeypatch.setattr(rig.observer, "_block", settled_native)
     await rig.mqtt.inject(MESH_SET_TOPIC, '{"state":"OFF"}')
-    record = rig.bridge._pending_mesh[MESH_PID]
-    deadline = record.deadline
+    record = pending(rig.bridge)[MESH_PID]
+    deadline = record.view.wire_deadline
     rig.mqtt.published.clear()
     rig.clock.advance(4)
     rig.observer.release.set()
     await turns()
-    assert rig.bridge._pending_mesh[MESH_PID] is record
-    assert record.deadline == deadline == 1081
+    assert pending(rig.bridge)[MESH_PID] is record
+    assert record.view.wire_deadline == deadline == 1081
     assert _mesh_states(rig.mqtt) == []
     await rig.report("1")
     rig.assert_terminal("contradicted", "ON")
@@ -272,14 +283,14 @@ async def test_matching_observation_holds_null_until_confirm_window(
     await rig.sleeper.release_all()
     await turns()
     rig.assert_terminal("idle" if settled else "unconfirmed", "OFF" if settled else None)
-    assert not rig.bridge._pending_mesh
+    assert not pending(rig.bridge)
     assert not rig.timers()
 
 
 async def test_unresolved_write_without_observations_closes_unconfirmed(rig: Rig) -> None:
     await rig.expire()
     rig.assert_terminal("unconfirmed", None)
-    assert not rig.bridge._pending_mesh
+    assert not pending(rig.bridge)
     assert not rig.timers()
     assert rig.observer.in_flight == 1
     assert not rig.observer.write_cancelled
@@ -292,7 +303,8 @@ async def test_detached_rpc_late_outcome_settles_only_its_own_pending(
     late_error: bool,
     revoke: bool,
 ) -> None:
-    record = rig.bridge._pending_mesh[MESH_PID]
+    record = pending(rig.bridge)[MESH_PID]
+    old_window = record.view.window
     if late_error:
         rig.observer._fail_with = RuntimeError("late rejection")
     if revoke:
@@ -302,19 +314,20 @@ async def test_detached_rpc_late_outcome_settles_only_its_own_pending(
     await rig.accept()
     if revoke:
         assert rig.mqtt.published == []
-        assert not rig.bridge._pending_mesh
+        assert not pending(rig.bridge)
         assert not rig.timers()
         assert rig.sleeper.requested == [80]
     elif late_error:
         rig.assert_terminal("failed", "ON")
-        assert not rig.bridge._pending_mesh
+        assert not pending(rig.bridge)
         assert not rig.timers()
     else:
         rig.assert_pending(deadline=1090)
-        rearmed = rig.bridge._pending_mesh[MESH_PID]
-        assert rearmed is not record
-        assert rearmed.receipt == "'ok'"
-        assert rearmed.last_observed_at is None
+        rearmed = pending(rig.bridge)[MESH_PID]
+        assert rearmed is record
+        assert rearmed.view.window is not old_window
+        assert rearmed.view.receipt == "'ok'"
+        assert last_observed(rearmed) is None
         assert rig.sleeper.requested == [80, 80]
 
 
@@ -322,7 +335,8 @@ async def test_detached_rpc_late_outcome_settles_only_its_own_pending(
 async def test_superseded_write_late_outcome_is_ignored(
     rig: Rig, monkeypatch: pytest.MonkeyPatch, late: str
 ) -> None:
-    old = rig.bridge._pending_mesh[MESH_PID]
+    old = pending(rig.bridge)[MESH_PID]
+    old_command = old.view.command_id
     old_timer = rig.timers()[MESH_PID]
     (native,) = rig.adapter._write_tasks
     successor_entered, successor_release = asyncio.Event(), asyncio.Event()
@@ -346,9 +360,10 @@ async def test_superseded_write_late_outcome_is_ignored(
         command_admission.reset(token)
     try:
         await turns()
-        assert rig.bridge._pending_mesh.get(MESH_PID) is not old
-        successor = rig.bridge._mesh_feedback[MESH_PID]
-        generation = rig.bridge._mesh_write_generation[MESH_PID]
+        assert old.view.command_id != old_command
+        assert pending(rig.bridge).get(MESH_PID) is None
+        successor = owners(rig.bridge)[MESH_PID]
+        generation = commands(rig.bridge)[MESH_PID]
         admission = rig.adapter._write_admissions[command.ticket]
         assert admission.ticket is command.ticket
         assert admission.values == {"on": "1"}
@@ -375,8 +390,8 @@ async def test_superseded_write_late_outcome_is_ignored(
         assert not replacement.done()
         assert rig.observer.in_flight == 1
         assert rig.adapter._write_locks["ble_mesh"].locked()
-        assert rig.bridge._mesh_feedback[MESH_PID] is successor
-        assert rig.bridge._mesh_write_generation[MESH_PID] == generation
+        assert owners(rig.bridge)[MESH_PID] is successor
+        assert commands(rig.bridge)[MESH_PID] == generation
         assert rig.adapter._write_admissions.get(command.ticket) is admission
         assert admission.ticket is command.ticket
         assert admission.values == {"on": "1"} and admission.issued
@@ -388,10 +403,11 @@ async def test_superseded_write_late_outcome_is_ignored(
         await replacement
         await turns()
         rig.assert_pending(target="1", deadline=1085)
-        current = rig.bridge._pending_mesh[MESH_PID]
-        assert current is not old
-        assert current.targets == {"on": "1"}
-        assert rig.bridge._mesh_write_generation[MESH_PID] == generation
+        current = pending(rig.bridge)[MESH_PID]
+        assert current is old
+        assert current.view.command_id != old_command
+        assert dict(current.view.targets) == {"on": "1"}
+        assert commands(rig.bridge)[MESH_PID] == generation
         assert rig.tickets[-1] is command.ticket
         assert rig.sleeper.requested == [80, 80]
         assert len(rig.timers()) == 1
@@ -411,8 +427,9 @@ async def test_adapter_rearm_publish_stays_cancellable(rig: Rig, revocation: str
     await rig.accept()
     assert rig.mqtt.publish_started.is_set(), "late acceptance must reach the gated publication"
     old_timer = rig.timers()[MESH_PID]
-    blocked = list(rig.bridge._mesh_feedback_tasks)
-    old = rig.bridge._pending_mesh[MESH_PID]
+    blocked = list(publishers(rig.bridge))
+    old = pending(rig.bridge)[MESH_PID]
+    old_command = old.view.command_id
     assert blocked
     if revocation == "withdraw":
         await rig.bridge.withdraw()
@@ -424,12 +441,13 @@ async def test_adapter_rearm_publish_stays_cancellable(rig: Rig, revocation: str
     assert all(task.cancelled() for task in blocked)
     assert old_timer.done()
     if revocation == "withdraw":
-        assert not rig.bridge._pending_mesh
+        assert not pending(rig.bridge)
         assert not rig.timers()
     else:
-        current = rig.bridge._pending_mesh[MESH_PID]
-        assert current is not old
-        assert current.targets == {"on": "1"}
+        current = pending(rig.bridge)[MESH_PID]
+        assert current is old
+        assert current.view.command_id != old_command
+        assert dict(current.view.targets) == {"on": "1"}
         assert rig.timers()[MESH_PID] is not old_timer
         assert not rig.timers()[MESH_PID].done()
     rig.mqtt.release_publish.set()
@@ -439,7 +457,7 @@ async def test_adapter_rearm_publish_stays_cancellable(rig: Rig, revocation: str
         await rig.expire()
         assert not rig.timers()
     else:
-        assert rig.bridge._pending_mesh[MESH_PID] is current
+        assert pending(rig.bridge)[MESH_PID] is current
 
 
 async def test_pre_acceptance_match_delivered_near_expiry_cannot_confirm(rig: Rig) -> None:
@@ -450,7 +468,7 @@ async def test_pre_acceptance_match_delivered_near_expiry_cannot_confirm(rig: Ri
     rig.clock.advance(79)
     await rig.bridge.poll_once(captured)
     rig.assert_pending()
-    assert rig.bridge._pending_mesh[MESH_PID].last_observed_at is None
+    assert last_observed(pending(rig.bridge)[MESH_PID]) is None
     await rig.expire(1)
     rig.assert_terminal("unconfirmed", None)
     assert not rig.timers()
@@ -481,7 +499,7 @@ async def test_pre_acceptance_push_delayed_until_after_acceptance(
         release.set()
         await turns()
         rig.assert_pending(deadline=1085)
-        assert rig.bridge._pending_mesh[MESH_PID].last_observed_at is None
+        assert last_observed(pending(rig.bridge)[MESH_PID]) is None
     finally:
         release.set()
 
@@ -491,7 +509,7 @@ async def test_matching_push_at_expiry_cannot_confirm(rig: Rig) -> None:
     rig.clock.advance(80)
     await rig.report("0")
     rig.assert_pending()
-    assert rig.bridge._pending_mesh[MESH_PID].last_observed_at is None
+    assert last_observed(pending(rig.bridge)[MESH_PID]) is None
     await rig.sleeper.release_all()
     await turns()
     rig.assert_terminal("unconfirmed", None)
@@ -530,7 +548,7 @@ async def test_fresh_contradiction_at_expiry_cannot_be_overwritten(
     if resolver_order == "after_observation":
         await rig.sleeper.release_all()
         await turns()
-    assert not rig.bridge._pending_mesh
+    assert not pending(rig.bridge)
     assert rig.state()["state"] == "ON"
     assert not any('"state": "OFF"' in payload for _, payload, _ in _mesh_states(rig.mqtt)[before:])
 
@@ -552,14 +570,32 @@ async def test_older_same_generation_capture_cannot_replace_newer_evidence(
     rig: Rig,
     older_on: str,
     newer_on: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     await rig.accept()
     rig.clock.advance(74)
     rig.set_on(older_on)
-    older = await rig.adapter.get_all()
+    from copy import deepcopy
+
+    old_raw = deepcopy(rig.raw)
+    entered, release = asyncio.Event(), asyncio.Event()
+    original_read = rig.observer.get_device
+
+    async def delayed_read(device_id: str) -> _RawDevice:
+        if device_id == "ble_mesh" and not entered.is_set():
+            entered.set()
+            await release.wait()
+            return old_raw
+        return await original_read(device_id)
+
+    monkeypatch.setattr(rig.observer, "get_device", delayed_read)
+    old_task = asyncio.create_task(rig.adapter.get_all())
+    await entered.wait()
     rig.clock.advance(1)
     rig.set_on(newer_on)
     newer = await rig.adapter.get_all()
+    release.set()
+    older = await old_task
     old_provenance, new_provenance = older[0].capture_provenance, newer[0].capture_provenance
     assert old_provenance is not None and new_provenance is not None
     assert old_provenance.source_generation == new_provenance.source_generation
@@ -569,7 +605,7 @@ async def test_older_same_generation_capture_cannot_replace_newer_evidence(
     await rig.bridge.poll_once(older)
     if newer_on == "0":
         rig.assert_pending()
-        assert rig.bridge._pending_mesh[MESH_PID].last_observed_at == 75
+        assert last_observed(pending(rig.bridge)[MESH_PID]) == 75
     else:
         rig.assert_terminal("contradicted", "ON")
     await rig.expire(1)
@@ -625,7 +661,7 @@ async def test_old_source_capture_cannot_contradict_new_acceptance(rig: Rig) -> 
     await rig.report("0")
     await rig.bridge.poll_once(older)
     rig.assert_pending()
-    assert rig.bridge._pending_mesh[MESH_PID].last_observed_at == rig.clock()
+    assert last_observed(pending(rig.bridge)[MESH_PID]) == rig.clock()
     await rig.expire(5)
     rig.assert_terminal("idle", "OFF")
 
@@ -645,15 +681,23 @@ async def test_normal_success_preserves_native_receipt_and_acceptance_fence(
         await rig.mqtt.inject(MESH_SET_TOPIC, '{"state":"OFF"}')
     finally:
         command_admission.reset(token)
-    record = rig.bridge._pending_mesh[MESH_PID]
-    accepted = getattr(record, "accepted_at", None)
+    record = pending(rig.bridge)[MESH_PID]
+    accepted = command.ticket.accepted_at
+    assert record.view.return_boundary is not None
+    assert accepted is not None
+    assert (
+        record.view.return_boundary.sequence,
+        record.view.return_boundary.captured_at,
+        record.view.return_boundary.source.incarnation,
+        record.view.return_boundary.generation,
+    ) == (accepted.sequence, accepted.captured_at, accepted.incarnation, accepted.source_generation)
     ticket_accepted = getattr(command.ticket, "accepted_at", None)
-    resolved = getattr(record, "rpc_unresolved", None)
-    assert record.receipt == "'ok'"
+    resolved = record.view.phase is Phase.UNRESOLVED
+    assert record.view.receipt == "'ok'"
     await rig.bridge.poll_once(captured)
     rig.assert_pending(deadline=1085)
-    assert rig.bridge._pending_mesh[MESH_PID] is record
-    assert record.last_observed_at is None
+    assert pending(rig.bridge)[MESH_PID] is record
+    assert last_observed(record) is None
     assert rig.tickets[-1] is command.ticket
     assert resolved is False
     assert settlement(command.ticket).settled
@@ -698,19 +742,31 @@ async def test_native_acceptance_before_caller_timeout_preserves_receipt_and_fen
         assert len(deferred) == 1
         admission, native = deferred[0]
         assert admission.record.detached and not admission.result.done()
-        record = rig.bridge._pending_mesh[MESH_PID]
-        assert record.receipt == native.result()
+        record = pending(rig.bridge)[MESH_PID]
+        assert record.view.receipt == native.result()
         await rig.bridge.poll_once(captured)
         rig.assert_pending(deadline=1085)
-        assert rig.bridge._pending_mesh[MESH_PID] is record
-        assert record.last_observed_at is None
+        assert pending(rig.bridge)[MESH_PID] is record
+        assert last_observed(record) is None
         assert admission.ticket is rig.tickets[-1]
         assert len(boundary) == 1
         settled, receipt, result_done, accepted = boundary[0]
         assert (settled, receipt, result_done) == (True, "'ok'", False)
         assert isinstance(accepted, CaptureProvenance)
-        assert getattr(record, "accepted_at", None) == accepted
-        assert getattr(record, "rpc_unresolved", None) is False
+        assert record.view.return_boundary is not None
+        assert (
+            record.view.return_boundary.sequence,
+            record.view.return_boundary.captured_at,
+            record.view.return_boundary.source.incarnation,
+            record.view.return_boundary.generation,
+        ) == (
+            accepted.sequence,
+            accepted.captured_at,
+            accepted.incarnation,
+            accepted.source_generation,
+        )
+        assert record.view.phase is Phase.ACCEPTED
+        assert record.view.outcome is OutcomeKind.ACCEPTED
         provenance = captured[0].capture_provenance
         assert provenance is not None
         assert provenance.source_generation == accepted.source_generation
@@ -736,7 +792,7 @@ async def test_shutdown_fences_obsolete_expiry_and_cleans_workers(rig: Rig, queu
     assert rig.mqtt.published == []
     assert timer.done()
     assert not rig.timers()
-    assert not rig.bridge._mesh_feedback_tasks
+    assert not publishers(rig.bridge)
 
 
 async def test_resolver_losing_ownership_releases_its_entry(rig: Rig) -> None:
@@ -755,19 +811,24 @@ async def test_settle_task_losing_ownership_clears_its_registry_entry(rig: Rig) 
     await rig.expire()
     assert rig.mqtt.published == []
     assert not rig.timers()
-    assert not rig.bridge._mesh_feedback_tasks
+    assert not publishers(rig.bridge)
 
 
 async def test_views_are_read_only(rig: Rig) -> None:
-    # Main has no owner diagnostic API. This is intentionally an API-only gap,
-    # distinct from the real wire failures above. Never freeze a test copy.
-    owner = getattr(rig.bridge, "_mesh", None)
-    assert owner is not None, "future settlement owner exposes read-only diagnostics"
-    for name in ("pending_view", "feedback_view", "confirm_tasks_view"):
-        view = getattr(owner, name, None)
-        assert isinstance(view, MappingProxyType)
-        with pytest.raises(TypeError):
-            cast(MutableMapping[str, object], view)["foreign"] = object()
+    registry = rig.bridge.mesh_registry
+    assert registry is not None
+    owner = registry.current(MESH_PID)
+    assert owner is not None
+    assert isinstance(registry.retired, MappingProxyType)
+    with pytest.raises(TypeError):
+        cast(MutableMapping[str, object], registry.retired)["foreign"] = object()
+    with pytest.raises(FrozenInstanceError):
+        field_name = "command_id"
+        setattr(owner.view, field_name, -1)
+    with pytest.raises(TypeError):
+        cast(MutableMapping[str, object], owner.render(rig.clock()))["state"] = "ON"
+    assert isinstance(owner.view.targets, tuple)
+    assert isinstance(owner.view.evidence, tuple)
 
 
 def gate_publish(
@@ -890,13 +951,7 @@ async def test_abandoned_reused_ticket_never_settles_the_reissue(
         raise RuntimeError("fresh rejection")
 
     monkeypatch.setattr(rig.observer, "_block", fresh_native)
-    generation = rig.bridge._command_generation.setdefault(MESH_PID, 0)
-    token = command_admission.set(
-        CommandAdmission(
-            ticket=stale,
-            try_supersede=_CommandSupersession(generation, lambda _payload: False),
-        )
-    )
+    token = command_admission.set(CommandAdmission(ticket=stale))
     try:
         command = asyncio.create_task(rig.mqtt.inject(MESH_SET_TOPIC, '{"state":"OFF"}'))
     finally:
@@ -914,7 +969,7 @@ async def test_abandoned_reused_ticket_never_settles_the_reissue(
     await turns()
     assert rig.native_payloads == [{"on": "0"}, {"on": "0"}]
     assert rig.observer.max_in_flight == 1
-    current = rig.bridge._pending_mesh[MESH_PID]
+    current = pending(rig.bridge)[MESH_PID]
     rig.assert_pending()
     # The old completion must not make the fresh unresolved request eligible
     # for contradiction; only the fresh native rejection may settle it.
@@ -922,7 +977,7 @@ async def test_abandoned_reused_ticket_never_settles_the_reissue(
     try:
         await rig.report("1")
         rig.assert_pending()
-        assert rig.bridge._pending_mesh.get(MESH_PID) is current
+        assert pending(rig.bridge).get(MESH_PID) is current
         assert len(_mesh_states(rig.mqtt)) == before
         assert len(rig.timers()) == 1
         fresh_gate.set()

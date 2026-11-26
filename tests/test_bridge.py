@@ -1650,9 +1650,17 @@ def _mesh_motion_dimmer_at(on: str, enable_motion_score: str = "1") -> Brilliant
 
 def _mesh_bridge_parts(bus: FakeBus, mqtt: FakeMqtt) -> tuple[Bridge, FakeClock, FakeSleeper]:
     clock = FakeClock()
+    bus._clock = clock
     sleeper = FakeSleeper()
-    bridge = Bridge(bus, mqtt, MESH_PANEL, include=_is_mesh, clock=clock, sleep=sleeper)
-    bridge._wall_clock = lambda: 1000.0
+    bridge = Bridge(
+        bus,
+        mqtt,
+        MESH_PANEL,
+        include=_is_mesh,
+        clock=clock,
+        wall_clock=lambda: 1000.0,
+        sleep=sleeper,
+    )
     return bridge, clock, sleeper
 
 
@@ -1813,7 +1821,7 @@ class TestMeshConfirmedWrites:
 
         await bus.emit(_mesh_dimmer_at("0"))  # mirror at the accepted value
         clock.advance(30.0)
-        with caplog.at_level(logging.WARNING, logger="brilliant_mqtt.bridge"):
+        with caplog.at_level(logging.WARNING, logger="brilliant_mqtt.mesh_driver"):
             await bus.emit(_mesh_dimmer_at("1"))  # backend reconciled: write lost
 
         states = _mesh_states(mqtt)
@@ -1861,7 +1869,7 @@ class TestMeshConfirmedWrites:
         clock.advance(5.0)
         await bus.emit(_mesh_dimmer_at("0"))  # last observation at t=5
         clock.advance(75.0)  # deadline at t=80: observation is 75s stale
-        with caplog.at_level(logging.WARNING, logger="brilliant_mqtt.bridge"):
+        with caplog.at_level(logging.WARNING, logger="brilliant_mqtt.mesh_driver"):
             await sleeper.release_all()
 
         assert [json.loads(p[1]) for p in _mesh_states(mqtt)] == [
@@ -2053,12 +2061,26 @@ class TestMeshConfirmedWrites:
         bus.stall = gate
         superseding = asyncio.create_task(mqtt.inject(MESH_SET_TOPIC, json.dumps({"state": "ON"})))
         await asyncio.sleep(0)  # the ON write is now stalled in flight
+        assert bridge.mesh_registry is not None and bridge.mesh_driver is not None
+        owner = bridge.mesh_registry.current(MESH_PID)
+        assert owner is not None
+        await bridge.mesh_driver.flush(owner)
+        assert [json.loads(payload) for _, payload, _ in _mesh_states(mqtt)] == [
+            _mesh_feedback_payload("ON", "superseded")
+        ]
+        command_id, window, targets = owner.view.command_id, owner.view.window, owner.view.targets
+        mqtt.published.clear()
 
         clock.advance(80.0)
         with caplog.at_level(logging.WARNING, logger="brilliant_mqtt.bridge"):
             await sleeper.release_all()  # fire the OLD pending's deadline mid-flight
 
         assert _mesh_states(mqtt) == []
+        assert (owner.view.command_id, owner.view.window, owner.view.targets) == (
+            command_id,
+            window,
+            targets,
+        )
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
         gate.set()
@@ -2162,10 +2184,10 @@ class TestMeshConfirmedWrites:
         mqtt.published.clear()
 
         mqtt.fail_next_publish = True
-        with caplog.at_level(logging.WARNING, logger="brilliant_mqtt.bridge"):
+        with caplog.at_level(logging.WARNING, logger="brilliant_mqtt.mesh_driver"):
             await sleeper.release_all()  # the confirm publish raises in the task
 
-        assert any("confirm publish failed" in r.getMessage() for r in caplog.records)
+        assert any("MESH_PUBLISH_FAILED RuntimeError" in r.getMessage() for r in caplog.records)
         assert _mesh_states(mqtt) == []
 
         await bus.emit(_mesh_dimmer_at("0"))  # the next observation repairs it
@@ -2207,8 +2229,11 @@ class TestMeshConfirmedWrites:
         mqtt.published.clear()
 
         mqtt.fail_next_publish = True
-        with pytest.raises(RuntimeError):
-            await mqtt.inject(MESH_SET_TOPIC, json.dumps({"state": "OFF"}))
+        await mqtt.inject(MESH_SET_TOPIC, json.dumps({"state": "OFF"}))
+        from tests.mesh_regression_support import owners
+
+        assert owners(bridge)[MESH_PID].view.ordinary_debt is not None
+        assert _mesh_states(mqtt) == []
 
         assert _mesh_states(mqtt) == []  # the null publish never hit the wire
 
@@ -2221,6 +2246,8 @@ class TestMeshConfirmedWrites:
         await bridge.withdraw()
 
     async def test_completed_resolver_clears_its_registry_entry(self) -> None:
+        from tests.mesh_regression_support import timers
+
         """Tribunal r2-3: a resolver that runs to completion removes its own
         registry handle (identity-guarded), so the registry keeps meaning
         'confirmation in progress'."""
@@ -2228,14 +2255,14 @@ class TestMeshConfirmedWrites:
         await bridge.reconcile()
         await mqtt.inject(MESH_SET_TOPIC, json.dumps({"state": "OFF"}))
         await asyncio.sleep(0)
-        assert MESH_PID in bridge._mesh_confirm_tasks  # armed while pending
+        assert MESH_PID in timers(bridge)  # armed while pending
 
         clock.advance(75.0)
         await bus.emit(_mesh_dimmer_at("0"))
         clock.advance(5.0)
         await sleeper.release_all()  # the confirm completes
 
-        assert bridge._mesh_confirm_tasks == {}
+        assert timers(bridge) == {}
 
 
 class TestMeshWriteTimeout:
@@ -2291,14 +2318,21 @@ class TestMeshWriteTimeout:
         bus, mqtt, bridge, _clock, sleeper = await self._timed_out_off(asyncio.TimeoutError())
         mqtt.published.clear()
 
-        with caplog.at_level(logging.WARNING, logger="brilliant_mqtt.bridge"):
+        with caplog.at_level(logging.WARNING, logger="brilliant_mqtt.mesh_driver"):
             await bus.emit(_mesh_dimmer_at("1"))  # still ON: the OFF never actuated
 
         assert [json.loads(p[1]) for p in _mesh_states(mqtt)] == [
             _mesh_feedback_payload("ON", "contradicted")
         ]
         contradicted = [r.getMessage() for r in caplog.records if "contradicted" in r.getMessage()]
-        assert contradicted and "rpc pending" in contradicted[0]  # the placeholder receipt
+        assert contradicted
+        from brilliant_mqtt.mesh_settlement_types import OutcomeKind
+        from tests.mesh_regression_support import owners
+
+        owner = owners(bridge)[MESH_PID]
+        assert owner.view.outcome is OutcomeKind.TIMEOUT
+        assert owner.view.return_boundary is not None
+        assert owner.view.receipt is None
         await sleeper.release_all()  # the dropped timer must not fire
         assert len(_mesh_states(mqtt)) == 1
 
@@ -2371,11 +2405,13 @@ class TestReconcileSubscribeDedupe:
     ) -> None:
         bus = FakeBus([hardware, dimmer])
         mqtt = FakeMqtt()
-        await Bridge(bus, mqtt, PANEL).reconcile()
+        first_bridge = Bridge(bus, mqtt, PANEL)
+        await first_bridge.reconcile()
         first = list(mqtt.subscriptions)
 
         # A rebuilt session is a fresh Bridge on a fresh connection: the
         # dedupe set must not leak across sessions.
+        await first_bridge.shutdown_mesh_feedback()
         await Bridge(bus, mqtt, PANEL).reconcile()
 
         assert mqtt.subscriptions == first + first

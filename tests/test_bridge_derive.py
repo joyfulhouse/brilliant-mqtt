@@ -48,22 +48,24 @@ def _last_motion(mqtt: FakeMqtt, pid: str = "pidA") -> bool:
 
 @pytest.mark.asyncio
 async def test_reconcile_publishes_derived_motion() -> None:
+    clock = FakeClock()
     dev = _scoring(score="200", motion="0")
-    bus = FakeBus([dev])
+    bus = FakeBus([dev], clock=clock)
     mqtt = FakeMqtt()
-    deriver = MotionDeriver(60.0, clock=FakeClock())
-    bridge = Bridge(bus, mqtt, "mesh", deriver=deriver)
+    deriver = MotionDeriver(60.0, clock=clock)
+    bridge = Bridge(bus, mqtt, "mesh", deriver=deriver, clock=clock)
     await bridge.reconcile()
     assert _last_motion(mqtt) is True  # firmware latch said 0; derived wins
 
 
 @pytest.mark.asyncio
 async def test_on_change_publishes_derived_motion() -> None:
+    clock = FakeClock()
     dev = _scoring(score="10")
-    bus = FakeBus([dev])
+    bus = FakeBus([dev], clock=clock)
     mqtt = FakeMqtt()
-    deriver = MotionDeriver(60.0, clock=FakeClock())
-    bridge = Bridge(bus, mqtt, "mesh", deriver=deriver)
+    deriver = MotionDeriver(60.0, clock=clock)
+    bridge = Bridge(bus, mqtt, "mesh", deriver=deriver, clock=clock)
     await bridge.reconcile()
     await bus.emit(_scoring(score="222"))
     assert _last_motion(mqtt) is True
@@ -73,10 +75,10 @@ async def test_on_change_publishes_derived_motion() -> None:
 async def test_poll_tick_publishes_expiry_off_flip() -> None:
     clock = FakeClock()
     dev = _scoring(score="200")
-    bus = FakeBus([dev])
+    bus = FakeBus([dev], clock=clock)
     mqtt = FakeMqtt()
     deriver = MotionDeriver(60.0, clock=clock)
-    bridge = Bridge(bus, mqtt, "mesh", deriver=deriver)
+    bridge = Bridge(bus, mqtt, "mesh", deriver=deriver, clock=clock)
     await bridge.reconcile()
     assert _last_motion(mqtt) is True
 
@@ -95,8 +97,9 @@ async def test_poll_tick_publishes_expiry_off_flip() -> None:
 
 @pytest.mark.asyncio
 async def test_no_deriver_passes_firmware_value_through() -> None:
+    clock = FakeClock()
     dev = _scoring(score="200", motion="0")
-    bus = FakeBus([dev])
+    bus = FakeBus([dev], clock=clock)
     mqtt = FakeMqtt()
     bridge = Bridge(bus, mqtt, "mesh")
     await bridge.reconcile()
@@ -107,10 +110,10 @@ async def test_no_deriver_passes_firmware_value_through() -> None:
 async def test_withdraw_clears_hold_state() -> None:
     clock = FakeClock()
     dev = _scoring(score="200")
-    bus = FakeBus([dev])
+    bus = FakeBus([dev], clock=clock)
     mqtt = FakeMqtt()
     deriver = MotionDeriver(60.0, clock=clock)
-    bridge = Bridge(bus, mqtt, "mesh", deriver=deriver)
+    bridge = Bridge(bus, mqtt, "mesh", deriver=deriver, clock=clock)
     await bridge.reconcile()
     await bridge.withdraw()
     # Re-acquisition with a cold score: the old hold must not leak through.

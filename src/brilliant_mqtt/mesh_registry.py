@@ -276,6 +276,10 @@ class MeshRegistry:
                 binding_dimmable=metadata.binding_dimmable,
                 binding_max_intensity=metadata.binding_max_intensity,
             )
+        if metadata.kind not in AUX_SPECS:
+            if binding is not None:
+                self._absence(binding, boundary)
+            return
         changed = binding is not None and self._identity(metadata) != self._identity(
             binding.owner.metadata
         )

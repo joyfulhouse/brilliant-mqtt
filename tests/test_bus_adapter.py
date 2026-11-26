@@ -27,7 +27,8 @@ from brilliant_mqtt.bridge import Bridge
 from brilliant_mqtt.bus import RpcBusAdapter, _session_client_name
 from brilliant_mqtt.commands import VarSet
 from brilliant_mqtt.desired_state import DesiredState
-from brilliant_mqtt.mapping import EntityDescriptor
+from brilliant_mqtt.mapping import EntityDescriptor, entities_for
+from brilliant_mqtt.mesh_settlement import MeshSettlement
 from brilliant_mqtt.model import BrilliantDevice, DeviceKind, Variable
 from brilliant_mqtt.mqttio import _InboundMessage, _TopicDispatcher
 from brilliant_mqtt.write_admission import (
@@ -45,10 +46,45 @@ from tests.fakes import (
     _GatedRpcObserver,
     _RawDevice,
     _RawPeripheral,
+    _RawVariable,
     _settle,
     _StartHarness,
 )
 from tests.test_write_admission import _Harness
+
+
+async def _registered_mesh_fixture(
+    monkeypatch: pytest.MonkeyPatch,
+    bridge: Bridge,
+    adapter: RpcBusAdapter,
+    observer: object,
+    device: BrilliantDevice,
+) -> MeshSettlement:
+    peripheral = _RawPeripheral()
+    peripheral.peripheral_type = 22 if device.kind is DeviceKind.HARDWARE else 27
+    peripheral.variables = {name: _RawVariable(var.value) for name, var in device.variables.items()}
+    if device.kind is DeviceKind.HARDWARE:
+        peripheral.variables["screen_brightness"] = _RawVariable("0")
+    raw = _RawDevice(
+        "ble_mesh",
+        {"slider": peripheral, "blocker": _RawPeripheral(), "successor": _RawPeripheral()},
+    )
+    assert raw.peripherals is not None
+    raw.peripherals["blocker"].peripheral_type = 27
+    raw.peripherals["successor"].peripheral_type = 27
+
+    async def get_peripheral(device_id: str, peripheral_id: str) -> _RawPeripheral | None:
+        return raw.peripherals.get(peripheral_id) if raw.peripherals is not None else None
+
+    monkeypatch.setattr(observer, "get_peripheral", get_peripheral, raising=False)
+    registry = bridge.mesh_registry
+    assert registry is not None
+    registry.acquire()
+    for peripheral_id in ("slider", "blocker", "successor"):
+        await adapter.get_peripheral("ble_mesh", peripheral_id)
+    owner = registry.current("slider")
+    assert owner is not None
+    return owner
 
 
 class TestSessionClientName:
@@ -628,7 +664,9 @@ class TestInteractiveScheduling:
 
     @pytest.mark.parametrize("issued", [False, True])
     async def test_cancelled_lane_revokes_folded_waiter_but_retains_issued_rpc(
-        self, issued: bool
+        self,
+        issued: bool,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         harness = _Harness()
         device = BrilliantDevice(
@@ -641,23 +679,36 @@ class TestInteractiveScheduling:
                 "max_intensity_value": Variable("max_intensity_value", "255"),
             },
         )
-        bridge = Bridge(harness.adapter, FakeMqtt(), "test", sleep=FakeSleeper())
+        bridge = Bridge(
+            harness.adapter, FakeMqtt(), "test", clock=harness.clock, sleep=FakeSleeper()
+        )
         topic = "brilliant/test/slider/set"
-        bridge._devices["slider"] = device
+        owner = await _registered_mesh_fixture(
+            monkeypatch, bridge, harness.adapter, harness.observer, device
+        )
         bridge._by_cmd_topic[topic] = ("slider", None)
+        bridge._mesh_route_owners[topic] = owner
+        registry = bridge.mesh_registry
+        assert registry is not None
 
         async def handle(message: _InboundMessage) -> None:
             await bridge._on_command(message.topic, message.payload)
 
         dispatcher = _TopicDispatcher(handle)
         try:
-            await harness.queue("blocker", {"on": "1"})
+            await harness.queue(
+                "blocker",
+                {"on": "1"},
+                ticket=AdmissionTicket(mesh_owner=registry.current("blocker")),
+            )
             await dispatcher.dispatch(
-                _InboundMessage(topic, '{"brightness":20}', False, (), ()), latest_wins=True
+                _InboundMessage(topic, '{"brightness":20}', False, (), (), mesh_owner=owner),
+                latest_wins=True,
             )
             await _settle(10)
             await dispatcher.dispatch(
-                _InboundMessage(topic, '{"brightness":80}', False, (), ()), latest_wins=True
+                _InboundMessage(topic, '{"brightness":80}', False, (), (), mesh_owner=owner),
+                latest_wins=True,
             )
             if issued:
                 await harness.release(0)
@@ -666,7 +717,11 @@ class TestInteractiveScheduling:
             worker.cancel()
             await asyncio.gather(worker, return_exceptions=True)
             if issued:
-                await harness.queue("successor", {"on": "1"})
+                await harness.queue(
+                    "successor",
+                    {"on": "1"},
+                    ticket=AdmissionTicket(mesh_owner=registry.current("successor")),
+                )
                 assert len(harness.observer.calls) == 2
                 assert harness.observer.in_flight["ble_mesh"] == 1
                 assert harness.observer.cancelled == 0
@@ -677,7 +732,7 @@ class TestInteractiveScheduling:
             await harness.drain()
             assert harness.observer.max_in_flight == {"ble_mesh": 1}
             assert not harness.adapter._write_admissions
-            assert not bridge._pending_mesh
+            assert owner.view.window is None
         finally:
             await harness.drain()
             await dispatcher.shutdown()
@@ -723,7 +778,10 @@ class TestInteractiveScheduling:
     @pytest.mark.parametrize("device_id", ["shared", "ble_mesh"])
     @pytest.mark.parametrize("auxiliary", [False, True])
     async def test_ingress_only_newest_payload_issues_after_gate_opens(
-        self, device_id: str, auxiliary: bool
+        self,
+        device_id: str,
+        auxiliary: bool,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         observer, adapter = _adapter_for(_SchedulingObserver())
         device = BrilliantDevice(
@@ -745,7 +803,22 @@ class TestInteractiveScheduling:
             if auxiliary
             else "brilliant/test/slider/set"
         )
-        bridge._devices["slider"] = device
+        owner = None
+        if device_id == "ble_mesh":
+            if auxiliary:
+                device = replace(
+                    device,
+                    variables={
+                        **device.variables,
+                        "motion_high_threshold": Variable("motion_high_threshold", "0"),
+                        "enable_motion_score": Variable("enable_motion_score", "1"),
+                    },
+                )
+                topic = "brilliant/test/slider/set_motion_high_threshold"
+            owner = await _registered_mesh_fixture(monkeypatch, bridge, adapter, observer, device)
+            bridge._mesh_route_owners[topic] = owner
+        else:
+            bridge._devices["slider"] = device
         descriptor = (
             EntityDescriptor(
                 "number",
@@ -759,14 +832,31 @@ class TestInteractiveScheduling:
             if auxiliary
             else None
         )
+        if device_id == "ble_mesh" and auxiliary:
+            assert owner is not None
+            descriptor = next(
+                descriptor
+                for descriptor in entities_for(owner.materialize(clock()), "test")
+                if descriptor.command_var == "motion_high_threshold"
+            )
         bridge._by_cmd_topic[topic] = ("slider", descriptor)
 
         async def handle(message: _InboundMessage) -> None:
             await bridge._on_command(message.topic, message.payload)
 
         dispatcher = _TopicDispatcher(handle)
+        blocker_ticket = None
+        if device_id == "ble_mesh":
+            registry = bridge.mesh_registry
+            assert registry is not None
+            blocker_ticket = AdmissionTicket(mesh_owner=registry.current("blocker"))
         blocker = asyncio.create_task(
-            adapter.set_variables(device_id, "blocker", [VarSet("on", "1")])
+            adapter.set_variables(
+                device_id,
+                "blocker",
+                [VarSet("on", "1")],
+                ticket=blocker_ticket,
+            )
         )
         try:
             await _settle(10)
@@ -778,6 +868,7 @@ class TestInteractiveScheduling:
                         False,
                         (),
                         (),
+                        mesh_owner=owner,
                     ),
                     latest_wins=True,
                 )
@@ -787,11 +878,24 @@ class TestInteractiveScheduling:
             await dispatcher.shutdown()
             assert observer.payloads == [
                 (device_id, "blocker", {"on": "1"}),
-                (device_id, "slider", {"screen_brightness" if auxiliary else "intensity": "120"}),
+                (
+                    device_id,
+                    "slider",
+                    {
+                        (
+                            "motion_high_threshold"
+                            if device_id == "ble_mesh"
+                            else "screen_brightness"
+                        )
+                        if auxiliary
+                        else "intensity": "120"
+                    },
+                ),
             ]
             assert observer.max_in_flight == 1
             if device_id == "ble_mesh" and not auxiliary:
-                assert bridge._pending_mesh["slider"].targets == {"intensity": "120"}
+                assert owner is not None
+                assert dict(owner.view.targets) == {"intensity": "120"}
                 assert sleeper.requested == [80.0]
         finally:
             observer.release.set()
