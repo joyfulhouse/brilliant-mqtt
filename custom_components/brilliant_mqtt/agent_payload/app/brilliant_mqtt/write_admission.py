@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import TYPE_CHECKING
 
 from brilliant_mqtt.model import CaptureProvenance
+
+if TYPE_CHECKING:
+    from brilliant_mqtt.mesh_settlement import MeshSettlement
 
 
 class WriteClass(Enum):
@@ -44,12 +49,75 @@ class WriteCancelled(asyncio.CancelledError):
 class AdmissionTicket:
     """Opaque identity: routing, payload and session ownership stay in the adapter."""
 
+    mesh_owner: MeshSettlement | None = field(default=None, repr=False)
+
     _owner: object | None = field(default=None, init=False, repr=False)
     _cancel_waiting: Callable[[], None] | None = field(default=None, init=False, repr=False)
     _issued_at: CaptureProvenance | None = field(default=None, init=False, repr=False)
     _on_issued: Callable[[CaptureProvenance], None] | None = field(
         default=None, init=False, repr=False
     )
+    _outcome: str | BaseException | None = field(default=None, init=False, repr=False)
+    _returned_at: CaptureProvenance | None = field(default=None, init=False, repr=False)
+    _on_settled: Callable[[str | BaseException], None] | None = field(
+        default=None, init=False, repr=False
+    )
+    _on_refused: Callable[[], None] | None = field(default=None, init=False, repr=False)
+
+    @property
+    def issued_at(self) -> CaptureProvenance | None:
+        """Actual native authorization, distinct from an issue preparation callback."""
+        return self._issued_at
+
+    @property
+    def settled(self) -> bool:
+        return self._outcome is not None
+
+    @property
+    def outcome(self) -> str | BaseException | None:
+        return self._outcome
+
+    @property
+    def returned_at(self) -> CaptureProvenance | None:
+        return self._returned_at
+
+    @property
+    def accepted_at(self) -> CaptureProvenance | None:
+        return self._returned_at if isinstance(self._outcome, str) else None
+
+    def set_settle_callback(self, callback: Callable[[str | BaseException], None]) -> None:
+        """Replay the stored first outcome once for this listener registration."""
+        self._on_settled = callback
+        if self._outcome is not None:
+            self._notify_settled(self._outcome)
+
+    def clear_settle_callback(self) -> None:
+        self._on_settled = None
+
+    def clear_callbacks(self) -> None:
+        """Release lifecycle listeners without erasing identity or native history."""
+        self._on_issued = None
+        self._on_settled = None
+        self._on_refused = None
+
+    def mark_settled(
+        self, outcome: str | BaseException, provenance: CaptureProvenance | None = None
+    ) -> None:
+        if self._outcome is not None:
+            return
+        self._returned_at = provenance
+        self._outcome = outcome
+        self._notify_settled(outcome)
+
+    def _notify_settled(self, outcome: str | BaseException) -> None:
+        callback, self._on_settled = self._on_settled, None
+        if callback is not None:
+            try:
+                callback(outcome)
+            except Exception as error:
+                logging.getLogger("brilliant_mqtt.bus").warning(
+                    "WRITE_SETTLE_CALLBACK_FAILED %s", type(error).__name__
+                )
 
     def cancel_waiting(self) -> None:
         """Relinquish lane ownership; the adapter never cancels an issued RPC."""
@@ -77,6 +145,7 @@ class CommandAdmission:
 
     ticket: AdmissionTicket = field(default_factory=AdmissionTicket)
     try_supersede: Callable[[str], bool] | None = None
+    mesh_owner: object | None = None
 
 
 command_admission: ContextVar[CommandAdmission | None] = ContextVar(

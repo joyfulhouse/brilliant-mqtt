@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Mesh write feedback now follows one current owner through native late
+  acceptance/rejection, reconnect and queued commands. Confirmation evidence
+  stays scoped to reported fields and fixed windows; bounded publication,
+  routing and slider recovery preserve unknown state for unresolved or
+  abandoned writes. This does not claim faster physical response (Refs #225).
+
 ## [0.13.0] - 2026-11-26
 
 Prerelease candidate. This release updates the Home Assistant integration to

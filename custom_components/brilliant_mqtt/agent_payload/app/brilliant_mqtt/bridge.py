@@ -10,10 +10,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import math
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
+from typing import cast
 
 from brilliant_mqtt import __version__
 from brilliant_mqtt.commands import VarSet, translate_aux, translate_command
@@ -34,9 +34,14 @@ from brilliant_mqtt.mapping import (
     has_calibrated_motion_thresholds,
     payload_fields,
 )
+from brilliant_mqtt.mesh_commands import MeshCommands
+from brilliant_mqtt.mesh_driver import MeshDriver
+from brilliant_mqtt.mesh_registry import MeshRegistry
+from brilliant_mqtt.mesh_routing import DesiredTopic, MeshRouting
+from brilliant_mqtt.mesh_settlement import MeshSettlement
 from brilliant_mqtt.model import BrilliantDevice, CaptureProvenance, DeviceKind, Variable
 from brilliant_mqtt.motion_derive import MotionDeriver
-from brilliant_mqtt.protocols import BusClient, MqttClient
+from brilliant_mqtt.protocols import BusClient, MeshBusClient, MqttClient
 from brilliant_mqtt.retained_topics import RetainedTopicLedger
 from brilliant_mqtt.wired_feedback import (
     Begin,
@@ -93,16 +98,6 @@ MESH_CONFIRM_SECONDS = 80.0
 # stale-stream watchdog owns stream recovery).
 MESH_CONFIRM_MAX_OBSERVATION_AGE_S = 10.0
 
-# Confirm receipts log at INFO once every N confirmations (contradiction
-# receipts always log at WARNING — those are the known-failed deliveries).
-_MESH_RECEIPT_LOG_SAMPLE_EVERY = 10
-
-# Placeholder receipt for a mesh write whose RPC outrun the bus adapter's
-# caller deadline (#72): the write is UNRESOLVED, not failed — it keeps running
-# detached in the adapter — so the pending record is armed exactly as for an
-# accepted write and observations settle it. Logged wherever a receipt is.
-_PENDING_RPC_RECEIPT = "<rpc pending after caller deadline>"
-
 
 @dataclass
 class _CommandSupersession:
@@ -114,27 +109,6 @@ class _CommandSupersession:
 
     def __call__(self, payload: str) -> bool:
         return self.enabled and self.supersede(payload)
-
-
-@dataclass
-class _PendingMeshWrite:
-    """One in-flight mesh primary write awaiting observation-based confirmation.
-
-    Each command creates a fresh record, so object identity IS the generation
-    tag: a stale confirm task detects supersession by identity check.
-    """
-
-    # Commanded variable values (name -> string value), compared verbatim
-    # against observed snapshots: any differing value is a contradiction.
-    targets: dict[str, str]
-    # Normalized transport-ack receipt from BusClient.set_variables — logged
-    # on contradiction (known-failed delivery) and sampled on confirm.
-    receipt: str
-    generation: int
-    status: str = "pending"
-    deadline: float | None = None
-    # Bridge-clock time of the newest observation matching the targets.
-    last_observed_at: float | None = None
 
 
 @dataclass
@@ -278,6 +252,8 @@ class Bridge:
 
         # peripheral_id → most recent BrilliantDevice snapshot.
         self._devices: dict[str, BrilliantDevice] = {}
+        # Only a filtered full reconcile refreshes or clears discovery firmware.
+        self._discovery_sw_version: str | None = None
         # Camera permission must not inherit discovery's intentionally unpruned cache.
         self._privacy_off = False
         self._privacy_source_generation = getattr(bus, "capture_generation", 0)
@@ -286,8 +262,8 @@ class Bridge:
         # command topic → (peripheral_id, descriptor). descriptor is None for the
         # PRIMARY JSON light/switch topic; an EntityDescriptor for each aux topic.
         self._by_cmd_topic: dict[str, tuple[str, EntityDescriptor | None]] = {}
-        # Admission ownership, separate from mesh confirmation generations.
-        # Keep epochs across withdrawal/rebinding to reject an A -> B -> A route.
+        # Wired admission epochs survive withdrawal/rebinding. Mesh commands use
+        # the exact registry owner stamped at MQTT ingress instead.
         self._command_generation: dict[str, int] = {}
         # Command topics this session has already SUBSCRIBEd (#76): the periodic
         # resync must not re-issue them. Bridge lifetime == MQTT session, and
@@ -300,29 +276,343 @@ class Bridge:
         # before JSON serialization; the payload cache preserves wire-level
         # publish decisions for any projections with equivalent JSON.
         self._last_state_fields: dict[str, dict[str, object]] = {}
-        # Mesh primaries only (issues #46/#47): peripheral_id → in-flight write
-        # awaiting observation-based confirmation.
-        self._pending_mesh: dict[str, _PendingMeshWrite] = {}
-        # Confirm timers, keyed OUTSIDE the pending record: a resolver deletes
-        # its pending entry before publishing the confirmation, and must stay
-        # cancellable (supersession, withdraw) through that final publish.
-        self._mesh_confirm_tasks: dict[str, asyncio.Task[None]] = {}
-        # Monotonic per-peripheral command counter — NEVER cleared or reused
-        # within a Bridge lifetime, so a stalled bus write from before a
-        # withdraw can never match a generation minted after re-acquisition.
-        self._mesh_write_generation: dict[str, int] = {}
-        self._mesh_feedback: dict[str, _PendingMeshWrite] = {}
-        # Only the new feedback publications, NOT the existing confirm timers.
-        self._mesh_feedback_tasks: dict[asyncio.Task[None], str] = {}
-        self._mesh_feedback_enabled = True
-        self._mesh_confirm_count = 0
+        self._mesh: MeshRegistry | None = None
+        self._mesh_driver: MeshDriver | None = None
+        self._mesh_commands: MeshCommands | None = None
+        self.on_mesh_capacity_recovered: Callable[[], Awaitable[None]] | None = None
+        self._mesh_recovery_pending = False
+        self._mesh_recovery_running = False
+        self._mesh_route_owners: dict[str, MeshSettlement] = {}
+        self._mesh_descriptors: dict[MeshSettlement, tuple[EntityDescriptor, ...]] = {}
+        self._mesh_routing = MeshRouting(
+            mqtt, self._subscribed, self._fail_mesh_routing, self._async_publish_retained
+        )
+        if panel == _MESH_PANEL or include is None or include(_MESH_DEVICE_ID):
+            mesh_bus = cast(MeshBusClient, bus)
+            self._mesh = MeshRegistry(
+                mesh_bus,
+                clock=clock,
+                wall_clock=wall_clock,
+                derive_motion=deriver is not None,
+                motion_hold_s=deriver.hold_s if deriver is not None else 60,
+                native_motion_passthrough=motion_native_passthrough,
+                is_mesh_leader=lambda: self._include is None or self._include(_MESH_DEVICE_ID),
+            )
+            self._mesh_driver = MeshDriver(self._mesh, mqtt, panel=panel, sleep=self._sleep)
+            self._mesh_driver.cleanup = self._cleanup_mesh
+            self._mesh_commands = MeshCommands(self._mesh, self._mesh_driver, bus)
+            self._mesh.revoked = self._mesh_revoked
+            self._mesh.changed = self._mesh_status_changed
+            self._mesh.recovered = self._mesh_capacity_recovered
+            self._mesh.retained_ids = self._mesh_retained_ids
+            mqtt.set_mesh_owner_resolver(self._resolve_mesh_owner)
         self._wired: dict[str, _WiredSlot] = {}
         self._wired_source_generation = getattr(bus, "capture_generation", 0)
         self._wired_feedback_enabled = True
         self._wired_lifecycle = 0
 
-        bus.on_change(self._on_change, want_device=self._include)
+        if self._mesh is not None:
+            mesh_bus.on_change(self._on_change, want_device=self._include, mesh_metadata_only=True)
+        else:
+            bus.on_change(self._on_change, want_device=self._include)
         mqtt.on_command(self._on_command)
+
+    @property
+    def mesh_registry(self) -> MeshRegistry | None:
+        """Actual owner registry for read-only integration diagnostics."""
+        return self._mesh
+
+    @property
+    def mesh_driver(self) -> MeshDriver | None:
+        return self._mesh_driver
+
+    def _fail_mesh_routing(self, error: Exception) -> None:
+        if self._mesh is not None:
+            self._mesh.bus.fail_mesh(error)
+
+    def _mesh_retained_ids(self) -> frozenset[str]:
+        ids = self._mesh_routing.peripheral_ids
+        if self._mesh_driver is not None:
+            ids |= self._mesh_driver.peripheral_ids
+        return ids
+
+    def _mesh_status_changed(self) -> None:
+        registry = self._mesh
+        if registry is not None and registry.enabled and self._panel == _MESH_PANEL:
+            self._queue_mesh_availability("offline")
+
+    def _mesh_capacity_recovered(self) -> None:
+        self._mesh_recovery_pending = True
+
+    async def _drain_mesh_recovery(self) -> None:
+        if self._mesh_recovery_running:
+            return
+        self._mesh_recovery_running = True
+        try:
+            # Coalesce only real recovery notifications received during an
+            # existing sweep; ordinary captures never request another sweep.
+            while self._mesh_recovery_pending:
+                registry = self._mesh
+                callback = self.on_mesh_capacity_recovered
+                if (
+                    callback is None
+                    or registry is None
+                    or not registry.enabled
+                    or registry.disabled
+                    or not registry.bus.mesh_admission_open
+                    or self._include is not None
+                    and not self._include(_MESH_DEVICE_ID)
+                ):
+                    return
+                self._mesh_recovery_pending = False
+                await callback()
+        finally:
+            self._mesh_recovery_running = False
+
+    def _queue_mesh_availability(self, payload: str) -> asyncio.Task[None]:
+        registry = self._mesh
+        assert registry is not None
+        acquisition = registry.acquisition
+        assert acquisition is not None
+        return self._mesh_routing.request(
+            availability_topic(self._panel),
+            DesiredTopic(
+                acquisition,
+                lambda: (
+                    registry.enabled
+                    and registry.acquisition is acquisition
+                    and registry.bus.mesh_admission_open
+                    and (payload == "offline" or self._mesh_online_ready())
+                ),
+                payload=payload,
+            ),
+            revoke=True,
+        )
+
+    def _mesh_online_ready(self) -> bool:
+        registry = self._mesh
+        if (
+            registry is None
+            or not registry.enabled
+            or registry.disabled
+            or not registry.inventory_ready
+            or registry.retired
+            or self._mesh_driver is None
+        ):
+            return False
+        expected: set[str] = set()
+        for owner in registry.owners:
+            if (
+                not registry.live(owner)
+                or self._mesh_driver.published_fields(owner) is None
+                or owner.view.terminal is not None
+                or owner.view.in_flight is not None
+            ):
+                return False
+            pid = owner.metadata.peripheral_id
+            descriptors = entities_for(owner.materialize(self._clock()), self._panel)
+            if self._mesh_descriptors.get(owner) != tuple(descriptors):
+                return False
+            for descriptor in descriptors:
+                topic = config_topic(descriptor)
+                expected.add(topic)
+                if not self._mesh_routing.repaired(
+                    topic,
+                    owner,
+                    payload=config_payload(descriptor, sw_version=self._discovery_sw_version),
+                ):
+                    return False
+                command = self._command_topic_for(pid, descriptor)
+                if command is None:
+                    continue
+                expected.add(command)
+                if (
+                    not self._mesh_routing.repaired(command, owner, membership=True)
+                    or command not in self._subscribed
+                    or self._resolve_mesh_owner(command) is not owner
+                    or self._by_cmd_topic.get(command)
+                    != (pid, descriptor if descriptor.command_var is not None else None)
+                ):
+                    return False
+        return all(
+            record.peripheral_id is None or topic in expected
+            for topic, record in self._mesh_routing.records.items()
+        )
+
+    async def _repair_mesh_availability(self) -> None:
+        registry = self._mesh
+        if registry is None or not registry.enabled or self._panel != _MESH_PANEL:
+            return
+        payload = "online" if self._mesh_online_ready() else "offline"
+        await asyncio.shield(self._queue_mesh_availability(payload))
+
+    def _mesh_revoked(self, owner: MeshSettlement) -> None:
+        self._mesh_status_changed()
+        self._mesh_routing.revoke(owner)
+        if self._mesh_commands is not None:
+            self._mesh_commands.revoke(owner)
+        if (
+            self._mesh is not None
+            and self._mesh.retired.get(owner.metadata.peripheral_id) is not owner
+        ):
+            self._mesh_descriptors.pop(owner, None)
+
+    def _current_device(self, peripheral_id: str) -> BrilliantDevice | None:
+        if self._mesh is not None:
+            owner = self._mesh.current(peripheral_id)
+            if owner is not None:
+                return owner.materialize(self._clock()) if self._mesh.live(owner) else None
+        device = self._devices.get(peripheral_id)
+        return device if device is None or device.device_id != _MESH_DEVICE_ID else None
+
+    def _resolve_mesh_owner(self, topic: str) -> MeshSettlement | None:
+        route = self._by_cmd_topic.get(topic)
+        if route is None or self._mesh is None:
+            return None
+        peripheral_id, _descriptor = route
+        owner = self._mesh.current(peripheral_id)
+        if (
+            owner is None
+            or not self._mesh.live(owner)
+            or self._mesh_route_owners.get(topic) is not owner
+        ):
+            return None
+        return owner
+
+    async def _flush_mesh(self, peripheral_id: str, *, force: bool = False) -> None:
+        if self._mesh is not None and self._mesh_driver is not None:
+            owner = self._mesh.current(peripheral_id)
+            if owner is not None:
+                await self._mesh_driver.flush(owner, force=force)
+
+    async def _flush_retired_mesh(self) -> None:
+        if self._mesh is not None and self._mesh_driver is not None:
+            for owner in tuple(self._mesh.retired.values()):
+                await self._mesh_driver.flush(owner)
+
+    async def _repair_mesh(self, peripheral_id: str, *, force: bool) -> None:
+        registry = self._mesh
+        if registry is None:
+            return
+        while True:
+            owner = registry.current(peripheral_id)
+            if owner is None or not registry.live(owner):
+                return
+            sw_version = self._discovery_sw_version
+            device = owner.materialize(self._clock())
+            descriptors = entities_for(device, self._panel)
+            self._remember_device(device)
+            self._mesh_descriptors[owner] = tuple(descriptors)
+            if self._mesh_driver is not None:
+                self._mesh_driver.wake(owner, force=force)
+            desired: dict[str, DesiredTopic] = {}
+
+            def current(owner: MeshSettlement = owner) -> bool:
+                return registry.current(peripheral_id) is owner and registry.live(owner)
+
+            def current_config(sw_version: str | None = sw_version) -> bool:
+                return current() and self._discovery_sw_version == sw_version
+
+            for descriptor in descriptors:
+                desired[config_topic(descriptor)] = DesiredTopic(
+                    owner, current_config, payload=config_payload(descriptor, sw_version=sw_version)
+                )
+                topic = self._command_topic_for(peripheral_id, descriptor)
+                self._register_command_topic(peripheral_id, descriptor)
+                if topic is None:
+                    continue
+                self._mesh_route_owners[topic] = owner
+                desired[topic] = DesiredTopic(owner, current, membership=True)
+            for topic, record in tuple(self._mesh_routing.records.items()):
+                if record.peripheral_id == peripheral_id and topic not in desired:
+                    desired[topic] = DesiredTopic(
+                        owner,
+                        current,
+                        payload="" if record.desired.membership is None else None,
+                        membership=False if record.desired.membership is not None else None,
+                        forget=True,
+                    )
+                    self._mesh_route_owners.pop(topic, None)
+                    self._by_cmd_topic.pop(topic, None)
+            tasks = [
+                self._mesh_routing.request(topic, target, force=force)
+                for topic, target in desired.items()
+            ]
+            for task in tasks:
+                await asyncio.shield(task)
+            if self._discovery_sw_version != sw_version:
+                continue
+            if registry.current(peripheral_id) is not owner:
+                continue
+            if registry.live(owner) and descriptors != entities_for(
+                owner.materialize(self._clock()), self._panel
+            ):
+                continue
+            if registry.live(owner):
+                await self._flush_mesh(peripheral_id)
+            if self._discovery_sw_version != sw_version:
+                continue
+            return
+
+    async def _cleanup_mesh(self, owner: MeshSettlement) -> None:
+        registry = self._mesh
+        peripheral_id = owner.metadata.peripheral_id
+        if registry is None:
+            return
+
+        def current() -> bool:
+            return (
+                registry.enabled
+                and registry.bus.mesh_admission_open
+                and registry.retired.get(peripheral_id) is owner
+                and registry.current(peripheral_id) is None
+            )
+
+        if not current():
+            return
+        records = [
+            (topic, record)
+            for topic, record in tuple(self._mesh_routing.records.items())
+            if record.peripheral_id == peripheral_id
+        ]
+        records.sort(key=lambda item: item[1].desired.membership is None)
+        for topic, record in records:
+            if not current():
+                return
+            await asyncio.shield(
+                self._mesh_routing.request(
+                    topic,
+                    DesiredTopic(
+                        owner,
+                        current,
+                        payload="" if record.desired.payload is not None else None,
+                        membership=False if record.desired.membership is not None else None,
+                        forget=True,
+                    ),
+                )
+            )
+        if registry.retired.get(peripheral_id) is owner:
+            for topic, route_owner in tuple(self._mesh_route_owners.items()):
+                if route_owner.metadata.peripheral_id == peripheral_id:
+                    self._mesh_route_owners.pop(topic)
+                    self._by_cmd_topic.pop(topic, None)
+            self._mesh_descriptors.pop(owner, None)
+            self._devices.pop(peripheral_id, None)
+            self._command_generation.pop(peripheral_id, None)
+            self._last_state_payload.pop(peripheral_id, None)
+            self._last_state_fields.pop(peripheral_id, None)
+            self._last_reassert = {
+                key: at for key, at in self._last_reassert.items() if key[0] != peripheral_id
+            }
+            self._reassert_retry_interval_s = {
+                key: at
+                for key, at in self._reassert_retry_interval_s.items()
+                if key[0] != peripheral_id
+            }
+            self._missing_var_logged = {
+                key for key in self._missing_var_logged if key[0] != peripheral_id
+            }
+            registry.finish_retired(owner)
 
     def _included(self, device: BrilliantDevice) -> bool:
         """True when *device* is in this bridge's scope (no filter = everything).
@@ -334,6 +624,8 @@ class Bridge:
 
     def _derived(self, device: BrilliantDevice) -> BrilliantDevice:
         """Apply score-derived motion to *device* (identity when disabled)."""
+        if device.device_id == _MESH_DEVICE_ID:
+            return device
         return device if self._deriver is None else self._deriver.apply(device)
 
     def _payload_fields(self, device: BrilliantDevice) -> dict[str, object]:
@@ -353,6 +645,9 @@ class Bridge:
         )
 
     def _remember_device(self, device: BrilliantDevice) -> None:
+        if device.device_id == _MESH_DEVICE_ID:
+            self._devices[device.peripheral_id] = replace(device, variables={})
+            return
         previous = self._devices.get(device.peripheral_id)
         if previous is None or not self._same_binding(previous, device):
             # These are translate_command's snapshot inputs. Observed values
@@ -501,11 +796,9 @@ class Bridge:
     async def reconcile(self) -> None:
         """Publish availability, discovery configs, and initial state for all devices.
 
-        Idempotent for re-publishing and additions: safe to call repeatedly;
-        already-subscribed command topics are skipped. Stale
-        peripherals are NOT pruned — out of scope; removal is handled
-        operationally by clearing the retained config topic (see
-        docs/reference/deployment.md).
+        Already-subscribed command topics are skipped. Mesh inventory removal
+        retains a bounded absence publication and exact route/config cleanup;
+        wired discovery retains its existing operational cleanup policy.
         """
         # Read the bus and stamp the liveness heartbeat BEFORE any broker-dependent
         # publish. A broker that rejects or hangs the availability PUBLISH (or
@@ -520,11 +813,24 @@ class Bridge:
         lifecycle = self._wired_lifecycle
         if not self._feedback_alive(lifecycle):
             return
+        if (
+            self._panel == _MESH_PANEL
+            and self._include is not None
+            and not self._include(_MESH_DEVICE_ID)
+        ):
+            return
+        if self._mesh is not None:
+            self._mesh.acquire()
         devices = [d for d in await self._bus.get_all() if self._included(d)]
         if not self._feedback_alive(lifecycle):
             return
         self._beat()
-        self._mesh_feedback_enabled = True
+        # Refresh before broker awaits so ordinary poll/push repairs and online
+        # readiness use the current filtered HARDWARE context, including absence.
+        sw_version = _sw_version_from(devices)
+        if self._discovery_sw_version != sw_version:
+            self._discovery_sw_version = sw_version
+            self._mesh_status_changed()
         self._observe_privacy_snapshot(devices)
 
         # A broker await may admit a command or native push. Apply this captured
@@ -534,16 +840,10 @@ class Bridge:
                 observed = self._derived(captured)
                 self._remember_native_observation(observed)
 
-        await self._async_publish_retained(
-            availability_topic(self._panel),
-            "online",
-        )
+        if self._panel != _MESH_PANEL:
+            await self._async_publish_retained(availability_topic(self._panel), "online")
         if not self._feedback_alive(lifecycle):
             return
-
-        # Pre-pass: the panel firmware version (from the HARDWARE peripheral) is
-        # attached to every entity's HA device block so the device page shows it.
-        sw_version = _sw_version_from(devices)
 
         # Bridge meta: the companion integration's machine contract. Retained and
         # republished on every reconcile (idempotent, like discovery configs).
@@ -564,6 +864,11 @@ class Bridge:
 
         n_devices = n_entities = 0
         for device in devices:
+            if device.device_id == _MESH_DEVICE_ID:
+                await self._repair_mesh(device.peripheral_id, force=True)
+                if not self._feedback_alive(lifecycle):
+                    return
+                continue
             descriptors = entities_for(device, self._panel)
             if not descriptors:
                 # UNKNOWN / SENSOR — no HA entity; skip entirely.
@@ -596,7 +901,6 @@ class Bridge:
             else:
                 observed = self._derived(device)
                 device = self._remember_native_observation(observed)
-                self._observe_mesh_pending(device)
                 for descriptor in descriptors:
                     await self._async_publish_retained(
                         config_topic(descriptor),
@@ -637,7 +941,10 @@ class Bridge:
             len(self._by_cmd_topic),
         )
         if self._feedback_alive(lifecycle):
+            await self._flush_retired_mesh()
             await self._enforce_desired(devices)
+            await self._repair_mesh_availability()
+            await self._drain_mesh_recovery()
 
     async def reconcile_after_reconnect(self) -> None:
         """Retire session-local wired evidence before reading a new bus generation."""
@@ -672,7 +979,11 @@ class Bridge:
             return
         route = (peripheral_id, d if d.command_var is not None else None)
         previous = self._by_cmd_topic.get(topic)
-        if previous is not None and previous != route:
+        if (
+            previous is not None
+            and previous != route
+            and (self._mesh is None or self._mesh.current(peripheral_id) is None)
+        ):
             self._command_generation[peripheral_id] = (
                 self._command_generation.get(peripheral_id, 0) + 1
             )
@@ -687,46 +998,44 @@ class Bridge:
         everything fresh via reconcile(). Safe to call on a bridge that never
         reconciled (no-op).
         """
-        # Step down SYNCHRONOUSLY, before ANY await. Clearing the command
-        # routing first means a command already queued in the MQTT lane that
-        # begins mid-withdraw finds no route — it can neither perform an
-        # ex-leader bus write nor arm a fresh pending/confirm task the sweep
-        # below would never see. Then revoke mesh pendings and their confirm
-        # timers: an ex-leader must not resolve confirmations it no longer
-        # owns, and a deadline elapsing during the unsubscribe handoff must
-        # not publish one (the registry union also reaches a resolver already
-        # past its pending entry, mid-publish).
-        topics = list(self._by_cmd_topic)
+        # Close routing and registry synchronously before joining effects or
+        # awaiting the broker. Queued commands and ready expiry lose ownership
+        # at this boundary, while actual native RPCs retain their physical lock.
+        topics = [topic for topic in self._by_cmd_topic if topic not in self._mesh_routing.records]
         for peripheral_id in self._command_generation:
             self._command_generation[peripheral_id] += 1
         self._by_cmd_topic.clear()
-        self._subscribed.clear()
-        for peripheral_id in set(self._pending_mesh) | set(self._mesh_confirm_tasks):
-            self._drop_pending_mesh(peripheral_id)
-        # Invalidate — never clear — the write generations: a pre-withdraw bus
-        # write still in flight (it looked up its route before this point)
-        # must not match a generation minted after re-acquisition and
-        # resurrect its stale command (ABA); its completion is rejected, so it
-        # cannot arm a pending or publish either.
-        await self.shutdown_mesh_feedback()
-        await self.shutdown_wired_feedback()
+        self._subscribed.difference_update(topics)
+        if self._mesh is not None:
+            self._mesh.close()
+        self._mesh_recovery_pending = False
+        mesh_repairs = self._mesh_routing.withdraw()
+        self._mesh_route_owners.clear()
+        self._mesh_descriptors.clear()
+        self._last_state_payload.clear()
+        self._last_state_fields.clear()
+        self._devices.clear()
+        self._discovery_sw_version = None
+        if self._deriver is not None:
+            self._deriver.clear()
+        if self._panel == _MESH_PANEL:
+            self._wired_lifecycle += 1
+        if self._mesh_driver is not None:
+            await self._mesh_driver.shutdown()
+        if self._panel != _MESH_PANEL:
+            await self.shutdown_wired_feedback()
         unsubscribed = 0
+        await self._mesh_routing.join(mesh_repairs)
         for topic in topics:
             # A failed unsubscribe must not abort the rest — a step-down must
             # always complete so the routing/state caches are reliably cleared.
             try:
                 await self._mqtt.unsubscribe(topic)
+                self._subscribed.discard(topic)
                 unsubscribed += 1
             except Exception:
                 logger.exception("withdraw: unsubscribe failed for %s; continuing", topic)
-        self._last_state_payload.clear()
-        self._last_state_fields.clear()
-        self._devices.clear()
         self._wired_feedback_enabled = True
-        if self._deriver is not None:
-            # An ex-leader must not carry hold state into a re-acquisition;
-            # the new session starts cold (motion off until the next spike).
-            self._deriver.clear()
         logger.info("withdraw: %d command topics unsubscribed", unsubscribed)
 
     async def poll_once(self, devices: list[BrilliantDevice] | None = None) -> None:
@@ -761,18 +1070,25 @@ class Bridge:
             # bus device, including the other bridge's.
             if not self._included(device):
                 continue
+            if device.device_id == _MESH_DEVICE_ID:
+                await self._repair_mesh(device.peripheral_id, force=False)
+                if not self._feedback_alive(lifecycle):
+                    return
+                continue
             if not entities_for(device, self._panel):
                 continue
             observed = self._derived(device)
             device = self._remember_native_observation(observed)
-            self._observe_mesh_pending(device)
             fields = self._payload_fields(device)
             if fields:
                 await self._publish_state(device, fields, force=False)
                 if not self._feedback_alive(lifecycle):
                     return
         if self._feedback_alive(lifecycle):
+            await self._flush_retired_mesh()
             await self._enforce_desired(devices)
+            await self._repair_mesh_availability()
+            await self._drain_mesh_recovery()
 
     def _motion_default_wants(self, device: BrilliantDevice) -> dict[str, str]:
         """Config-driven motion defaults for *device*, overlaid under recorded intent.
@@ -814,6 +1130,11 @@ class Bridge:
                 return
             if not self._included(device):
                 continue
+            if device.device_id == _MESH_DEVICE_ID:
+                current = self._current_device(device.peripheral_id)
+                if current is None:
+                    continue
+                device = current
             wanted = {
                 **self._motion_default_wants(device),
                 **self._desired.wanted(device.peripheral_id),
@@ -874,12 +1195,24 @@ class Bridge:
             self._throttle.last_ts = now
             writes += 1
             try:
-                await self._bus.set_variables(
-                    device.device_id,
-                    device.peripheral_id,
-                    drifted,
-                    write_class=WriteClass.MAINTENANCE,
-                )
+                if device.device_id == _MESH_DEVICE_ID:
+                    owner = (
+                        self._mesh.current(device.peripheral_id) if self._mesh is not None else None
+                    )
+                    if owner is None or self._mesh_commands is None:
+                        continue
+                    result = await self._mesh_commands.execute(
+                        owner, drifted, primary=False, maintenance=True
+                    )
+                    if isinstance(result, Superseded):
+                        continue
+                else:
+                    await self._bus.set_variables(
+                        device.device_id,
+                        device.peripheral_id,
+                        drifted,
+                        write_class=WriteClass.MAINTENANCE,
+                    )
                 if not self._feedback_alive(lifecycle):
                     return
             except WriteCancelled:
@@ -937,9 +1270,7 @@ class Bridge:
         the wire-payload comparison for publish parity. *force* bypasses both
         checks for reconcile's level-triggered repair.
 
-        The pending-mesh overlay is applied BEFORE either cache, so every
-        publish path — echo, push, poll, and forced reconcile alike — holds
-        `state: null` while a mesh write awaits confirmation.
+        Mesh publication delegates entirely to its owner and final driver lane.
 
         The caches commit only AFTER the broker accepted the publish: a failed
         publish must not leave them claiming the wire carries this payload, or
@@ -947,15 +1278,14 @@ class Bridge:
         topic would stay stale until the value changed again.
         """
         peripheral_id = device.peripheral_id
+        if device.device_id == _MESH_DEVICE_ID:
+            await self._flush_mesh(peripheral_id, force=force)
+            return
         wired_primary = self._is_wired_primary(device)
         if wired_primary and (not self._wired_feedback_enabled or not self._included(device)):
             return
         if wired_primary:
             await self._publish_wired_slot(peripheral_id, force=force)
-            return
-        fields = self._project_pending_mesh(peripheral_id, fields)
-        mesh_feedback = "mesh_write_status" in fields
-        if mesh_feedback and (not self._mesh_feedback_enabled or not self._included(device)):
             return
         # Accepted parity exception: dict equality treats numerically-equal
         # values as equal (-0.0 == 0.0, 1 == 1.0), so such a re-rendering keeps
@@ -969,23 +1299,6 @@ class Bridge:
             self._last_state_fields[peripheral_id] = fields
             return
         logger.debug("state publish for %s%s", peripheral_id, " (forced)" if force else "")
-        if mesh_feedback:
-            generation = self._mesh_write_generation.get(peripheral_id, 0)
-            mesh_record = self._mesh_feedback.get(peripheral_id)
-            task = asyncio.create_task(
-                self._publish_mesh_feedback(device, fields, payload, generation, mesh_record),
-                name=f"brilliant-mqtt-mesh-feedback-{peripheral_id}",
-            )
-            self._mesh_feedback_tasks[task] = peripheral_id
-            try:
-                await task
-            except asyncio.CancelledError:
-                if self._owns_mesh_feedback(peripheral_id, generation, mesh_record):
-                    raise
-                # Revocation cancelled this publication, not its command/poll owner.
-            finally:
-                self._mesh_feedback_tasks.pop(task, None)
-            return
         await self._async_publish_retained(
             state_topic(self._panel, peripheral_id),
             payload,
@@ -1124,56 +1437,14 @@ class Bridge:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._wired.clear()
 
-    def _owns_mesh_feedback(
-        self, peripheral_id: str, generation: int, record: _PendingMeshWrite | None
-    ) -> bool:
-        return (
-            self._mesh_feedback_enabled
-            and self._mesh_write_generation.get(peripheral_id, 0) == generation
-            and self._mesh_feedback.get(peripheral_id) is record
-        )
-
-    async def _publish_mesh_feedback(
-        self,
-        device: BrilliantDevice,
-        fields: dict[str, object],
-        payload: str,
-        generation: int,
-        record: _PendingMeshWrite | None,
-    ) -> None:
-        peripheral_id = device.peripheral_id
-        if not self._owns_mesh_feedback(peripheral_id, generation, record) or not self._included(
-            device
-        ):
-            return
-        await self._async_publish_retained(state_topic(self._panel, peripheral_id), payload)
-        if self._owns_mesh_feedback(peripheral_id, generation, record):
-            self._last_state_fields[peripheral_id] = fields
-            self._last_state_payload[peripheral_id] = payload
-
-    def _set_mesh_feedback(self, peripheral_id: str, record: _PendingMeshWrite | None) -> None:
-        for task, pid in self._mesh_feedback_tasks.items():
-            if pid == peripheral_id and task.cancel():
-                # Bytes may already be retained before local completion/cache commit.
-                # The next publish must repair that uncertain broker state.
-                self._last_state_fields.pop(peripheral_id, None)
-                self._last_state_payload.pop(peripheral_id, None)
-        if record is None:
-            self._mesh_feedback.pop(peripheral_id, None)
-        else:
-            self._mesh_feedback[peripheral_id] = record
-
     async def shutdown_mesh_feedback(self) -> None:
-        """Revoke and join feedback publishes without sweeping existing confirm timers."""
-        self._mesh_feedback_enabled = False
-        self._mesh_feedback.clear()
-        for peripheral_id in self._mesh_write_generation:
-            self._mesh_write_generation[peripheral_id] += 1
-        tasks = list(self._mesh_feedback_tasks)
-        for task in tasks:
-            task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        if self._mesh is not None:
+            self._mesh.close()
+        await self._mesh_routing.join(self._mesh_routing.withdraw())
+        if self._mesh_driver is not None:
+            await self._mesh_driver.shutdown()
+        if self._mesh is not None:
+            self._mesh.dispose()
 
     async def _async_publish_retained(self, topic: str, payload: str) -> None:
         """Publish through the panel ledger, or directly for the mesh bridge."""
@@ -1187,6 +1458,11 @@ class Bridge:
         # The shared-bus fan-out delivers every device's changes to every
         # bridge — an out-of-scope device must not even be snapshotted.
         if not self._included(device):
+            return
+        if device.device_id == _MESH_DEVICE_ID:
+            await self._repair_mesh(device.peripheral_id, force=False)
+            await self._flush_retired_mesh()
+            await self._drain_mesh_recovery()
             return
         if self._wired_feedback_enabled:
             self._observe_privacy(device)
@@ -1202,7 +1478,6 @@ class Bridge:
 
         observed = self._derived(device)
         device = self._remember_native_observation(observed)
-        self._observe_mesh_pending(device)
 
         fields = self._payload_fields(device)
         if fields:
@@ -1220,6 +1495,18 @@ class Bridge:
             logger.debug("COMMAND_ROUTE_UNKNOWN")
             return
         peripheral_id, descriptor = route
+        owner = self._mesh.current(peripheral_id) if self._mesh is not None else None
+        cached = self._devices.get(peripheral_id)
+        if owner is not None or cached is not None and cached.device_id == _MESH_DEVICE_ID:
+            admission = command_admission.get()
+            if owner is None or admission is None or admission.mesh_owner is not owner:
+                return
+            if self._resolve_mesh_owner(topic) is not owner:
+                return
+            if descriptor is not None and descriptor not in entities_for(
+                owner.materialize(self._clock()), self._panel
+            ):
+                return
 
         if descriptor is None:
             await self._handle_primary_command(topic, peripheral_id, payload)
@@ -1238,7 +1525,7 @@ class Bridge:
             logger.debug("COMMAND_OBJECT_INVALID")
             return
 
-        device = self._devices.get(peripheral_id)
+        device = self._current_device(peripheral_id)
         if device is None:
             logger.debug("COMMAND_DEVICE_UNKNOWN")
             return
@@ -1250,10 +1537,14 @@ class Bridge:
             route = self._by_cmd_topic.get(topic)
             target = (device.device_id, device.peripheral_id)
             translation = (device.kind, device.is_dimmable, device.max_intensity)
-            generation = self._command_generation.setdefault(peripheral_id, 0)
+            generation = (
+                self._command_generation.setdefault(peripheral_id, 0)
+                if device.device_id != _MESH_DEVICE_ID
+                else 0
+            )
 
             def decode(new_payload: str) -> list[VarSet]:
-                current = self._devices.get(peripheral_id)
+                current = self._current_device(peripheral_id)
                 if (
                     self._command_generation.get(peripheral_id) != generation
                     or self._by_cmd_topic.get(topic) != route
@@ -1272,7 +1563,34 @@ class Bridge:
             if device.device_id == _MESH_DEVICE_ID:
                 # Mesh primaries: no optimistic echo — observation-confirmed
                 # write with a pending-visible (state: null) window instead.
-                await self._write_mesh_primary(device, peripheral_id, sets, decode=decode)
+                owner = self._mesh.current(peripheral_id) if self._mesh is not None else None
+                if owner is not None and self._mesh_commands is not None:
+
+                    def decode_mesh(new_payload: str) -> list[VarSet]:
+                        if self._resolve_mesh_owner(topic) is not owner:
+                            return []
+                        try:
+                            value = json.loads(new_payload)
+                        except (json.JSONDecodeError, ValueError):
+                            return []
+                        return (
+                            translate_command(owner.materialize(self._clock()), value)
+                            if isinstance(value, dict)
+                            else []
+                        )
+
+                    try:
+                        await self._mesh_commands.execute(
+                            owner, sets, primary=True, decode=decode_mesh
+                        )
+                    except (TimeoutError, asyncio.TimeoutError):
+                        logger.warning(
+                            "mesh write unresolved at caller deadline: %s", peripheral_id
+                        )
+                    except Exception as error:
+                        logger.warning(
+                            "mesh write failed %s %s", peripheral_id, type(error).__name__
+                        )
                 return
             if peripheral_id not in self._wired or self._wired[peripheral_id].record.native is None:
                 self._wired_event(peripheral_id, Capture(device))
@@ -1336,9 +1654,30 @@ class Bridge:
         if value is None:
             logger.debug("aux command on %s (%r) did not translate; ignoring", topic, payload)
             return
+        if self._by_cmd_topic.get(topic) != (peripheral_id, d):
+            return
+        device = self._current_device(peripheral_id)
+        owner = self._mesh.current(peripheral_id) if self._mesh is not None else None
+        cached = self._devices.get(peripheral_id)
+        if (
+            owner is not None
+            or cached is not None
+            and cached.device_id == _MESH_DEVICE_ID
+            or topic in self._mesh_route_owners
+        ):
+            # Rejected mesh intent must not become a later maintenance write.
+            admission = command_admission.get()
+            if (
+                owner is None
+                or admission is None
+                or admission.mesh_owner is not owner
+                or self._resolve_mesh_owner(topic) is not owner
+                or device is None
+                or d not in entities_for(device, self._panel)
+            ):
+                return
         if self._desired is not None and d.command_var in RECONCILED_VARS:
             self._desired.record(peripheral_id, d.command_var, value)
-        device = self._devices.get(peripheral_id)
         if device is None:
             # Without a snapshot we cannot know which bus device owns the
             # peripheral, so the write cannot be routed — mirror the primary
@@ -1351,10 +1690,14 @@ class Bridge:
         sets = [VarSet(d.command_var, value)]
         route = self._by_cmd_topic.get(topic)
         target = (device.device_id, device.peripheral_id)
-        generation = self._command_generation.setdefault(peripheral_id, 0)
+        generation = (
+            self._command_generation.setdefault(peripheral_id, 0)
+            if device.device_id != _MESH_DEVICE_ID
+            else 0
+        )
 
         def decode(new_payload: str) -> list[VarSet]:
-            current = self._devices.get(peripheral_id)
+            current = self._current_device(peripheral_id)
             if (
                 self._command_generation.get(peripheral_id) != generation
                 or self._by_cmd_topic.get(topic) != route
@@ -1365,6 +1708,24 @@ class Bridge:
             value = translate_aux(new_payload, d.value_kind, d.invert, d.min_value, d.max_value)
             return [VarSet(d.command_var, value)] if value is not None and d.command_var else []
 
+        if device.device_id == _MESH_DEVICE_ID:
+            owner = self._resolve_mesh_owner(topic)
+            if owner is None or self._mesh_commands is None:
+                return
+
+            def decode_mesh_aux(new_payload: str) -> list[VarSet]:
+                if self._resolve_mesh_owner(topic) is not owner:
+                    return []
+                value = translate_aux(new_payload, d.value_kind, d.invert, d.min_value, d.max_value)
+                return [VarSet(d.command_var, value)] if value is not None and d.command_var else []
+
+            await self._mesh_commands.execute(
+                owner,
+                sets,
+                primary=False,
+                decode=decode_mesh_aux if d.component == "number" else None,
+            )
+            return
         result = await self._write_command(
             device, peripheral_id, sets, decode if d.component == "number" else None
         )
@@ -1455,262 +1816,14 @@ class Bridge:
                 ticket=fresh_ticket,
             )
 
-    async def _write_mesh_primary(
-        self,
-        device: BrilliantDevice,
-        peripheral_id: str,
-        sets: list[VarSet],
-        *,
-        decode: Callable[[str], list[VarSet]] | None = None,
-    ) -> None:
-        """Mesh primary write with observation-confirmed publication (#46/#47).
-
-        A mesh ``set_variables`` can be RPC-accepted yet never actuate: the BLE
-        layer drops it silently and the notification-fed mirror carries the
-        accepted value until the backend reconciles (75.2s observed maximum) —
-        so a matching observation proves nothing, while a CONTRADICTING one
-        proves failure. Until :meth:`_resolve_pending_mesh` settles the write,
-        every publish for the peripheral holds ``state: null`` (HA `unknown`);
-        aux keys keep their live values throughout (a null aux key would render
-        as a false OFF through the aux value templates — exactly the defect
-        this exists to eliminate).
-        """
-        # Generation bump AND old-pending revocation FIRST, before any await:
-        # a newer command supersedes an older one the moment it starts, even
-        # while this write is in flight — the old pending must not keep
-        # confirming, contradicting, or expiring against a target that is no
-        # longer wanted.
-        generation = self._mesh_write_generation.get(peripheral_id, 0) + 1
-        self._mesh_write_generation[peripheral_id] = generation
-        self._drop_pending_mesh(peripheral_id)
-        self._set_mesh_feedback(
-            peripheral_id,
-            _PendingMeshWrite(targets={}, receipt="", generation=generation, status="superseded")
-            if peripheral_id in self._mesh_feedback
-            else None,
-        )
-        try:
-            result = await self._write_command(device, peripheral_id, sets, decode)
-            if isinstance(result, Superseded):
-                return
-            receipt = result
-        except (asyncio.TimeoutError, TimeoutError):
-            # Both classes: they are distinct on the panel's Python 3.10, and
-            # the bus adapter raises the asyncio one while the panel lib's own
-            # "No response received!" is the builtin.
-            if self._mesh_write_generation.get(peripheral_id) != generation:
-                raise
-            # Unresolved, not failed: the RPC may still actuate (it keeps
-            # running detached in the adapter), so the outcome is unknown —
-            # exactly what the pending hold expresses. Republishing the last
-            # snapshot here would assert a state nobody can attest.
-            logger.warning(
-                "mesh write for %s/%s unresolved at the caller deadline; holding state "
-                "unknown until an observation settles it",
-                device.device_id,
-                peripheral_id,
-            )
-            receipt = _PENDING_RPC_RECEIPT
-        except Exception:
-            if self._mesh_write_generation.get(peripheral_id) != generation:
-                # Superseded mid-flight — the newer command owns the pending
-                # state now; surface the failure through the command lane only.
-                raise
-            # Mode A (bounded write failure): nothing was fabricated, so the
-            # last observed snapshot is still the best truth — force it back
-            # out past every cache.
-            logger.warning(
-                "mesh write failed for %s/%s; republishing last observed state",
-                device.device_id,
-                peripheral_id,
-                exc_info=True,
-            )
-            self._set_mesh_feedback(
-                peripheral_id,
-                _PendingMeshWrite(targets={}, receipt="", generation=generation, status="failed"),
-            )
-            await self._republish_snapshot(peripheral_id, force=True)
-            return
-
-        if self._mesh_write_generation.get(peripheral_id) != generation:
-            # Superseded while this write awaited; the newer command's pending
-            # (and confirm timer) owns the peripheral now.
-            return
-        deadline = self._wall_clock() + MESH_CONFIRM_SECONDS
-        pending = _PendingMeshWrite(
-            targets={s.name: s.value for s in sets},
-            receipt=receipt,
-            generation=generation,
-            deadline=deadline if math.isfinite(deadline) else None,
-        )
-        self._pending_mesh[peripheral_id] = pending
-        self._set_mesh_feedback(peripheral_id, pending)
-        self._mesh_confirm_tasks[peripheral_id] = asyncio.create_task(
-            self._resolve_pending_mesh(peripheral_id, pending),
-            name=f"brilliant-mqtt-mesh-confirm-{peripheral_id}",
-        )
-        await self._republish_snapshot(peripheral_id, force=False)
-
-    async def _resolve_pending_mesh(self, peripheral_id: str, pending: _PendingMeshWrite) -> None:
-        """Deadline arm of the pending-write state machine (background task).
-
-        Runs OUTSIDE the MQTT command lane so confirmation never blocks the
-        next command. Sleeps out the confirmation window, then — if *pending*
-        still owns the peripheral — publishes the commanded value only when a
-        fresh observation backs it; otherwise closes unconfirmed and leaves
-        state unknown (the stale-stream watchdog owns stream recovery).
-
-        Ownership gate at publish time: the identity check below and the start
-        of the confirm publish sit in one event-loop slice (no await between
-        them), and any later ownership change (supersession, withdraw) reaches
-        this task through the _mesh_confirm_tasks registry as cancellation —
-        including while the final publish is still in flight.
-        """
-        await self._sleep(MESH_CONFIRM_SECONDS)
-        if self._pending_mesh.get(peripheral_id) is not pending or not self._owns_mesh_feedback(
-            peripheral_id, pending.generation, pending
-        ):
-            return
-        del self._pending_mesh[peripheral_id]
-        if (
-            pending.last_observed_at is None
-            or (self._clock() - pending.last_observed_at) > MESH_CONFIRM_MAX_OBSERVATION_AGE_S
-        ):
-            logger.warning(
-                "mesh write for %s unconfirmed after %.0fs (no fresh observation); "
-                "state stays unknown (receipt: %s)",
-                peripheral_id,
-                MESH_CONFIRM_SECONDS,
-                pending.receipt,
-            )
-            self._set_mesh_feedback(
-                peripheral_id,
-                replace(pending, targets={}, status="unconfirmed", deadline=None),
-            )
-            try:
-                await self._republish_snapshot(peripheral_id, force=False)
-            except Exception:
-                logger.warning("mesh expiry publish failed for %s", peripheral_id, exc_info=True)
-        else:
-            self._set_mesh_feedback(peripheral_id, None)
-            self._mesh_confirm_count += 1
-            if self._mesh_confirm_count % _MESH_RECEIPT_LOG_SAMPLE_EVERY == 1:
-                logger.info(
-                    "mesh write confirmed by observation for %s: %s (receipt: %s)",
-                    peripheral_id,
-                    pending.targets,
-                    pending.receipt,
-                )
-            try:
-                await self._echo_state(
-                    peripheral_id,
-                    [VarSet(name, value) for name, value in pending.targets.items()],
-                )
-            except Exception:
-                # The diff caches only commit after a successful publish, so
-                # the next observation republishes and repairs the retained
-                # topic (no auto-retry by design). CancelledError passes
-                # through untouched.
-                logger.warning(
-                    "mesh confirm publish failed for %s; retained state repairs "
-                    "on the next observation",
-                    peripheral_id,
-                    exc_info=True,
-                )
-        # Registry hygiene: a completed resolver removes its own handle — but
-        # ONLY under an identity guard, so this cleanup can never strip a
-        # successor's cancellation handle. (A cancelled resolver never gets
-        # here; its canceller already popped the entry.)
-        if self._mesh_confirm_tasks.get(peripheral_id) is asyncio.current_task():
-            del self._mesh_confirm_tasks[peripheral_id]
-
-    def _observe_mesh_pending(self, device: BrilliantDevice) -> None:
-        """Feed one bus observation into the pending-write state machine.
-
-        A value CONTRADICTING the commanded target proves the write did not
-        take (the mirror only ever lies TOWARD the accepted value) — cancel
-        immediately; the caller's publish that follows surfaces the observed
-        truth. A MATCHING value is deliberately NOT confirmation (the mirror
-        can carry the accepted-but-undelivered value for ~75s); it only
-        refreshes the observation clock the confirm deadline checks.
-        """
-        pending = self._pending_mesh.get(device.peripheral_id)
-        if pending is None:
-            feedback = self._mesh_feedback.get(device.peripheral_id)
-            if feedback is not None and feedback.status != "superseded":
-                self._set_mesh_feedback(device.peripheral_id, None)
-            return
-        if not self._owns_mesh_feedback(device.peripheral_id, pending.generation, pending):
-            return
-        fully_matched = True
-        for name, want in pending.targets.items():
-            var = device.variables.get(name)
-            if var is None:
-                fully_matched = False
-            elif var.value != want:
-                self._drop_pending_mesh(device.peripheral_id)
-                self._set_mesh_feedback(
-                    device.peripheral_id,
-                    replace(pending, targets={}, status="contradicted", deadline=None),
-                )
-                logger.warning(
-                    "mesh write contradicted by observation for %s (%s=%s, wanted %s); "
-                    "publishing observed state (receipt: %s)",
-                    device.peripheral_id,
-                    name,
-                    var.value,
-                    want,
-                    pending.receipt,
-                )
-                return
-        if fully_matched:
-            pending.last_observed_at = self._clock()
-
-    def _drop_pending_mesh(self, peripheral_id: str) -> None:
-        """Revoke any pending confirmation for *peripheral_id* and its timer.
-
-        The timer is cancelled through the registry, not the record, so a
-        resolver that already removed its pending entry to publish the
-        confirmation is still reached — even mid-publish.
-        """
-        self._pending_mesh.pop(peripheral_id, None)
-        task = self._mesh_confirm_tasks.pop(peripheral_id, None)
-        if task is not None:
-            task.cancel()
-
     async def _republish_snapshot(self, peripheral_id: str, *, force: bool) -> None:
         """Publish the stored snapshot's current payload (no-op without one)."""
-        device = self._devices.get(peripheral_id)
+        device = self._current_device(peripheral_id)
         if device is None:
             return
         fields = self._payload_fields(device)
         if fields:
             await self._publish_state(device, fields, force=force)
-
-    def _project_pending_mesh(
-        self, peripheral_id: str, fields: dict[str, object]
-    ) -> dict[str, object]:
-        """Overlay ``state: null`` while a mesh write awaits confirmation.
-
-        ONLY the primary state key is withheld — null renders `unknown`
-        through the primary light/switch template. Every aux key keeps its
-        real observed value: the aux value templates collapse null into a
-        false OFF (issue #47), which would invert safety-meaning entities.
-        """
-        if "mesh_write_status" not in fields:
-            return fields
-        feedback = self._mesh_feedback.get(peripheral_id)
-        if feedback is None:
-            return fields
-        projected = {
-            **fields,
-            "mesh_write_status": feedback.status,
-            "mesh_requested": feedback.targets,
-            "mesh_write_deadline": feedback.deadline,
-        }
-        if feedback.status in ("pending", "unconfirmed"):
-            projected["state"] = None
-        return projected
 
     async def _echo_state(self, peripheral_id: str, sets: list[VarSet]) -> None:
         """Optimistically fold written VarSets into the snapshot and republish state.
@@ -1721,9 +1834,13 @@ class Bridge:
         commanded values immediately keeps HA in sync; real bus notifications and
         the resync still own externally-caused changes.
         """
-        device = self._devices.get(peripheral_id)
+        device = self._current_device(peripheral_id)
         if device is None:
             # Write already happened; nothing to echo without a snapshot.
+            return
+
+        if device.device_id == _MESH_DEVICE_ID:
+            await self._flush_mesh(peripheral_id)
             return
 
         # Build a NEW variables dict — never mutate one a pending callback may share.

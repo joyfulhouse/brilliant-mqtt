@@ -1,8 +1,10 @@
 # PR #232 Regression Port
 
-This is the test-only Phase B baseline on production main
-`376f745ae1273bd4b1312a01eeba41066470285b`. No production file or mirrored
-payload is changed. Historical committed sources are test files at
+This records the historical test-only Phase B baseline on production main
+`376f745ae1273bd4b1312a01eeba41066470285b`. At that stage no production file or
+mirrored payload was changed. The baseline outcomes, mapping and Task 4B notes
+below remain historical evidence; final implementation results are appended
+separately. Historical committed sources are test files at
 `74f97a4aa7769276192c1f6f9096947b0f6fc33c`, relative to
 `0b329e48a2592ac519ec4f21130fd7ad3aab8461`. External sources are the four
 read-only S4 files named in the mapping. Every one of the authoritative
@@ -391,3 +393,67 @@ repaired only by existing reconcile; dynamic standby/shared panel scoping; twelv
 distinct peripheral IDs with bounded live maps; unsupported infrastructure; and
 exact inherited completion listeners across registered loop/foreign reconnect
 hooks and withdrawal/reacquisition.
+
+## Final Integration Validation
+
+The completed implementation reruns the **exact historical 148-case selection:
+148 PASS**, with zero skips/xfails, errors or failures. The collected
+`(classname, name)` set is identical to the authoritative Phase B XML's 148
+nodes. All 75 original mapping rows and the historical baseline outcomes above
+are preserved; the baseline logs/XML were not overwritten. Task 4B's explicit
+fixture/diagnostic adaptations remain documented above. Final slider operations
+retain the exact preparation ticket, per-slider mutex, backup/write/readback/
+commit ordering and capacity/fatal/generation revocation assertions.
+
+Final root static checks pass, and the affected focused selection passes
+**1,871 cases across 62 files**. This includes every new runtime test and the
+affected bus, admission, Bridge, MQTT, model, motion, commands, desired-state,
+wired feedback, camera/privacy, coordinator and virtual-slider consumers. These
+counts overlap the historical selection and the schedule/resource proofs;
+they must not be added together. Full agent and HA suites remain CI gates.
+
+Representative executed schedule anchors (parameter variants run together):
+
+| Schedule | Committed test evidence |
+| --- | --- |
+| Disjoint/overlapping native read and push | `tests/test_mesh_bus_ingress.py::test_actual_read_push_overlap_merges_owner_fields_independently` |
+| Actual registered reconnect hooks, ready expiry and waiting issue | `tests/test_mesh_bus_reconnect.py::test_actual_hook_fences_an_already_ready_real_owner_expiry`; `tests/test_mesh_bus_issue.py::test_actual_foreign_hook_fences_write_already_waiting_for_device_lock` |
+| Acquisition, retirement, motion and negative-read fences | `tests/test_mesh_final_schedules.py::test_native_read_from_old_acquisition_cannot_seed_reacquired_owner_or_routes`; `test_pre_expiry_native_read_and_aux_only_reconnect_cannot_release_unknown`; `test_stale_high_motion_native_read_between_low_pushes_cannot_refresh_history`; `test_native_negative_read_shapes_respect_per_field_evidence_and_topology` |
+| Identical mirror with target/power/deletion/unreliable masks | `tests/test_mesh_final_schedules.py::test_identical_native_mirror_refreshes_only_explicit_reliable_target_evidence` |
+| Production MQTT fold and original queued owner | `tests/test_mesh_bridge_integration.py::test_production_lane_fold_owns_merged_targets_before_rehandler`; `test_original_queued_owner_cannot_write_after_same_topic_replacement` |
+| Blocked old-window pending/terminal, late acceptance and successful idle expiry | `tests/test_mesh_final_schedules.py::test_late_native_acceptance_revokes_blocked_old_window_before_handoff`; `test_successful_native_idle_expiry_revokes_blocked_pending_before_handoff`; `test_blocked_terminal_native_contradiction_precedes_ordinary_idle_debt` |
+| Abandonment, successor completion and absent-owner creation floor | `tests/test_mesh_bridge_integration.py::test_issued_worker_abandonment_remains_unknown_through_real_return`; `tests/test_mesh_final_schedules.py::test_abandoned_native_work_keeps_successor_unknown_until_post_return_capture`; `test_native_return_without_owner_fences_already_started_reappearance_read` |
+| Astra R5 scale/read across native return | `tests/test_mesh_registry.py::test_pre_return_binding_repair_seeds_no_state_and_older_reads_cannot_rebind_or_remove` |
+| Routing, availability, capacity and full ownership-map churn | `tests/test_mesh_capacity_routing.py`; `tests/test_mesh_availability.py`; `tests/test_mesh_discovery_metadata.py`; `tests/test_mesh_session_recovery.py`; `tests/test_mesh_bridge_integration.py::test_repeated_mesh_create_write_remove_reacquire_bounds_all_live_maps` |
+| Resident slider preparation/issue and deferred recovery | `tests/test_mesh_slider_admission.py`; `tests/test_mesh_slider_operations.py` |
+| Standby/shared-panel native read budget and blocked-broker work | `tests/test_mesh_bridge_integration.py::test_dynamic_standby_and_shared_panel_bridge_keep_one_mesh_guard`; `tests/test_mesh_resource_bounds.py::test_forty_load_storm_has_bounded_work_and_no_extra_reads` |
+
+The connected resource proof uses the actual production adapter, native observer
+and Bridge with **40 loads, 30 raw variables each and 101 frames**. It records
+4,040 captures and 4,040 scoped fields, zero bus normalizations/`Variable`
+allocations, **80 renders while the state broker children are blocked**, 40
+initial blocked state attempts and 80 total attempts. Tasks/owners/lanes remain
+bounded, mesh never allocates wired field eras, and native reads remain exactly
+the initial `own-device` and `ble_mesh` reads. All final state is ON/idle. The
+explicit post-unblock flush produces **267 total renders**; the blocked-work
+bound is not a total-render claim or a live CPU measurement.
+
+TDD chronology is preserved: Phase B ran before implementation and recorded
+100 PASS, 31 BEHAVIOR RED, 5 CLEANUP RED and 12 API GAP. Runtime tasks then added
+their focused regressions and corrections. The resource proof and
+`tests/test_mesh_final_schedules.py` are **postimplementation supporting proof**;
+no preimplementation RED result is claimed for those additions. No test-only
+owner policy substitutes for production settlement.
+
+Detailed final schedule-to-node/result audit and touched-surface coverage live
+in the persistent S9 artifacts `task6-final-schedule-audit.md`,
+`task6-final-schedule-audit.json` and `task6-affected-files.txt`. Execution logs
+and XML are `task6-final-affected.*`, `task6-final-historical148.*`,
+`task6-final-schedules.*` and `task6-final-resource.*`; original Phase B evidence
+has a separately recorded SHA-256 inventory. These are internal local gates,
+not final prescribed PR reviews, CI or deployment. Agent 0.12.0, integration
+0.13.0 and release ordinal 7 remain unchanged. HA static and focused payload
+consumer gates do not establish HA-core template rendering: the stock-Jinja
+limitation in [mesh-write-feedback.md](../reference/mesh-write-feedback.md)
+still applies. Live CPU delta (agent <=2 percentage points, bus <=0.5) and
+physical responsiveness remain outstanding under #225.
