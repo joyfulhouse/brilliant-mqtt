@@ -2221,9 +2221,14 @@ class PanelProvisioner:
         again: only the transaction-owned candidate is pruned before the journal is
         cleared, exactly as the interrupted rollback would have done.
         """
+        await self._async_assert_named_live(record.panel_request)
+        retained = await self._journal.async_retained(record.transaction_id)
+        if retained is None or await self._journal.async_load() != record:
+            raise PanelProvisioningError("provisioning_recovery_required")
         staged, _snapshot = await self._async_recovery_artifacts(record, False)
         shell = await self._async_recovery_shell(record, host, password, False)
         primary: PanelProvisioningError | None = None
+        cancellation: asyncio.CancelledError | None = None
         try:
             if shell.pinned_host_key() != record.panel_request.public_key:
                 raise PanelProvisioningError("panel_identity_mismatch")
@@ -2233,21 +2238,39 @@ class PanelProvisioner:
                 raise
             except Exception as error:
                 raise PanelProvisioningError(recovery_connect_failure_code(error)) from None
+            await self._async_assert_named_live(record.panel_request)
+            if (
+                await self._journal.async_load() != record
+                or await self._journal.async_retained(record.transaction_id) != retained
+            ):
+                raise PanelProvisioningError("provisioning_recovery_required")
             await self._operations.cleanup_staged(shell, staged)
+            await self._async_assert_named_live(record.panel_request)
+            if (
+                await self._journal.async_load() != record
+                or await self._journal.async_retained(record.transaction_id) != retained
+            ):
+                raise PanelProvisioningError("provisioning_recovery_required")
             if record.prior_snapshot.layout is StoredPanelLayout.ABSENT:
                 await self._journal.async_complete_absent_rollback(record.transaction_id)
             else:
                 await self._journal.async_complete_rollback(record.transaction_id, verified=True)
             await self._repair_reporter.async_clear_rollback_failure(record.transaction_id)
+        except asyncio.CancelledError as error:
+            cancellation = error
         except PanelProvisioningError as error:
             primary = error
         except Exception:
             primary = PanelProvisioningError("cleanup_failed")
         closed = await _settle_close(shell.close)
-        if closed.cancellation is not None:
-            raise closed.cancellation from None
+        if cancellation is not None:
+            raise cancellation from None
         if primary is not None:
             raise primary from None
+        if closed.cancellation is not None:
+            raise closed.cancellation from None
+        if closed.error is not None:
+            raise PanelProvisioningError("cleanup_failed")
 
     async def _async_record_recovery_failure(self, record: ProvisioningRecord, code: str) -> None:
         """Best-effort durable typed error; never changes phase, baseline or journal."""
@@ -2497,17 +2520,45 @@ class PanelProvisioner:
         if not isinstance(self._journal, ProvisioningJournal):
             raise PanelProvisioningError("provisioning_recovery_required")
         journal = self._journal
+        current = await journal.async_load()
+        if current is not None and self._same_panel(current, retained.record):
+            raise PanelProvisioningError("provisioning_recovery_required")
+        if await journal.async_retained(retained.record.transaction_id) != retained:
+            raise PanelProvisioningError("provisioning_recovery_required")
         scoped = journal.scoped(retained.record.transaction_id)
         record = await scoped.async_load()
-        if record is None or record != retained.recovery_record:
+        if (
+            record is None
+            or record != retained.recovery_record
+            or (self._named_owner_resolver is not None and record.panel_request.bound_owner is None)
+        ):
             raise PanelProvisioningError("provisioning_recovery_required")
-        await self._async_admit_connection(record.panel_request)
+        if retained.state == "restored" and (
+            record.phase not in {ProvisioningPhase.ROLLBACK_PENDING, ProvisioningPhase.ROLLED_BACK}
+            or (
+                record.prior_snapshot.layout is StoredPanelLayout.ABSENT
+                and record.phase is not ProvisioningPhase.ROLLBACK_PENDING
+            )
+            or (
+                record.prior_snapshot.layout is not StoredPanelLayout.ABSENT
+                and retained.recovery_deployment_id is None
+            )
+        ):
+            raise PanelProvisioningError("provisioning_recovery_required")
+        await self._async_assert_named_live(record.panel_request)
         password = await self._resolve_credential(record.panel_request)
+        if await journal.async_retained(retained.record.transaction_id) != retained:
+            raise PanelProvisioningError("provisioning_recovery_required")
         self._journal = scoped
         try:
-            await self._async_recover_record(
-                record, _noop_progress, host=record.panel_request.host, password=password
-            )
+            if retained.state == "restored":
+                await self._async_finish_verified_restore(
+                    record, record.panel_request.host, password
+                )
+            else:
+                await self._async_recover_record(
+                    record, _noop_progress, host=record.panel_request.host, password=password
+                )
         finally:
             self._journal = journal
 
@@ -2617,7 +2668,7 @@ class PanelProvisioner:
             current is not None and self._same_panel(current, retained.record)
         ):
             raise PanelProvisioningError("provisioning_recovery_required")
-        if retained.finalization_origin == "ownerless_restored":
+        if retained.finalization_origin is not None:
             raise PanelProvisioningError("ownerless_finalize_reauthentication_required")
         retained = await self._async_bind_named(retained, expected_owner)
         await self._journal.async_retained_state(transaction_id, "finalizing")

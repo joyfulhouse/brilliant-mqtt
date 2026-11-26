@@ -5002,6 +5002,7 @@ async def test_successful_fleet_topology_change_reloads_control_plane(
     with (
         patch.object(PanelManager, "async_setup", _noop_setup),
         patch.object(PanelManager, "async_shutdown", _noop_shutdown),
+        patch.object(hass.config_entries, "async_schedule_reload") as schedule_reload,
     ):
         await fleet.async_setup()
         assert fleet._update_unsub is not None
@@ -5019,6 +5020,7 @@ async def test_successful_fleet_topology_change_reloads_control_plane(
             await fleet.async_panel_added("panel-kitchen")
 
         control_plane.async_reload_settings.assert_awaited_once_with()
+        schedule_reload.assert_called_once_with(entry.entry_id)
         await fleet.async_shutdown()
 
 

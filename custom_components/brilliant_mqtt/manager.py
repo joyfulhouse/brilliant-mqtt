@@ -1831,7 +1831,7 @@ class PanelManager:
             if (
                 request.slug != self.panel
                 or request.host != self.store.data[CONF_HOST]
-                or request.public_key != self.store.data.get(DATA_SSH_HOST_KEY)
+                or request.public_key != owner.owner.public_key
             ):
                 raise PanelOpError("baseline_owner_mismatch")
             if request.bound_owner is not None and request.bound_owner != owner.owner:
@@ -1845,6 +1845,11 @@ class PanelManager:
                 raise ValueError("invalid_canary_operation")
         except Exception as error:
             code = getattr(error, "code", "canary_operation_failed")
+            if isinstance(error, PanelOpError) and str(error) in {
+                "address_change_incomplete",
+                "baseline_owner_mismatch",
+            }:
+                code = str(error)
             if not isinstance(code, str) or re.fullmatch(r"[a-z_]{1,64}", code) is None:
                 code = "canary_operation_failed"
             raise HomeAssistantError(f"{code}: see docs/canary-rollback.md") from None
