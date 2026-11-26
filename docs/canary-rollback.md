@@ -107,6 +107,10 @@ while obtaining redacted diagnostics and the HA repair/log code.
 | `baseline_retained_finalize_first` | A rollback baseline remains for this panel. Keep it through the agreed soak. After sign-off, explicitly run Finalize retained canary with its transaction name before another update, or roll back; rejection leaves the baseline intact. Repair, post-OTA refresh and component enablement report the same code instead of installing or replacing bridge or watchdog code while the baseline is retained. |
 | `release_update_required` | Repair, post-OTA refresh and component enablement keep installed code and only install code that is missing. Change it with the canaried Update entity or `brilliant_mqtt.redeploy`. |
 | `rollback_credentials_unavailable` | Restore the exact HA panel owner/configuration and its pinned host identity; then retry. Do not enable automatic host-key trust. |
+| `canary_owner_changed` | The original panel owner, address, pin, slug or login changed, or more than one owner matches. Preserve the baseline and verify the panel configuration before another explicit action. |
+| `canary_record_changed` | The exact retained record or active operation changed. Preserve the journal and baseline; let another active operation finish before retrying. |
+| `canary_action_unavailable` | This manual address path cannot settle the retained state or provenance. Preserve interrupted or inconsistent work for maintainer investigation. |
+| `canary_manual_action_required` | A manual rollback at a changed address was interrupted. Automatic replay and a new rollback are refused, including if the address changes back. Preserve the journal and baseline for maintainer assistance; this path adds no resume mechanism. |
 | `rollback_health_failed` | Bytes may already be restored. Check HA's broker connection and panel connectivity. Retained MQTT history cannot satisfy this check. Retry after resolving connectivity. |
 | `rollback_deadline_exceeded` | Treat recovery as unverified. The pending journal remains; remote restore processes are terminated and settled before reuse. Resolve connectivity/storage delays before retrying. |
 | `rollback_failed` / `rollback_failed` state | Preserve artifacts and the actionable repair code for the maintainer. A missing or changed pinned release is not silently replaced with bundled code. |
@@ -156,6 +160,8 @@ Changed-address finalization leaves the passive retained record in place until
 cleanup succeeds, so an interruption requires another explicit action. Rollback
 uses the existing execution journal and preserves `canary_manual_action_required`
 until it completes; a restart does not reuse the temporary address.
+An interrupted manual rollback is preserved for investigation and cannot be
+resumed through this path.
 
 If the panel owner, slug, pin, or exact retained record changes during the action,
 or ownership is ambiguous, the action refuses with a typed code and leaves the

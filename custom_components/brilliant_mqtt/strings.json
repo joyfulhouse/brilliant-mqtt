@@ -855,12 +855,11 @@
     },
     "canary_new_address": {
       "title": "Finalize or roll back {panel} at its new address",
-      "description": "The retained baseline still names the previous address. Choose one action to use the current panel address after fresh identity and login checks. The retained address is kept. Interrupted or ambiguous work requires manual recovery; healthy panels continue running.",
       "fix_flow": {
         "step": {
           "init": {
             "title": "Choose a retained baseline action",
-            "description": "Finalize removes the rollback guarantee. Rollback restores and verifies the baseline, which remains available for later finalization. Each choice uses the current configured address for this action only. Result code: {code}",
+            "description": "The retained baseline still names the previous address. Each action verifies the pinned identity and current login first; the retained address is kept. Interrupted or ambiguous work requires manual recovery; healthy panels continue running. Finalize removes the rollback guarantee. Rollback restores and verifies the baseline, which remains available for later finalization. Each choice uses the current configured address for this action only. Result code: {code}",
             "data": {
               "action": "Action"
             }

@@ -1967,7 +1967,12 @@ class PanelProvisioner:
         record = await self._journal.async_load()
         if record is not None:
             if record.transaction_id in deferred:
-                return
+                raise PanelProvisioningError(
+                    "rollback_credentials_unavailable"
+                    if record.operation
+                    in {ProvisioningOperation.ROLLBACK, ProvisioningOperation.ONBOARDING_ROLLBACK}
+                    else "provisioning_recovery_required"
+                )
             await self._async_recover_record(record, progress)
         elif ownerless_pending:
             raise PanelProvisioningError("ownerless_finalize_reauthentication_required")
