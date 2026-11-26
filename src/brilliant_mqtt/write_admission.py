@@ -8,8 +8,12 @@ from collections.abc import Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import TYPE_CHECKING
 
 from brilliant_mqtt.model import CaptureProvenance
+
+if TYPE_CHECKING:
+    from brilliant_mqtt.mesh_settlement import MeshSettlement
 
 
 class WriteClass(Enum):
@@ -45,6 +49,8 @@ class WriteCancelled(asyncio.CancelledError):
 class AdmissionTicket:
     """Opaque identity: routing, payload and session ownership stay in the adapter."""
 
+    mesh_owner: MeshSettlement | None = field(default=None, repr=False)
+
     _owner: object | None = field(default=None, init=False, repr=False)
     _cancel_waiting: Callable[[], None] | None = field(default=None, init=False, repr=False)
     _issued_at: CaptureProvenance | None = field(default=None, init=False, repr=False)
@@ -56,6 +62,12 @@ class AdmissionTicket:
     _on_settled: Callable[[str | BaseException], None] | None = field(
         default=None, init=False, repr=False
     )
+    _on_refused: Callable[[], None] | None = field(default=None, init=False, repr=False)
+
+    @property
+    def issued_at(self) -> CaptureProvenance | None:
+        """Actual native authorization, distinct from an issue preparation callback."""
+        return self._issued_at
 
     @property
     def settled(self) -> bool:

@@ -612,6 +612,8 @@ class RpcBusAdapter:
         self._mesh_sinks: list[MeshSink] = []
         self._mesh_failed = False
         self._mesh_fatal = False
+        self._mesh_write_guard: Callable[[AdmissionTicket, str], bool] | None = None
+        self._mesh_creation_floor = 0
         self._privacy_revocation: CaptureProvenance | None = None
         self._field_eras: dict[tuple[str, str, str], int] = {}
         # Multiple consumers (panel bridge + mesh publisher) may each register
@@ -760,6 +762,130 @@ class RpcBusAdapter:
         failed = self._mesh_fatal
         self._mesh_fatal = False
         return failed
+
+    @property
+    def mesh_creation_floor(self) -> int:
+        """Floor for absent/new binding creation only, never existing field merges."""
+        return self._mesh_creation_floor
+
+    def advance_mesh_creation_floor(self, boundary: CaptureProvenance) -> None:
+        if boundary.incarnation == self._capture_source:
+            self._mesh_creation_floor = max(self._mesh_creation_floor, boundary.sequence)
+
+    def outstanding_mesh_ticket(self, peripheral_id: str) -> AdmissionTicket | None:
+        admission = self._write_serving.get("ble_mesh")
+        if (
+            admission is not None
+            and admission.peripheral_id == peripheral_id
+            and admission.issued
+            and not admission.ticket.settled
+        ):
+            return admission.ticket
+        return None
+
+    def register_mesh_write_guard(
+        self, guard: Callable[[AdmissionTicket, str], bool]
+    ) -> Callable[[], None]:
+        """Current binding/enabled/slider eligibility, evaluated outside the lock."""
+        if self._mesh_write_guard is not None:
+            raise ValueError("mesh write guard already installed")
+        self._mesh_write_guard = guard
+
+        def remove() -> None:
+            if self._mesh_write_guard is guard:
+                self._mesh_write_guard = None
+
+        return remove
+
+    def bind_mesh_ticket(
+        self,
+        ticket: AdmissionTicket,
+        owner: MeshSettlement,
+        *,
+        on_issue: Callable[[CaptureProvenance], None],
+        on_settle: Callable[[str | BaseException], None],
+        on_refused: Callable[[], None],
+    ) -> None:
+        """Install owner callbacks with fail-closed native-return dispatch."""
+        if ticket.mesh_owner is not None and ticket.mesh_owner is not owner:
+            raise TicketAdoptionError("mesh ticket belongs to another owner")
+        ticket.mesh_owner = owner
+        ticket.set_issue_callback(on_issue)
+        ticket._on_refused = on_refused
+
+        def settle(outcome: str | BaseException) -> None:
+            try:
+                on_settle(outcome)
+            except Exception as error:
+                self._fail_mesh(error)
+
+        ticket.set_settle_callback(settle)
+
+    def _refuse_mesh_issue(self, admission: _WriteAdmission) -> None:
+        admission.tombstoned = True
+        self._refuse_mesh_ticket(admission.ticket)
+
+    def _refuse_mesh_ticket(self, ticket: AdmissionTicket) -> None:
+        callback, ticket._on_refused = ticket._on_refused, None
+        if callback is not None:
+            try:
+                callback()
+            except Exception as error:
+                self._fail_mesh(error)
+        ticket.mark_settled(WriteCancelled())
+
+    def _prepare_mesh_issue(self, admission: _WriteAdmission, boundary: CaptureProvenance) -> bool:
+        ticket = admission.ticket
+        owner = ticket.mesh_owner
+        try:
+            if not self.mesh_admission_open or (
+                owner is not None
+                and (
+                    not self.mesh_owner_live(owner)
+                    or owner.metadata.device_id != admission.device_id
+                    or owner.metadata.peripheral_id != admission.peripheral_id
+                )
+            ):
+                return False
+            if ticket._on_issued is not None:
+                ticket._on_issued(boundary)
+            return self._mesh_write_guard is None or self._mesh_write_guard(
+                ticket, admission.peripheral_id
+            )
+        except Exception as error:
+            self._fail_mesh(error)
+            return False
+
+    def _commit_mesh_issue(self, admission: _WriteAdmission, boundary: CaptureProvenance) -> bool:
+        """Only simple state and immutable owner identity inside the hook lock."""
+        owner = admission.ticket.mesh_owner
+        with self._generation_lock:
+            if (
+                self._shutting_down
+                or self._mesh_failed
+                or admission.session != self._session
+                or admission.tombstoned
+                or admission.acquired.cancelled()
+                or boundary.source_generation != self._capture_generation
+                or (
+                    owner is not None
+                    and (
+                        not owner.active
+                        or owner.source != self._capture_source
+                        or owner.generation != self._capture_generation
+                    )
+                )
+            ):
+                return False
+            admission.issued = True
+            admission.ticket._issued_at = boundary
+            return True
+
+    def _native_return(self, admission: _WriteAdmission, outcome: str | BaseException) -> None:
+        boundary = self._next_capture_provenance("native")
+        if admission.device_id == "ble_mesh":
+            self.advance_mesh_creation_floor(boundary)
+        admission.ticket.mark_settled(outcome, boundary)
 
     def _fail_mesh(self, error: Exception) -> None:
         self._mesh_failed = True
@@ -1376,6 +1502,8 @@ class RpcBusAdapter:
             if self._shutting_down or session != self._session:
                 return
             generation = max(generation, self._capture_generation)
+        self._note_push()
+        self._note_reconnect()
         if generation <= self._applied_capture_generation:
             return
         self._applied_capture_generation = generation
@@ -1383,8 +1511,6 @@ class RpcBusAdapter:
         self._privacy_revocation = None
         self._field_eras.clear()
         self._mesh_control(MeshGeneration(self._next_capture_provenance("lifecycle")))
-        self._note_push()
-        self._note_reconnect()
         self._spawn(self._after_reconnect(session))
 
     async def _after_reconnect(self, session: int | None = None) -> None:
@@ -1622,6 +1748,10 @@ class RpcBusAdapter:
         ticket._cancel_waiting = None
         if admission is not None and not admission.issued and admission.task is not None:
             admission.tombstoned = True
+            if admission.device_id == "ble_mesh":
+                self._refuse_mesh_issue(admission)
+            else:
+                admission.ticket.mark_settled(WriteCancelled())
             admission.task.cancel()
 
     async def set_variables(
@@ -1642,6 +1772,10 @@ class RpcBusAdapter:
         obs, _ = self._require_started()
         if self._shutting_down:
             raise RuntimeError("bus adapter shutting down; write rejected")
+        if device_id == "ble_mesh" and not self.mesh_admission_open:
+            if ticket is not None:
+                self._refuse_mesh_ticket(ticket)
+            raise WriteCancelled()
         ticket = AdmissionTicket() if ticket is None else ticket
         admission = self._write_admissions.get(ticket)
         values = {s.name: s.value for s in sets}
@@ -1716,8 +1850,11 @@ class RpcBusAdapter:
                 ticket._cancel_waiting = None
 
     def _finish_admission(self, admission: _WriteAdmission, task: asyncio.Task[str]) -> None:
-        if not admission.issued:
-            admission.ticket.mark_settled(WriteCancelled())
+        if not admission.issued and not admission.ticket.settled:
+            if admission.device_id == "ble_mesh":
+                self._refuse_mesh_issue(admission)
+            else:
+                admission.ticket.mark_settled(WriteCancelled())
         self._settle_write(task, admission=admission)
         if not admission.acquired.done():
             admission.acquired.set_result(None)
@@ -1760,43 +1897,54 @@ class RpcBusAdapter:
             )
             cap = asyncio.get_running_loop().call_later(_WRITE_HARD_CAP_S, self._cap_write, record)
             try:
-                admission.issued = True
-                try:
-                    if admission.device_id != "ble_mesh":
+                boundary = replace(
+                    self._next_capture_provenance("issue"),
+                    issued_values=tuple(admission.values.items()),
+                )
+                if admission.device_id == "ble_mesh":
+                    if not self._prepare_mesh_issue(admission, boundary):
+                        self._refuse_mesh_issue(admission)
+                        raise WriteCancelled()
+                else:
+                    admission.issued = True
+                    try:
                         for name in admission.values:
                             key = (admission.device_id, admission.peripheral_id, name)
                             self._field_eras[key] = self._field_eras.get(key, 0) + 1
-                    boundary = self._next_capture_provenance("issue")
-                    admission.ticket.mark_issued(
-                        replace(
+                        admission.ticket.mark_issued(
                             self._field_capture(
                                 boundary,
                                 admission.device_id,
                                 admission.peripheral_id,
                                 admission.values,
-                            ),
-                            issued_values=tuple(admission.values.items()),
+                            )
                         )
-                    )
-                except Exception as error:
-                    logger.warning("WIRED_ISSUE_CALLBACK_FAILED %s", type(error).__name__)
+                    except Exception as error:
+                        logger.warning("WIRED_ISSUE_CALLBACK_FAILED %s", type(error).__name__)
                 if admission.write_class is not WriteClass.MAINTENANCE:
                     for waiter in self._write_waiters.get(admission.device_id, []):
                         if waiter.write_class is WriteClass.MAINTENANCE:
                             waiter.bypasses += 1
+                if admission.device_id == "ble_mesh" and not self._commit_mesh_issue(
+                    admission, boundary
+                ):
+                    self._refuse_mesh_issue(admission)
+                    raise WriteCancelled()
                 response = await obs.request_set_variables_in_peripheral(
                     admission.peripheral_id,
                     admission.values,
                     device_id=admission.device_id,
                 )
                 receipt = _normalize_receipt(response)
-                admission.ticket.mark_settled(receipt, self._next_capture_provenance())
+                self._native_return(admission, receipt)
             except asyncio.CancelledError:
-                admission.ticket.mark_settled(WriteCancelled(), self._next_capture_provenance())
-                logger.info("set_variables(%s) cancelled at session teardown", record.label)
+                if admission.issued:
+                    self._native_return(admission, WriteCancelled())
+                    logger.info("set_variables(%s) cancelled at session teardown", record.label)
                 raise
             except Exception as error:
-                admission.ticket.mark_settled(error, self._next_capture_provenance())
+                if admission.issued:
+                    self._native_return(admission, error)
                 if record.detached:
                     logger.warning(
                         "detached set_variables(%s) failed after %.1fs (queue wait %.3fs)",
@@ -1892,13 +2040,9 @@ class RpcBusAdapter:
         finish on their own: they stay strongly referenced in _write_tasks and
         their done-callback (_settle_write) still consumes any exception.
         """
-        for admission in list(self._write_admissions.values()):
+        admissions = tuple(self._write_admissions.values())
+        for admission in admissions:
             admission.ticket._cancel_waiting = None
-            if not admission.result.done():
-                admission.result.set_exception(WriteCancelled())
-                admission.result.exception()
-            if not admission.acquired.done():
-                admission.acquired.set_result(None)
         self._write_admissions.clear()
         outstanding = [task for task in self._write_tasks if not task.done()]
         if not outstanding:
@@ -1910,6 +2054,12 @@ class RpcBusAdapter:
             task.cancel()
         _, pending = await asyncio.wait(outstanding, timeout=_WRITE_SETTLE_TIMEOUT_S)
         if pending:
+            # The bounded teardown may detach a waiter from an uncooperative
+            # RPC. Its ticket/physical lock still belong to the real outcome.
+            for admission in admissions:
+                if admission.task in pending and not admission.result.done():
+                    admission.result.set_exception(WriteCancelled())
+                    admission.result.exception()
             logger.error(
                 "%d bus write(s) did not settle within %.0fs of cancellation; closing the "
                 "observer anyway: %s",
@@ -2025,6 +2175,7 @@ class RpcBusAdapter:
         self._pending_pushes.clear()
         self._push_tasks.clear()
         self._mesh_sinks.clear()
+        self._mesh_write_guard = None
         await self._close_bus_resources()
 
 
