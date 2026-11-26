@@ -368,6 +368,12 @@ cases successfully. Baseline logs/XML are unchanged; new evidence uses
   Only mesh native returns allocate return provenance and advance creation floor;
   wired issue retains field eras and current-generation provenance, reusing the
   lock-acquisition timestamp without an intervening await or another clock read.
+- Direct auxiliary translation validates the registered route/descriptor and
+  original live mesh owner before persisting reconciled intent. Production
+  adapter cases cover missing/revoked context, missing routes and descriptors
+  invalidated by a native capture; existing desired contents and file bytes
+  remain unchanged, with zero native calls through later ordinary enforcement.
+  Registered wired routes still record intent before the snapshot guard.
 
 Additional connected production schedules cover synchronous native return before
 caller resumption; merged MQTT fold ownership before the replacement handler;

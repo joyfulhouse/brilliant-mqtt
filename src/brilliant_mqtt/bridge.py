@@ -1474,9 +1474,30 @@ class Bridge:
         if value is None:
             logger.debug("aux command on %s (%r) did not translate; ignoring", topic, payload)
             return
+        if self._by_cmd_topic.get(topic) != (peripheral_id, d):
+            return
+        device = self._current_device(peripheral_id)
+        owner = self._mesh.current(peripheral_id) if self._mesh is not None else None
+        cached = self._devices.get(peripheral_id)
+        if (
+            owner is not None
+            or cached is not None
+            and cached.device_id == _MESH_DEVICE_ID
+            or topic in self._mesh_route_owners
+        ):
+            # Rejected mesh intent must not become a later maintenance write.
+            admission = command_admission.get()
+            if (
+                owner is None
+                or admission is None
+                or admission.mesh_owner is not owner
+                or self._resolve_mesh_owner(topic) is not owner
+                or device is None
+                or d not in entities_for(device, self._panel)
+            ):
+                return
         if self._desired is not None and d.command_var in RECONCILED_VARS:
             self._desired.record(peripheral_id, d.command_var, value)
-        device = self._current_device(peripheral_id)
         if device is None:
             # Without a snapshot we cannot know which bus device owns the
             # peripheral, so the write cannot be routed — mirror the primary

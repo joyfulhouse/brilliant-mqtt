@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -13,10 +14,11 @@ from brilliant_mqtt import mqttio
 from brilliant_mqtt.bridge import Bridge
 from brilliant_mqtt.bus import RpcBusAdapter
 from brilliant_mqtt.commands import VarSet
+from brilliant_mqtt.desired_state import DesiredState
 from brilliant_mqtt.discovery import command_topic
 from brilliant_mqtt.mesh_settlement import MeshSettlement
 from brilliant_mqtt.model import CaptureProvenance
-from brilliant_mqtt.write_admission import AdmissionTicket
+from brilliant_mqtt.write_admission import AdmissionTicket, CommandAdmission, command_admission
 from tests.fakes import (
     FakeClock,
     FakeMqtt,
@@ -141,6 +143,63 @@ async def test_direct_mesh_translation_without_original_context_cannot_admit_nat
     )
     assert rig.harness.write_starts == []
     assert owner.view.command_id == before
+
+
+@pytest.mark.parametrize("admission", ["missing", "revoked", "missing_route", "stale_descriptor"])
+async def test_direct_mesh_aux_rejects_invalid_admission_before_persisting_intent(
+    connected: Connected,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    admission: str,
+) -> None:
+    rig = connected
+    desired_path = tmp_path / "desired.json"
+    desired = DesiredState(desired_path)
+    desired.record("load", "enable_motion_score", "0")
+    before = desired_path.read_text()
+    rig.bridge._desired = desired
+    topic = "brilliant/mesh/load/set_enable_motion_score"
+    original = rig.owner()
+    descriptor = rig.bridge._by_cmd_topic[topic][1]
+    assert descriptor is not None
+    if admission == "revoked":
+        rig.harness.procs[0].reconnect_cbs[0]()
+        await rig.bridge.reconcile()
+        assert rig.owner() is not original
+    elif admission == "missing_route":
+        rig.bridge._by_cmd_topic.pop(topic)
+    elif admission == "stale_descriptor":
+        assert rig.raw.peripherals is not None
+        rig.raw.peripherals["load"].variables.pop("enable_motion_score")
+        await rig.adapter.get_all()
+
+    payloads: list[tuple[str, str, dict[str, str]]] = []
+    native = rig.harness.observers[0].request_set_variables_in_peripheral
+
+    async def record(peripheral_id: str, values: dict[str, str], *, device_id: str) -> str:
+        payloads.append((device_id, peripheral_id, dict(values)))
+        result = await native(peripheral_id, values, device_id=device_id)
+        assert isinstance(result, str)
+        return result
+
+    monkeypatch.setattr(rig.harness.observers[0], "request_set_variables_in_peripheral", record)
+    rig.harness.write_release.set()
+    token = command_admission.set(
+        None if admission == "missing" else CommandAdmission(mesh_owner=original)
+    )
+    try:
+        await rig.bridge._handle_aux_command(topic, "load", descriptor, "ON")
+    finally:
+        command_admission.reset(token)
+
+    await rig.bridge._enforce_desired(await rig.adapter.get_all())
+
+    assert {"desired": desired.wanted("load"), "native": payloads} == {
+        "desired": {"enable_motion_score": "0"},
+        "native": [],
+    }
+    assert desired_path.read_text() == before
+    assert rig.harness.write_starts == []
 
 
 async def test_owner_created_by_sync_ingress_before_async_repair(
