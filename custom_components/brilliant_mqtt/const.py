@@ -100,6 +100,8 @@ DATA_HA_MIRROR_RETIRE_VERIFIED = "ha_mirror_retire_verified"
 
 # Options keys + defaults.
 OPT_AUTO_REPAIR = "auto_repair"
+OPT_PLUGINS_ENABLED = "plugins_enabled"
+DEFAULT_PLUGINS_ENABLED = False
 OPT_OFFLINE_GRACE_MINUTES = "offline_grace_minutes"
 OPT_REPAIR_COOLDOWN_MINUTES = "repair_cooldown_minutes"
 OPT_TRUST_HOST_KEY_CHANGES = "trust_host_key_changes"
