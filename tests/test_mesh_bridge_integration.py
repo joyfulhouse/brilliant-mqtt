@@ -15,7 +15,7 @@ from brilliant_mqtt.bridge import Bridge
 from brilliant_mqtt.bus import RpcBusAdapter
 from brilliant_mqtt.commands import VarSet
 from brilliant_mqtt.desired_state import DesiredState
-from brilliant_mqtt.discovery import command_topic
+from brilliant_mqtt.discovery import command_topic, config_topic
 from brilliant_mqtt.mesh_settlement import MeshSettlement
 from brilliant_mqtt.model import CaptureProvenance
 from brilliant_mqtt.write_admission import AdmissionTicket, CommandAdmission, command_admission
@@ -457,6 +457,157 @@ async def test_retired_cleanup_transport_failure_waits_for_existing_reconcile(
     assert attempts > 1
     assert "load" not in rig.bridge.mesh_registry.retired
     assert command_topic("mesh", "load") not in rig.bridge._by_cmd_topic
+
+
+@pytest.mark.parametrize("hook_kind", ["loop", "foreign"])
+async def test_failed_retired_cleanup_survives_registered_reconnect_without_state_admission(
+    connected: Connected,
+    monkeypatch: pytest.MonkeyPatch,
+    hook_kind: str,
+) -> None:
+    rig = connected
+    registry, driver = rig.bridge.mesh_registry, rig.bridge.mesh_driver
+    assert registry is not None and driver is not None
+    old = rig.owner()
+    configs = {config_topic(descriptor) for descriptor in rig.bridge._mesh_descriptors[old]}
+    unsubscribe = rig.mqtt.unsubscribe
+
+    async def unavailable(topic: str) -> None:
+        raise RuntimeError("ordinary broker failure")
+
+    monkeypatch.setattr(rig.mqtt, "unsubscribe", unavailable)
+    assert rig.raw.peripherals is not None
+    rig.raw.peripherals.pop("load")
+    await rig.adapter.get_all()
+    await turns()
+    assert registry.retired.get("load") is old
+    rig.mqtt.published.clear()
+    hook = rig.harness.procs[0].reconnect_cbs[0]
+    if hook_kind == "foreign":
+        from tests.test_mesh_bus_reconnect import foreign
+
+        foreign(hook)
+    else:
+        hook()
+    await turns()
+    assert not old.active
+    assert not registry.live(old, publication=True)
+    assert registry.reserve(old, "publish") is None
+    await rig.bridge.reconcile()
+    assert registry.retired.get("load") is old
+    monkeypatch.setattr(rig.mqtt, "unsubscribe", unsubscribe)
+
+    await rig.bridge.reconcile()
+    await turns()
+
+    assert not registry.retired
+    assert old not in driver._lanes
+    assert old not in rig.bridge._mesh_descriptors
+    assert old not in rig.bridge._mesh_route_owners.values()
+    assert command_topic("mesh", "load") in rig.mqtt.unsubscriptions
+    assert command_topic("mesh", "load") not in rig.bridge._by_cmd_topic
+    assert command_topic("mesh", "load") not in rig.bridge._subscribed
+    assert "load" not in rig.bridge._devices
+    assert {
+        topic for topic, payload, _ in rig.mqtt.published if topic in configs and payload == ""
+    } == configs
+    assert not any(topic == "brilliant/mesh/load/state" for topic, _, _ in rig.mqtt.published)
+    assert rig.harness.write_starts == []
+
+
+@pytest.mark.parametrize("distinct_ids", [False, True])
+async def test_failed_cleanup_reconnect_churn_releases_all_old_ownership_maps(
+    connected: Connected,
+    monkeypatch: pytest.MonkeyPatch,
+    distinct_ids: bool,
+) -> None:
+    rig = connected
+    registry, driver = rig.bridge.mesh_registry, rig.bridge.mesh_driver
+    assert registry is not None and driver is not None
+    unsubscribe = rig.mqtt.unsubscribe
+    old_owners = []
+
+    async def unavailable(topic: str) -> None:
+        raise RuntimeError("ordinary broker failure")
+
+    assert rig.raw.peripherals is not None
+    for index in range(4):
+        pid = "load" if not distinct_ids or index == 0 else f"load-{index}"
+        if index:
+            peripheral = _RawPeripheral("1")
+            peripheral.peripheral_type = 27
+            rig.raw.peripherals[pid] = peripheral
+            await rig.bridge.reconcile()
+        old = rig.owner(pid)
+        old_owners.append(old)
+        configs = {config_topic(descriptor) for descriptor in rig.bridge._mesh_descriptors[old]}
+        monkeypatch.setattr(rig.mqtt, "unsubscribe", unavailable)
+        rig.raw.peripherals.pop(pid)
+        await rig.adapter.get_all()
+        await turns()
+        assert registry.retired.get(pid) is old
+        rig.harness.procs[0].reconnect_cbs[0]()
+        await turns()
+        monkeypatch.setattr(rig.mqtt, "unsubscribe", unsubscribe)
+        await rig.bridge.reconcile()
+        await turns()
+
+        assert not registry.retired
+        assert all(owner not in driver._lanes for owner in old_owners)
+        assert all(owner not in rig.bridge._mesh_descriptors for owner in old_owners)
+        assert all(owner not in rig.bridge._mesh_route_owners.values() for owner in old_owners)
+        assert pid not in rig.bridge._devices
+        assert command_topic("mesh", pid) not in rig.bridge._by_cmd_topic
+        assert command_topic("mesh", pid) not in rig.bridge._subscribed
+        assert configs <= {topic for topic, payload, _ in rig.mqtt.published if payload == ""}
+    assert len(registry.owners) == 1
+    assert len(rig.bridge._mesh_descriptors) == 1
+    assert len(rig.bridge._mesh_route_owners) == 1
+    assert len(rig.bridge._by_cmd_topic) == 1
+    assert len(rig.bridge._subscribed) == 1
+    assert len(rig.bridge._devices) == 1
+
+
+async def test_reappearance_supersedes_revoked_cleanup_without_tombstoning_successor(
+    connected: Connected,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rig = connected
+    registry, driver = rig.bridge.mesh_registry, rig.bridge.mesh_driver
+    assert registry is not None and driver is not None
+    old = rig.owner()
+    unsubscribe = rig.mqtt.unsubscribe
+
+    async def unavailable(topic: str) -> None:
+        raise RuntimeError("ordinary broker failure")
+
+    monkeypatch.setattr(rig.mqtt, "unsubscribe", unavailable)
+    assert rig.raw.peripherals is not None
+    peripheral = rig.raw.peripherals.pop("load")
+    await rig.adapter.get_all()
+    await turns()
+    rig.harness.procs[0].reconnect_cbs[0]()
+    await turns()
+    monkeypatch.setattr(rig.mqtt, "unsubscribe", unsubscribe)
+    rig.raw.peripherals["load"] = peripheral
+    await rig.bridge.reconcile()
+    successor = rig.owner()
+    assert successor is not old
+    rig.mqtt.published.clear()
+    unsubscriptions = list(rig.mqtt.unsubscriptions)
+
+    await driver.flush(old)
+    await rig.bridge._cleanup_mesh(old)
+
+    assert not registry.retired
+    assert old not in rig.bridge._mesh_descriptors
+    assert old not in rig.bridge._mesh_route_owners.values()
+    assert registry.current("load") is successor
+    assert rig.bridge._mesh_route_owners[command_topic("mesh", "load")] is successor
+    assert command_topic("mesh", "load") in rig.bridge._subscribed
+    assert "load" in rig.bridge._devices
+    assert rig.mqtt.unsubscriptions == unsubscriptions
+    assert rig.mqtt.published == []
 
 
 async def test_original_queued_owner_cannot_write_after_same_topic_replacement(

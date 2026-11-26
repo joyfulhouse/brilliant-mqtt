@@ -374,6 +374,13 @@ cases successfully. Baseline logs/XML are unchanged; new evidence uses
   invalidated by a native capture; existing desired contents and file bytes
   remain unchanged, with zero native calls through later ordinary enforcement.
   Registered wired routes still record intent before the snapshot guard.
+- A reconnect permanently revokes retired state/admission but retains the exact
+  unfinished routing-cleanup entry. Existing repair triggers join obsolete
+  effects with the current bound and run cleanup only while acquisition and
+  adapter admission remain open. Actual loop/foreign hook schedules preserve
+  ordinary-failure debt, require unsubscribe/config tombstones and release old
+  maps through same/distinct-ID churn; reappearance prevents obsolete cleanup
+  from changing successor ownership or emitting old state.
 
 Additional connected production schedules cover synchronous native return before
 caller resumption; merged MQTT fold ownership before the replacement handler;

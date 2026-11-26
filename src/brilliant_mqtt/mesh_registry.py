@@ -373,9 +373,9 @@ class MeshRegistry:
             successor = self._new(old.metadata, boundary, replaced=True)
             self._bindings[pid] = _Binding(successor, boundary.sequence, boundary.sequence)
             self.effects(successor, (WakePublication(successor),))
+        # Keep unfinished routing cleanup, without reviving old state/admission.
         for owner in tuple(self._retired.values()):
             self._revoke(owner, boundary)
-        self._retired.clear()
 
     def finish_retired(self, owner: MeshSettlement) -> None:
         pid = owner.metadata.peripheral_id

@@ -187,6 +187,29 @@ class MeshDriver:
                 lane.timer, lane.window = None, None
 
     async def flush(self, owner: MeshSettlement, *, force: bool = False) -> None:
+        if not owner.active:
+            # Reconnect revokes publication, but exact retired routing cleanup
+            # remains eligible on this existing external repair trigger.
+            lane = self._lanes.get(owner)
+            if lane is not None:
+                if lane.worker is not None and not lane.worker.done():
+                    _, pending = await asyncio.wait(
+                        {lane.worker}, timeout=_SHUTDOWN_WORKER_SETTLE_S
+                    )
+                    if pending:
+                        self.registry.bus.fail_mesh(
+                            RuntimeError("obsolete mesh worker did not settle")
+                        )
+                        return
+                if not await self._join_child(lane):
+                    return
+            if (
+                self.registry.enabled
+                and self.registry.bus.mesh_admission_open
+                and self.registry.retired.get(owner.metadata.peripheral_id) is owner
+            ):
+                await self._cleanup(owner)
+            return
         self.wake(owner, force=force)
         lane = self._lanes.get(owner)
         if lane is not None:
