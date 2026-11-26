@@ -254,6 +254,8 @@ class MeshDriver:
                     self._lanes.pop(owner)
 
     async def _attempt(self, owner: MeshSettlement, lane: _Lane) -> None:
+        if not await self._join_obsolete_children(owner):
+            return
         envelope = self.registry.reserve(owner, "publish")
         if envelope is None or not self.registry.live(owner, publication=True):
             return
@@ -285,6 +287,26 @@ class MeshDriver:
         if result is not None:
             self.registry.dispatch(owner, PublishAccepted(result, token))
             lane.last_fields = json.loads(payload)
+
+    async def _join_obsolete_children(self, owner: MeshSettlement) -> bool:
+        while self.registry.live(owner, publication=True):
+            children = {
+                other_lane.child
+                for other, other_lane in self._lanes.items()
+                if other is not owner
+                and not self.registry.live(other, publication=True)
+                and other_lane.child is not None
+                and not other_lane.child.done()
+            }
+            if not children:
+                return True
+            done, pending = await asyncio.wait(children, timeout=_SHUTDOWN_WORKER_SETTLE_S)
+            for child in done:
+                self._retrieve(child)
+            if pending:
+                self.registry.bus.fail_mesh(RuntimeError("obsolete mesh publisher did not settle"))
+                return False
+        return False
 
     async def shutdown(self) -> None:
         """Bound joins after registry.close() synchronously shuts admission/ingress."""

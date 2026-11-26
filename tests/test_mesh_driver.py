@@ -229,3 +229,58 @@ async def test_failed_forced_same_payload_is_repaired_by_next_capture(
     finally:
         registry.close()
         await driver.shutdown()
+
+
+async def test_reacquisition_joins_obsolete_child_before_new_owner_attempt(
+    registry_rig: tuple[MeshRegistry, _RawDevice],
+) -> None:
+    registry, raw = registry_rig
+    adapter = cast(RpcBusAdapter, registry.bus)
+
+    class SlowCancellation(FakeMqtt):
+        def __init__(self) -> None:
+            super().__init__()
+            self.release = asyncio.Event()
+            self.calls = 0
+            self.active = 0
+            self.peak = 0
+
+        async def publish(
+            self, topic: str, payload: str, retain: bool = False, qos: int = 0
+        ) -> None:
+            self.calls += 1
+            self.active += 1
+            self.peak = max(self.peak, self.active)
+            try:
+                while not self.release.is_set():
+                    try:
+                        await self.release.wait()
+                    except asyncio.CancelledError:
+                        continue
+            finally:
+                self.active -= 1
+
+    mqtt = SlowCancellation()
+    driver = MeshDriver(registry, mqtt, panel="mesh")
+    try:
+        registry.acquire()
+        await adapter.get_all()
+        await turns()
+        assert mqtt.calls == 1
+        old = registry.current("load")
+        registry.close()
+        registry.acquire()
+        adapter._dispatch_raw_device(raw)
+        new = registry.current("load")
+        assert new is not None and new is not old
+        await turns(40)
+        assert mqtt.calls == 1
+        mqtt.release.set()
+        await turns(60)
+        assert mqtt.calls == 2
+        assert mqtt.peak == 1
+        assert adapter.mesh_admission_open
+    finally:
+        mqtt.release.set()
+        registry.close()
+        await driver.shutdown()
