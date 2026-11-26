@@ -157,7 +157,7 @@ class PanelConnectionOwner:
 
     async def async_commit(self, *, host: str, password: str) -> None:
         """Publish only this request's verified tuple while its operation lock is held."""
-        from .fleet_manager import async_wait_config_entry_persisted
+        from .fleet_manager import _async_settle_cleanup, async_wait_config_entry_persisted
 
         proposed = replace(self.prior, host=host, password=password)
         self.assert_current()
@@ -293,18 +293,27 @@ class PanelConnectionOwner:
             committed = True
         except asyncio.CancelledError as error:
             # Intent removal may have reached disk before cancellation surfaced.
-            pending = await self.journal.async_connection_intents()
-            committed = removal_started and not any(
-                item.commit_id == intent.commit_id for item in pending
-            )
+            cancellation = error
+            restore_intent = False
+            try:
+                pending = await self.journal.async_connection_intents()
+            except (Exception, asyncio.CancelledError):
+                restore_intent = removal_started
+            else:
+                committed = removal_started and not any(
+                    item.commit_id == intent.commit_id for item in pending
+                )
             if committed:
                 try:
                     assert_commit()
                 except ConnectionOwnershipError:
                     committed = False
-                if not committed:
-                    await self.journal.async_begin_connection_change(intent)
-            cancellation = error
+                    restore_intent = True
+            if restore_intent:
+                try:
+                    await _async_settle_cleanup(self.journal.async_begin_connection_change(intent))
+                except Exception:
+                    raise ConnectionOwnershipError("address_change_incomplete") from None
         except ConnectionOwnershipError:
             raise
         except Exception:

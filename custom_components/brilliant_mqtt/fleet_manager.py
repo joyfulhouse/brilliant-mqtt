@@ -1485,13 +1485,19 @@ class FleetManager:
                 if (
                     retained.state in {"restore_requested", "finalizing"}
                     and retained.finalization_origin is None
-                    and retained.record.panel_request.bound_owner is None
                     and retained.compensation_password(record) is None
                 ):
-                    await _async_report_ownership_unproven(
-                        self.hass, retained.record, original_code="restart_recovery"
-                    )
-                    continue
+                    from .connection_owner import async_resolve_panel_owner
+
+                    try:
+                        if retained.record.panel_request.bound_owner is None:
+                            raise EntryDataError("provisioning_ownership_mismatch")
+                        await async_resolve_panel_owner(self.hass, retained.record.panel_request)
+                    except ValueError:
+                        await _async_report_ownership_unproven(
+                            self.hass, retained.record, original_code="restart_recovery"
+                        )
+                        continue
                 password = retained.compensation_password(record)
                 if retained.state == "restore_requested" and (
                     record is None or password is not None

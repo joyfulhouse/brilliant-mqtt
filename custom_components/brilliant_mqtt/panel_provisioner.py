@@ -1953,6 +1953,12 @@ class PanelProvisioner:
                     and retained.record.panel_request.bound_owner is None
                 ):
                     continue
+                if (
+                    retained.state in {"restore_requested", "finalizing"}
+                    and retained.finalization_origin is None
+                    and retained.record.panel_request.bound_owner is not None
+                ):
+                    await self._async_assert_named_live(retained.record.panel_request)
             except (PanelProvisioningError, ProvisioningJournalError):
                 continue
             if retained.state == "finalizing":

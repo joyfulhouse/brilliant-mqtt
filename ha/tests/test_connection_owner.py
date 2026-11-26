@@ -387,6 +387,75 @@ async def test_postcommit_cancel_enqueue_failure_retains_retry_repair(
     assert ir.async_get(hass).async_get_issue(DOMAIN, _issue_id(owner.owner)) is not None
 
 
+@pytest.mark.parametrize("cancel_proof_read", [False, True])
+async def test_cancelled_commit_proof_read_failure_restores_exact_intent(
+    hass: HomeAssistant,
+    durable_connection_storage: None,
+    monkeypatch: pytest.MonkeyPatch,
+    cancel_proof_read: bool,
+) -> None:
+    import asyncio
+
+    from homeassistant.helpers import issue_registry as ir
+
+    from custom_components.brilliant_mqtt.connection_owner import PanelConnectionOwner, _issue_id
+    from custom_components.brilliant_mqtt.connection_state import ConnectionIntent
+    from custom_components.brilliant_mqtt.const import DOMAIN
+    from custom_components.brilliant_mqtt.fleet_manager import _shared_ssh_lock
+    from custom_components.brilliant_mqtt.provisioning_journal import ProvisioningJournalError
+
+    panel = _subentry()
+    entry = _fleet_entry(hass, panel)
+    stored = entry.subentries[panel.subentry_id]
+    owner = PanelConnectionOwner(hass, entry, stored)
+    finish = ProvisioningJournal.async_finish_connection_change
+    read = ProvisioningJournal.async_connection_intents
+    failed_read_pending = False
+    retired: list[ConnectionIntent] = []
+    notify = Mock()
+    monkeypatch.setattr(owner, "_enqueue_runtime", notify)
+
+    async def interrupted(
+        journal: ProvisioningJournal, intent: ConnectionIntent, **kwargs: Any
+    ) -> None:
+        nonlocal failed_read_pending
+        await finish(journal, intent, **kwargs)
+        retired.append(intent)
+        failed_read_pending = True
+        raise asyncio.CancelledError
+
+    async def failed_proof_read(journal: ProvisioningJournal) -> tuple[ConnectionIntent, ...]:
+        nonlocal failed_read_pending
+        if failed_read_pending:
+            failed_read_pending = False
+            if cancel_proof_read:
+                task = asyncio.current_task()
+                assert task is not None
+                task.cancel()
+                await asyncio.sleep(0)
+            raise ProvisioningJournalError("journal_load_failed")
+        return await read(journal)
+
+    monkeypatch.setattr(ProvisioningJournal, "async_finish_connection_change", interrupted)
+    monkeypatch.setattr(ProvisioningJournal, "async_connection_intents", failed_proof_read)
+    async with _shared_ssh_lock(hass):
+        task = asyncio.create_task(
+            owner.async_commit(host="moved.office.test", password="fresh-login")
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert len(retired) == 1
+    assert await owner.journal.async_connection_intents() == tuple(retired)
+    assert set(disk(hass, JOURNAL_STORAGE_KEY)["connection_intents"]) == {retired[0].commit_id}
+    assert stored.data[CONF_HOST] == "moved.office.test"
+    assert stored.data[CONF_ROOT_PASSWORD] == "fresh-login"
+    assert stored.data["connection_commit_id"] == retired[0].commit_id
+    notify.assert_not_called()
+    assert ir.async_get(hass).async_get_issue(DOMAIN, _issue_id(owner.owner)) is not None
+    with pytest.raises(ProvisioningJournalError, match="address_change_incomplete"):
+        await owner.journal.async_assert_connection_available(owner=owner.owner)
+
+
 async def test_key_only_legacy_duplicate_with_accepted_outer_whitespace(
     hass: HomeAssistant,
 ) -> None:
@@ -757,6 +826,140 @@ async def test_original_named_owner_removal_defers_scoped_dispatch(
         == "kitchen"
     )
     assert await journal.async_retained(record.transaction_id) is not None
+
+
+@pytest.mark.parametrize("state", ["restore_requested", "finalizing"])
+async def test_removed_owner_of_bound_legacy_marker_preserves_sibling_startup(
+    hass: HomeAssistant,
+    durable_connection_storage: None,
+    monkeypatch: pytest.MonkeyPatch,
+    state: str,
+) -> None:
+    from homeassistant.helpers import issue_registry as ir
+
+    from custom_components.brilliant_mqtt import fleet_manager as fm
+    from custom_components.brilliant_mqtt.connection_state import PanelOwner
+    from custom_components.brilliant_mqtt.const import DOMAIN
+    from custom_components.brilliant_mqtt.manager import PanelManager
+    from tests.test_config_flow import _OTHER_FINGERPRINT, _OTHER_PUBLIC_KEY
+
+    kitchen = _subentry(
+        slug="kitchen",
+        subentry_id="panel-kitchen",
+        priority=2,
+        fingerprint=_OTHER_FINGERPRINT,
+        public_key=_OTHER_PUBLIC_KEY,
+    )
+    entry = _fleet_entry(hass, kitchen)
+    journal = ProvisioningJournal(hass)
+    record = replace(
+        _record(),
+        prior_snapshot=replace(
+            _record().prior_snapshot, baseline=RollbackBaseline("c" * 32, "d" * 64, {})
+        ),
+    )
+    await journal.async_arm(record)
+    await journal.async_retained_state(record.transaction_id, state)
+    row = await journal.async_retained(record.transaction_id)
+    assert row is not None
+    before = await journal.async_bind_retained(
+        row, PanelOwner(entry.entry_id, "removed-office", "office", record.panel_request.public_key)
+    )
+    setup = AsyncMock()
+    monkeypatch.setattr(PanelManager, "async_setup", setup)
+    monkeypatch.setattr(PanelManager, "async_shutdown", AsyncMock())
+    monkeypatch.setattr(mqtt, "async_subscribe_connection_status", Mock(return_value=lambda: None))
+    monkeypatch.setattr(mqtt, "is_connected", lambda _hass: True)
+    monkeypatch.setattr(fm, "async_purge_stale_discovery_configs", AsyncMock())
+    fleet = fm.FleetManager(hass, entry)
+    try:
+        await fleet.async_setup()
+        assert set(fleet.panels) == {kitchen.subentry_id}
+        setup.assert_awaited_once()
+        assert fleet._recovery_task is None
+        assert await journal.async_retained(record.transaction_id) == before
+        assert await journal.async_load() is None
+        assert (
+            ir.async_get(hass).async_get_issue(
+                DOMAIN, fm._provisioning_repair_issue_id(record.transaction_id)
+            )
+            is not None
+        )
+    finally:
+        await fleet.async_shutdown()
+
+
+@pytest.mark.parametrize("state", ["restore_requested", "finalizing"])
+async def test_removed_owner_of_bound_legacy_marker_preserves_unrelated_recovery(
+    hass: HomeAssistant,
+    durable_connection_storage: None,
+    monkeypatch: pytest.MonkeyPatch,
+    state: str,
+) -> None:
+    from functools import partial
+    from uuid import uuid4
+
+    from custom_components.brilliant_mqtt.connection_owner import async_resolve_panel_owner
+    from custom_components.brilliant_mqtt.connection_state import PanelOwner
+    from custom_components.brilliant_mqtt.fleet_manager import _async_rollback_credential
+    from tests.test_config_flow import _OTHER_FINGERPRINT, _OTHER_PUBLIC_KEY
+    from tests.test_panel_provisioner import _Harness
+
+    kitchen = _subentry(
+        slug="kitchen",
+        subentry_id="panel-kitchen",
+        priority=2,
+        fingerprint=_OTHER_FINGERPRINT,
+        public_key=_OTHER_PUBLIC_KEY,
+    )
+    entry = _fleet_entry(hass, kitchen)
+    journal = ProvisioningJournal(hass)
+    record = replace(
+        _record(),
+        prior_snapshot=replace(
+            _record().prior_snapshot, baseline=RollbackBaseline("c" * 32, "d" * 64, {})
+        ),
+    )
+    await journal.async_arm(record)
+    row = await journal.async_retained(record.transaction_id)
+    assert row is not None
+    await journal.async_bind_retained(
+        row, PanelOwner(entry.entry_id, "removed-office", "office", record.panel_request.public_key)
+    )
+    await journal.async_retained_state(record.transaction_id, state)
+    before = await journal.async_retained(record.transaction_id)
+    active = replace(
+        _record(),
+        transaction_id=uuid4(),
+        panel_request=replace(
+            record.panel_request,
+            slug="kitchen",
+            public_key=_OTHER_PUBLIC_KEY,
+            fingerprint=_OTHER_FINGERPRINT,
+        ),
+    )
+    await journal.async_create(active)
+    harness = _Harness()
+    monkeypatch.setattr(harness, "journal", journal)
+    provisioner = harness.provisioner()
+    monkeypatch.setattr(
+        provisioner, "_named_owner_resolver", partial(async_resolve_panel_owner, hass)
+    )
+    monkeypatch.setattr(
+        provisioner, "_credential_resolver", partial(_async_rollback_credential, hass)
+    )
+    monkeypatch.setattr(
+        provisioner, "_connection_admission", journal.async_assert_connection_available
+    )
+    recover = AsyncMock()
+    monkeypatch.setattr(provisioner, "_async_recover_record", recover)
+    await provisioner.async_recover()
+    recover.assert_awaited_once()
+    assert recover.await_args is not None
+    assert recover.await_args.args[0] == active
+    assert await journal.async_retained(record.transaction_id) == before
+    assert await journal.async_load() == active
+    assert not any(event[0] == "shell_factory" for event in harness.events)
 
 
 async def test_fresh_verified_notification_retry_uses_committed_tuple_without_new_intent(
