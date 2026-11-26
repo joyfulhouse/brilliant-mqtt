@@ -17,7 +17,22 @@ MAX_FILES = 4096
 _ID = re.compile(r"[a-z][a-z0-9_]{0,63}")
 _VERSION = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
 _DIGEST = re.compile(r"[0-9a-f]{64}")
-_UNIT = re.compile(r"[a-zA-Z0-9_@.-]+\.(?:service|timer|socket|target|slice)")
+_REPLACEMENT_UNIT = re.compile(r"[a-zA-Z0-9_@.-]+\.(?:service|timer|socket|target|slice)")
+_CONFIGURATION_UNIT_TYPES = frozenset(
+    {
+        "service",
+        "socket",
+        "device",
+        "mount",
+        "automount",
+        "swap",
+        "target",
+        "path",
+        "timer",
+        "slice",
+        "scope",
+    }
+)
 _PROTECTED_STEMS = frozenset(
     {
         "message_bus",
@@ -71,22 +86,7 @@ _UNIT_SEARCH_DIRECTORIES = (
     "/lib/systemd/system",
     "/run/systemd/generator.late",
 )
-_SHARED_DROPIN_DIRECTORIES = frozenset(
-    f"{unit_type}.d"
-    for unit_type in (
-        "service",
-        "socket",
-        "device",
-        "mount",
-        "automount",
-        "swap",
-        "target",
-        "path",
-        "timer",
-        "slice",
-        "scope",
-    )
-)
+_SHARED_DROPIN_DIRECTORIES = frozenset(f"{unit_type}.d" for unit_type in _CONFIGURATION_UNIT_TYPES)
 
 
 class PluginValidationError(ValueError):
@@ -300,7 +300,7 @@ def _protected_unit(value: str, known_names: frozenset[str] = frozenset()) -> bo
 
 
 def _unit(value: str, known_names: frozenset[str] = frozenset()) -> None:
-    if _UNIT.fullmatch(value) is None or ".." in value:
+    if _REPLACEMENT_UNIT.fullmatch(value) is None or ".." in value:
         _fail()
     if _protected_unit(value, known_names):
         _fail()
@@ -347,8 +347,11 @@ def _path(value: str, known_names: frozenset[str] = frozenset()) -> None:
         unit = part
         for suffix in (".d", ".wants", ".requires", ".upholds"):
             unit = unit.removesuffix(suffix)
-        if _UNIT.fullmatch(unit):
-            _unit(unit, known_names)
+        # Configuration can affect core units outside the replacement grammar.
+        name, _, unit_type = unit.rpartition(".")
+        if name and unit_type in _CONFIGURATION_UNIT_TYPES:
+            if ".." in unit or _protected_unit(unit, known_names):
+                _fail()
 
 
 def guard_protected_core(manifest: PluginManifest, policy: ValidationPolicy) -> None:

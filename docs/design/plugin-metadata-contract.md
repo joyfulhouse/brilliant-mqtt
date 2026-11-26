@@ -66,6 +66,9 @@ Capabilities are declarations, not runtime grants or recorded consent:
 Ownership surfaces are the screen surfaces listed in section 3; topics are
 restricted to `plugins/<manifest id>`. Replacements have exactly `target`,
 `kind`, `identity` and `firmware_adapter`, with only `systemd` syntax supported.
+Replacement identities and traversed replacement dependencies retain the narrow
+`service`, `timer`, `socket`, `target` and `slice` grammar; broader configuration
+recognition does not make other unit types eligible replacements.
 Repeated replacements fail. A replacement must match a complete reviewed
 `Replacement` tuple; the default replacement allowlist is empty.
 
@@ -152,6 +155,10 @@ instance families, applicable hyphen-prefix drop-ins, and `.d`, `.wants`,
 `.requires` and `.upholds` directories. Owners of those namespaces enter the
 protected closure before their prerequisites are considered, until it stops
 growing. Symbolic replacement targets use the same protected names.
+Configuration recognition covers all eleven systemd unit suffixes: `service`,
+`socket`, `device`, `mount`, `automount`, `swap`, `target`, `path`, `timer`,
+`slice` and `scope`. It is independent of replacement name syntax, so a
+protected topology name containing `:` also protects its configuration paths.
 Discovered canonical identities and aliases also join the closure when they
 match protected template/instance families, before their prerequisites are
 expanded. An unrelated template instance is not protected by that rule.

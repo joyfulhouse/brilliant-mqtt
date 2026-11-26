@@ -835,3 +835,209 @@ def test_artifact_query_or_encoded_fragment_character_is_not_a_fragment(path: st
     document = manifest_document()
     document["artifact"]["url"] = "https://example.invalid/" + path
     assert parse_manifest(encoded(document), policy()).id == "demo"
+
+
+_CONFIGURATION_SUFFIXES = (
+    "service",
+    "socket",
+    "device",
+    "mount",
+    "automount",
+    "swap",
+    "target",
+    "path",
+    "timer",
+    "slice",
+    "scope",
+)
+_OMITTED_CONFIGURATION_SUFFIXES = ("device", "mount", "automount", "swap", "path", "scope")
+
+
+def configuration_owner_fixture(
+    core_name: str,
+    alias_name: str,
+    component: str,
+    *,
+    prerequisite: bool = False,
+    protect_by_path: bool = False,
+    unit_file: bool = False,
+) -> tuple[bytes, ValidationPolicy]:
+    document = manifest_document()
+    document["replaces"] = [replacement()]
+    allowed = Replacement("optional", "systemd", "optional.service", "fake_stock")
+    core = UnitTopology(core_name, aliases=(alias_name,))
+    nodes = [UnitTopology("message_bus.service", dependencies=(core_name,)), core]
+    if protect_by_path:
+        nodes = [replace(core, paths=("/run/brilliant-mqtt/fixture-core",))]
+    mutation_path = f"/etc/systemd/system/{component}/override.conf"
+    if unit_file:
+        mutation_path = f"/etc/systemd/system/{component}"
+    if prerequisite:
+        nodes.extend(
+            (
+                UnitTopology(
+                    "namespace_owner.service",
+                    paths=(mutation_path,),
+                    dependencies=("optional.service",),
+                ),
+                UnitTopology("optional.service"),
+            )
+        )
+    else:
+        nodes.append(UnitTopology("optional.service", paths=(mutation_path,)))
+    return encoded(document), policy(
+        replacement_allowlist=frozenset({allowed}), topology=tuple(nodes)
+    )
+
+
+@pytest.mark.parametrize("suffix", _OMITTED_CONFIGURATION_SUFFIXES)
+@pytest.mark.parametrize("namespace", ["unit_file", "d", "wants", "requires", "upholds"])
+@pytest.mark.parametrize("alias", [False, True])
+@pytest.mark.parametrize("prerequisite", [False, True])
+def test_all_omitted_configuration_types_protect_named_namespaces(
+    suffix: str,
+    namespace: str,
+    alias: bool,
+    prerequisite: bool,
+) -> None:
+    core_name = f"fixture-core.{suffix}"
+    alias_name = f"fixture-alias.{suffix}"
+    name = alias_name if alias else core_name
+    component = name if namespace == "unit_file" else f"{name}.{namespace}"
+    raw, qualified = configuration_owner_fixture(
+        core_name,
+        alias_name,
+        component,
+        prerequisite=prerequisite,
+        unit_file=namespace == "unit_file",
+    )
+    with pytest.raises(PluginValidationError):
+        parse_manifest(raw, qualified)
+
+
+@pytest.mark.parametrize("suffix", _OMITTED_CONFIGURATION_SUFFIXES)
+@pytest.mark.parametrize("alias", [False, True])
+@pytest.mark.parametrize("prerequisite", [False, True])
+def test_nonreplacement_unit_types_protect_hyphen_prefix_dropins(
+    suffix: str,
+    alias: bool,
+    prerequisite: bool,
+) -> None:
+    component = f"{'alias' if alias else 'core'}-.{suffix}.d"
+    raw, qualified = configuration_owner_fixture(
+        f"core-fixture.{suffix}", f"alias-fixture.{suffix}", component, prerequisite=prerequisite
+    )
+    with pytest.raises(PluginValidationError):
+        parse_manifest(raw, qualified)
+
+
+@pytest.mark.parametrize("name", ["core-fixture", "alias-fixture"])
+@pytest.mark.parametrize("instance", ["", "panel"])
+@pytest.mark.parametrize("prerequisite", [False, True])
+def test_path_unit_template_and_instance_configuration_is_protected(
+    name: str,
+    instance: str,
+    prerequisite: bool,
+) -> None:
+    raw, qualified = configuration_owner_fixture(
+        "core-fixture@.path",
+        "alias-fixture@.path",
+        f"{name}@{instance}.path.d",
+        prerequisite=prerequisite,
+    )
+    with pytest.raises(PluginValidationError):
+        parse_manifest(raw, qualified)
+
+
+@pytest.mark.parametrize("suffix", ["service", "mount", "path"])
+@pytest.mark.parametrize("alias", [False, True])
+@pytest.mark.parametrize("prerequisite", [False, True])
+def test_configuration_recognition_does_not_inherit_replacement_name_characters(
+    suffix: str,
+    alias: bool,
+    prerequisite: bool,
+) -> None:
+    core_name = f"fixture:core.{suffix}"
+    alias_name = f"fixture:alias.{suffix}"
+    component = f"{alias_name if alias else core_name}.d"
+    raw, qualified = configuration_owner_fixture(
+        core_name, alias_name, component, prerequisite=prerequisite
+    )
+    with pytest.raises(PluginValidationError):
+        parse_manifest(raw, qualified)
+
+
+@pytest.mark.parametrize("suffix", _CONFIGURATION_SUFFIXES)
+@pytest.mark.parametrize("colon", [False, True])
+def test_unrelated_configuration_remains_eligible_with_protected_prerequisite(
+    suffix: str,
+    colon: bool,
+) -> None:
+    component = f"unrelated{':owner' if colon else '-owner'}.{suffix}.d"
+    raw, qualified = configuration_owner_fixture(
+        f"fixture-core.{suffix}", f"fixture-alias.{suffix}", component
+    )
+    assert parse_manifest(raw, qualified).replaces == (
+        Replacement("optional", "systemd", "optional.service", "fake_stock"),
+    )
+
+
+@pytest.mark.parametrize("suffix", ["path", "mount"])
+@pytest.mark.parametrize("prerequisite", [False, True])
+def test_runtime_path_protected_nonservice_alias_configuration_is_protected(
+    suffix: str,
+    prerequisite: bool,
+) -> None:
+    raw, qualified = configuration_owner_fixture(
+        f"core.{suffix}",
+        f"core_alias.{suffix}",
+        f"core_alias.{suffix}.d",
+        prerequisite=prerequisite,
+        protect_by_path=True,
+    )
+    with pytest.raises(PluginValidationError):
+        parse_manifest(raw, qualified)
+
+
+@pytest.mark.parametrize(
+    "identity",
+    [
+        "optional.device",
+        "optional.mount",
+        "optional.automount",
+        "optional.swap",
+        "optional.path",
+        "optional.scope",
+        "optional:fixture.service",
+    ],
+)
+def test_configuration_support_does_not_expand_replacement_identity_grammar(
+    identity: str,
+) -> None:
+    document = manifest_document()
+    document["replaces"] = [replacement(identity)]
+    allowed = Replacement("optional", "systemd", identity, "fake_stock")
+    qualified = policy(
+        replacement_allowlist=frozenset({allowed}), topology=(UnitTopology(identity),)
+    )
+    with pytest.raises(PluginValidationError):
+        parse_manifest(encoded(document), qualified)
+
+
+@pytest.mark.parametrize("suffix", _OMITTED_CONFIGURATION_SUFFIXES)
+def test_configuration_support_does_not_expand_replacement_dependency_grammar(
+    suffix: str,
+) -> None:
+    document = manifest_document()
+    document["replaces"] = [replacement()]
+    dependency = f"unrelated.{suffix}"
+    allowed = Replacement("optional", "systemd", "optional.service", "fake_stock")
+    qualified = policy(
+        replacement_allowlist=frozenset({allowed}),
+        topology=(
+            UnitTopology("optional.service", dependencies=(dependency,)),
+            UnitTopology(dependency),
+        ),
+    )
+    with pytest.raises(PluginValidationError):
+        parse_manifest(encoded(document), qualified)
