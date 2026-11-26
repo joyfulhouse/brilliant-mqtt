@@ -197,6 +197,111 @@ async def test_mesh_issue_sink_exception_fails_closed_and_wired_is_best_effort()
     await harness.adapter.shutdown()
 
 
+@pytest.mark.parametrize("replay", ["success", "error", "cross_owner"])
+async def test_issued_ticket_rebinding_preserves_native_work_and_fails_closed_on_replay_error(
+    monkeypatch: pytest.MonkeyPatch,
+    replay: str,
+) -> None:
+    from brilliant_mqtt.write_admission import TicketAdoptionError
+
+    harness = _StartHarness(monkeypatch, gated_writes=True)
+    adapter = RpcBusAdapter()
+    await adapter.start()
+    owner = owner_for(adapter)
+    ticket = bind(adapter, owner)
+    caller = asyncio.create_task(
+        adapter.set_variables("ble_mesh", "p", [VarSet("on", "0")], ticket=ticket)
+    )
+    issues: list[CaptureProvenance] = []
+    settlements: list[tuple[str | BaseException, CaptureProvenance | None, bool]] = []
+    refusals: list[bool] = []
+
+    def issue(boundary: CaptureProvenance) -> None:
+        issues.append(boundary)
+        if replay == "error":
+            raise ValueError("issue replay dispatch failed")
+
+    def rebind() -> None:
+        adapter.bind_mesh_ticket(
+            ticket,
+            owner_for(adapter) if replay == "cross_owner" else owner,
+            on_issue=issue,
+            on_settle=lambda outcome: settlements.append(
+                (outcome, ticket.returned_at, adapter._write_locks["ble_mesh"].locked())
+            ),
+            on_refused=lambda: refusals.append(True),
+        )
+
+    try:
+        await _settle()
+        issued = ticket.issued_at
+        assert issued is not None
+        original_settle = ticket._on_settled
+        native_tasks = set(adapter._write_tasks)
+        assert len(native_tasks) == 1
+        if replay == "cross_owner":
+            with pytest.raises(TicketAdoptionError):
+                rebind()
+            assert issues == []
+        elif replay == "error":
+            with pytest.raises(ValueError, match="issue replay dispatch failed"):
+                rebind()
+            assert issues == [issued]
+        else:
+            rebind()
+            assert issues == [issued]
+        if replay != "cross_owner":
+            assert issues[0] is issued
+        if replay != "success":
+            assert ticket._on_settled is original_settle
+        assert adapter.mesh_admission_open is (replay != "error")
+        assert adapter.mesh_owner_live(owner) is (replay != "error")
+        assert adapter.consume_mesh_fatal() is (replay == "error")
+        assert not adapter.consume_mesh_fatal()
+        assert adapter.mesh_admission_open is (replay != "error")
+        assert ticket.mesh_owner is owner
+        assert ticket.issued_at is issued
+        assert not ticket.settled
+        assert ticket.outcome is None
+        assert ticket.returned_at is None
+        assert adapter.mesh_creation_floor == 0
+        assert adapter.outstanding_mesh_ticket("p") is ticket
+        assert set(adapter._write_tasks) == native_tasks
+        assert all(not task.done() and not task.cancelled() for task in native_tasks)
+        assert adapter._write_locks["ble_mesh"].locked()
+        assert harness.writes_in_flight == 1
+        assert harness.write_starts == ["ble_mesh"]
+        assert not caller.done()
+        assert settlements == []
+        assert refusals == []
+
+        harness.write_release.set()
+        assert await caller == "'ok'"
+        returned = ticket.returned_at
+        assert returned is not None
+        assert returned.sequence > issued.sequence
+        assert ticket.issued_at is issued
+        assert ticket.outcome == "'ok'"
+        assert ticket.accepted_at is returned
+        assert adapter.mesh_creation_floor == returned.sequence
+        assert adapter.outstanding_mesh_ticket("p") is None
+        assert not adapter._write_locks["ble_mesh"].locked()
+        assert harness.writes_in_flight == 0
+        assert harness.write_starts == ["ble_mesh"]
+        if replay != "success":
+            assert settlements == []
+            assert owner.view.phase is Phase.ACCEPTED
+        else:
+            assert settlements == [("'ok'", returned, True)]
+        assert len(issues) == (0 if replay == "cross_owner" else 1)
+        assert refusals == []
+        assert not adapter.consume_mesh_fatal()
+    finally:
+        harness.write_release.set()
+        await asyncio.gather(caller, return_exceptions=True)
+        await adapter.shutdown()
+
+
 @pytest.mark.parametrize("outcome", ["ok", "rejected", "timeout"])
 async def test_native_outcome_is_stored_before_finish_waiter_and_lock_release(
     monkeypatch: pytest.MonkeyPatch,

@@ -816,11 +816,15 @@ class RpcBusAdapter:
         on_settle: Callable[[str | BaseException], None],
         on_refused: Callable[[], None],
     ) -> None:
-        """Install owner callbacks with fail-closed native-return dispatch."""
+        """Install owner callbacks with fail-closed issue replay and return dispatch."""
         if ticket.mesh_owner is not None and ticket.mesh_owner is not owner:
             raise TicketAdoptionError("mesh ticket belongs to another owner")
         ticket.mesh_owner = owner
-        ticket.set_issue_callback(on_issue)
+        try:
+            ticket.set_issue_callback(on_issue)
+        except Exception as error:
+            self._fail_mesh(error)
+            raise
         ticket._on_refused = on_refused
         self.set_mesh_settle_callback(ticket, on_settle)
 
