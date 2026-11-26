@@ -7,8 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-11-26
+
+Prerelease candidate. This release updates the Home Assistant integration to
+0.13.0 and the bundled on-panel agent to 0.12.0 with release ordinal 7. The
+agent minor version includes the new optional features below as well as the
+watchdog, outbox and screen-brightness fixes. The separate voice payload stays
+at 0.1.1. Installing the integration alone does not update panel code; use the
+panel Update entity or a canaried redeploy deliberately, pilot panel first,
+then observe and finalize the retained baseline before a wider rollout.
+
 ### Added
 
+- Virtual HMI / detached sliders for wired faceplates and BLE mesh switches:
+  virtual dimmers, single/double/triple-tap and gesture events, with saved
+  original slider bindings and mesh-leader-only binding writes. Configure
+  `VIRTUAL_SLIDERS_JSON` explicitly; existing sliders are unchanged by default
+  (#249).
+- Opt-in panel camera snapshots and TV Ambilight sampling
+  (`AMBILIGHT_ENABLED=1`), with an HA camera, capture button, sampling switch,
+  dominant-color sensor, crop controls and a 0.25–10 second polling interval.
+  Capture requires current, unambiguous panel privacy-off evidence. Images
+  are published without retention; disabling the feature retires its owned
+  discovery and retained state (#279, from #251).
 - Experimental, per-panel opt-in for aarch64 / i350 panels during Add panel.
   Official support remains armv7l only; the architecture gate is unchanged
   unless that panel's opt-in is checked (default off). Voice is refused on
@@ -26,6 +47,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Screen brightness now exposes the full panel bus range of 0–15, allowing
+  values above 10 without an unknown entity or clamping writes at 10 (#258).
+- Virtual slider backups remain durable until read-back confirms restoration;
+  failed or superseded restoration keeps the binding available for retry
+  (#269).
+- Add panel checks panel-side broker DNS/TCP reachability before arming a
+  baseline. Broker settings reject HA-internal add-on addresses and loopback,
+  explain the attempted endpoint and connection failure, and offer explicit
+  removal of verifiably idle Add panel flows. Name and confirmation steps
+  expire after 15 minutes when provisioning has not started (#252).
 - A bridge that recovers its local bus but cannot record that success in the
   phase marker no longer leaves a stale failed-attempt record behind. If
   atomic replacement, in-place rewrite and unlink all fail, the bridge empties
@@ -34,7 +65,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   loop, even after a watchdog restart. A failed bus attempt never empties the
   marker, so genuine crash-loop recovery (#133) is unchanged. The lease stream
   is now unbuffered so no stale bytes can be written back after the truncate.
-  This closes [#143](https://github.com/joyfulhouse/brilliant-mqtt/issues/143)
+  This addresses [#143](https://github.com/joyfulhouse/brilliant-mqtt/issues/143),
   except when the kernel refuses the truncate or the bridge dies in the few
   system calls between the successful read and the truncate; see
   `docs/issue-143-lease-revocation.md`.
@@ -54,8 +85,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now fail with a clear "armv7l-only" error before changing the panel, including
   repair of an existing payload and wake-word updates. Inspection and removal
   remain available (#155).
-### Fixed
-
 - One scene or mode outbox frame that the broker always disconnects on (for
   example, one over an operator `max_packet_size`) no longer wedges the outbox
   and tears the MQTT session down every few seconds. A disconnect counts
@@ -107,6 +136,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Add Brilliant panel can clear an already stranded `armed` / `staged`
   baseline that has no execution journal and no panel subentry, after the
   panel still matches the capture and no candidate release directory exists.
+  The recovery is regression-tested against an actual 0.12.2 retained-record
+  format: upgrade the integration, use **Add Brilliant panel**, authenticate
+  the affected panel again, and confirm the named unactivated-baseline discard
+  only when offered. If a journal exists, use the offered onboarding rollback
+  and then finalize its verified restored baseline. Preserve recovery records
+  if proof refuses; do not delete HA storage or target another panel's canary
+  actions (#248, #272, #284; Refs #282).
+
+### Known Limitations
+
+- aarch64 / i350 remains experimental. OTA persistence of `/var` and HA Control
+  remain unverified; voice is armv7l-only. Positive i.MX6 controller-binding
+  confirmation on the armv7 pilot is still outstanding before stable release
+  qualification (#155, #230, #281).
+- Cancelling an onboarding confirmation request while it waits for storage
+  releases its busy marker but may leave its idle-expiry timer unset. No
+  install starts; remove the idle flow explicitly from broker settings if it
+  blocks a broker change (non-blocking LOW from #252).
+- The component-plugin and stock-service replacement design is documentation
+  only; this release does not implement a plugin system (#288, Refs #283).
 
 ## [0.12.2] - 2026-11-17
 
@@ -1448,7 +1497,8 @@ panel redeploy is needed.
 - JoyfulHouse OSS docs standard: LICENSE (MIT), INSTALL.md, CHANGELOG.md,
   FUNDING.yml, CODEOWNERS, and the canonical `docs/` set.
 
-[Unreleased]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.12.2...HEAD
+[Unreleased]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.12.2...v0.13.0
 [0.12.2]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.12.1...v0.12.2
 [0.12.1]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/joyfulhouse/brilliant-mqtt/compare/v0.11.6...v0.12.0
