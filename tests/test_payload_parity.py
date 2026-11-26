@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import re
 import subprocess
 from pathlib import Path
+
+import pytest
 
 import brilliant_mqtt
 
@@ -104,6 +108,31 @@ def test_project_source_and_payload_versions_match_release() -> None:
     assert version_match.group(1) == EXPECTED_PAYLOAD_VERSION
     assert brilliant_mqtt.__version__ == EXPECTED_PAYLOAD_VERSION
     assert PAYLOAD_VERSION_FILE.read_text(encoding="utf-8").strip() == EXPECTED_PAYLOAD_VERSION
+
+
+@pytest.mark.parametrize(
+    ("tag_template", "accepted"),
+    [("v{version}", True), ("{version}", False), ("v0.0.0", False), ("vv{version}", False)],
+)
+def test_release_tag_guard_preserves_voice_asset_url(tag_template: str, accepted: bool) -> None:
+    workflow = REPOSITORY_ROOT / ".github/workflows/release.yml"
+    source = workflow.read_text(encoding="utf-8")
+    marker = "      - name: Guard — manifest version must match the release tag\n        run: |\n"
+    guard = source.split(marker, maxsplit=1)[1].split("      - name:", maxsplit=1)[0]
+    commands = "\n".join(line[10:] for line in guard.splitlines() if line.startswith("          "))
+    manifest = json.loads(
+        (REPOSITORY_ROOT / "custom_components/brilliant_mqtt/manifest.json").read_text()
+    )
+    tag = tag_template.format(version=manifest["version"])
+    result = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", commands],
+        cwd=REPOSITORY_ROOT,
+        env={**os.environ, "GITHUB_REF_NAME": tag},
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert (result.returncode == 0) is accepted, result.stdout + result.stderr
 
 
 def test_preflight_and_retained_topic_modules_are_packaged_byte_for_byte() -> None:

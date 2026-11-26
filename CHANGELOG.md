@@ -14,8 +14,13 @@ Prerelease candidate. This release updates the Home Assistant integration to
 agent minor version includes the new optional features below as well as the
 watchdog, outbox and screen-brightness fixes. The separate voice payload stays
 at 0.1.1. Installing the integration alone does not update panel code; use the
-panel Update entity or a canaried redeploy deliberately, pilot panel first,
-then observe and finalize the retained baseline before a wider rollout.
+panel Update entity or a canaried redeploy deliberately, pilot panel first.
+Before installing this agent on any armv7 panel (including a first install),
+complete the read-only controller-binding check in
+`docs/brilliant-panel/i350-support.md` on the designated pilot. Then observe
+and finalize the retained baseline before a wider rollout. The integration
+prerelease and its HA-side baseline recovery can be used without updating
+existing panel code.
 
 ### Added
 
@@ -79,8 +84,8 @@ then observe and finalize the retained baseline before a wider rollout.
   It now requires the `mmc1` alias target to be bound to `sdhci-esdhc-imx`;
   driver registration alone is insufficient. Without binding evidence the
   reset is skipped and logged as a warning, and the guarded reboot still runs
-  (#155). Production binding evidence on the armv7 pilot remains a release
-  prerequisite.
+  (#155). Production binding evidence on the armv7 pilot remains an agent
+  installation prerequisite, including for prerelease deployments.
 - Voice upload, configuration, enable and restart on a panel that is not armv7l
   now fail with a clear "armv7l-only" error before changing the panel, including
   repair of an existing payload and wake-word updates. Inspection and removal
@@ -139,8 +144,9 @@ then observe and finalize the retained baseline before a wider rollout.
   The recovery is regression-tested against an actual 0.12.2 retained-record
   format: upgrade the integration, use **Add Brilliant panel**, authenticate
   the affected panel again, and confirm the named unactivated-baseline discard
-  only when offered. If a journal exists, use the offered onboarding rollback
-  and then finalize its verified restored baseline. Preserve recovery records
+  only when offered, to run the panel proof before discard. Continue only on
+  success. Use onboarding rollback only if offered for the journal, then
+  finalize its verified restored baseline. Preserve recovery records
   if proof refuses; do not delete HA storage or target another panel's canary
   actions (#248, #272, #284; Refs #282).
 
@@ -148,12 +154,19 @@ then observe and finalize the retained baseline before a wider rollout.
 
 - aarch64 / i350 remains experimental. OTA persistence of `/var` and HA Control
   remain unverified; voice is armv7l-only. Positive i.MX6 controller-binding
-  confirmation on the armv7 pilot is still outstanding before stable release
-  qualification (#155, #230, #281).
+  confirmation on the armv7 pilot is still outstanding and must precede any
+  installation of this agent on armv7 panels (#155, #230, #281).
 - Cancelling an onboarding confirmation request while it waits for storage
   releases its busy marker but may leave its idle-expiry timer unset. No
   install starts; remove the idle flow explicitly from broker settings if it
   blocks a broker change (non-blocking LOW from #252).
+### Documentation
+
+- Updated [one-panel broker-handshake troubleshooting](docs/TROUBLESHOOTING.md)
+  and its limits on ARP attribution (#227, #263), plus the
+  [upstream diyHue event-reflection proposal](docs/brilliant-panel/diyhue-event-reflection-proposal.md)
+  and qualification/sample-count guidance (#228, #264). These are guide changes,
+  with no new upstream event-reflection runtime in this release.
 - The component-plugin and stock-service replacement design is documentation
   only; this release does not implement a plugin system (#288, Refs #283).
 
