@@ -2192,6 +2192,8 @@ class PanelProvisioner:
         host: str | None,
         password: str | None,
         record_failures: bool,
+        *,
+        expected_retained: RetainedRollback | None = None,
     ) -> PanelShell:
         request = record.panel_request
         await self._async_admit_connection(request)
@@ -2200,6 +2202,13 @@ class PanelProvisioner:
             if password is not None and password != current_password:
                 raise PanelProvisioningError("rollback_credentials_unavailable")
             password = current_password
+        if expected_retained is not None:
+            await self._async_assert_named_live(request)
+            if (
+                await self._journal.async_load() != record
+                or await self._journal.async_retained(record.transaction_id) != expected_retained
+            ):
+                raise PanelProvisioningError("provisioning_recovery_required")
         try:
             return self._shell_factory(
                 host if host is not None else request.host,
@@ -2213,7 +2222,12 @@ class PanelProvisioner:
             raise PanelProvisioningError(code) from None
 
     async def _async_finish_verified_restore(
-        self, record: ProvisioningRecord, host: str, password: str
+        self,
+        record: ProvisioningRecord,
+        host: str,
+        password: str,
+        *,
+        expected_retained: RetainedRollback,
     ) -> None:
         """Complete a rollback that crashed after durable verified-restore evidence.
 
@@ -2222,11 +2236,16 @@ class PanelProvisioner:
         cleared, exactly as the interrupted rollback would have done.
         """
         await self._async_assert_named_live(record.panel_request)
-        retained = await self._journal.async_retained(record.transaction_id)
-        if retained is None or await self._journal.async_load() != record:
+        retained = expected_retained
+        if (
+            await self._journal.async_retained(record.transaction_id) != retained
+            or await self._journal.async_load() != record
+        ):
             raise PanelProvisioningError("provisioning_recovery_required")
         staged, _snapshot = await self._async_recovery_artifacts(record, False)
-        shell = await self._async_recovery_shell(record, host, password, False)
+        shell = await self._async_recovery_shell(
+            record, host, password, False, expected_retained=retained
+        )
         primary: PanelProvisioningError | None = None
         cancellation: asyncio.CancelledError | None = None
         try:
@@ -2340,7 +2359,9 @@ class PanelProvisioner:
                         retained.state == "restored"
                         and current.phase is ProvisioningPhase.ROLLBACK_PENDING
                     ):
-                        await self._async_finish_verified_restore(current, host, password)
+                        await self._async_finish_verified_restore(
+                            current, host, password, expected_retained=retained
+                        )
                     else:
                         await self._async_recover_record(
                             current, _noop_progress, host=host, password=password
@@ -2553,7 +2574,7 @@ class PanelProvisioner:
         try:
             if retained.state == "restored":
                 await self._async_finish_verified_restore(
-                    record, record.panel_request.host, password
+                    record, record.panel_request.host, password, expected_retained=retained
                 )
             else:
                 await self._async_recover_record(

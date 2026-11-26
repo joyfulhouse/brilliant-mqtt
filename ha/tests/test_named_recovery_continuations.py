@@ -21,7 +21,7 @@ from custom_components.brilliant_mqtt.connection_owner import (
     async_resolve_panel_owner,
 )
 from custom_components.brilliant_mqtt.connection_state import ConnectionIntent
-from custom_components.brilliant_mqtt.const import CONF_HOST, CONF_SSH_HOST_KEY
+from custom_components.brilliant_mqtt.const import CONF_HOST, CONF_ROOT_PASSWORD, CONF_SSH_HOST_KEY
 from custom_components.brilliant_mqtt.entry_data import LegacyPanelStore
 from custom_components.brilliant_mqtt.manager import PanelManager
 from custom_components.brilliant_mqtt.panel_ops import PanelOpError
@@ -310,6 +310,181 @@ async def test_restored_scope_change_during_login_resolution_refuses_contact(
     assert await owner.journal.async_retained(row.record.transaction_id) == replace(
         row, state="rollback_failed"
     )
+
+
+@pytest.mark.parametrize("change", ["evidence", "scope", "owner_host", "intent", "password", None])
+async def test_final_cleanup_login_resolution_preserves_admitted_authority(
+    hass: HomeAssistant,
+    durable_connection_storage: None,
+    monkeypatch: pytest.MonkeyPatch,
+    change: str | None,
+) -> None:
+    entry, owner = _owner(hass)
+    row = await _scoped(owner, restored=True)
+    provisioner, harness, transport, credentials = _runner(hass, owner.journal, monkeypatch)
+    calls = 0
+    expected = row
+
+    async def resolve(request: Any) -> str | None:
+        nonlocal calls, expected
+        password = await fm._async_rollback_credential(hass, request)
+        calls += 1
+        if calls == 2:
+            if change == "evidence":
+                await owner.journal.async_retained_state(
+                    row.record.transaction_id, "restored", evidence="c" * 32
+                )
+                expected = replace(row, recovery_deployment_id="c" * 32)
+            elif change == "scope":
+                await owner.journal.scoped(row.record.transaction_id).async_complete_rollback(
+                    row.record.transaction_id, verified=True
+                )
+                expected = replace(row, recovery_record=None)
+            elif change in {"owner_host", "password"}:
+                subentry = entry.subentries[str(owner.owner.subentry_id)]
+                key = CONF_HOST if change == "owner_host" else CONF_ROOT_PASSWORD
+                value = "later.test" if change == "owner_host" else "new-login"
+                hass.config_entries.async_update_subentry(
+                    entry, subentry, data={**subentry.data, key: value}
+                )
+                if change == "password":
+                    password = value
+            elif change == "intent":
+                await owner.journal.async_begin_connection_change(
+                    ConnectionIntent(
+                        str(uuid4()),
+                        owner.owner,
+                        owner.prior,
+                        replace(owner.prior, host="later.test"),
+                        (str(row.record.transaction_id),),
+                    )
+                )
+        return password
+
+    credentials.side_effect = resolve
+    if change is None:
+        await provisioner.async_rollback(row.record.transaction_id, expected_owner=owner.owner)
+        assert await owner.journal.async_retained(row.record.transaction_id) == replace(
+            row, recovery_record=None
+        )
+        transport.assert_called_once()
+        assert [event[0] for event in harness.events] == [
+            "shell_connect",
+            "cleanup_staged",
+            "shell_close",
+        ]
+    else:
+        code = {
+            "evidence": "provisioning_recovery_required",
+            "scope": "provisioning_recovery_required",
+            "owner_host": "baseline_owner_mismatch",
+            "intent": "address_change_incomplete",
+            "password": "rollback_credentials_unavailable",
+        }[change]
+        with pytest.raises(pp.PanelProvisioningError, match=code):
+            await provisioner.async_rollback(row.record.transaction_id, expected_owner=owner.owner)
+        assert await owner.journal.async_retained(row.record.transaction_id) == expected
+        transport.assert_not_called()
+        assert not harness.events
+    assert calls == 2
+
+
+@pytest.mark.parametrize("change_evidence", [False, True])
+async def test_cleanup_helper_keeps_callers_proof_across_initial_owner_await(
+    hass: HomeAssistant,
+    durable_connection_storage: None,
+    monkeypatch: pytest.MonkeyPatch,
+    change_evidence: bool,
+) -> None:
+    _entry, owner = _owner(hass)
+    row = await _scoped(owner, restored=True)
+    provisioner, harness, transport, _credentials = _runner(hass, owner.journal, monkeypatch)
+    resolver = provisioner._named_owner_resolver
+    calls = 0
+
+    async def resolve_then_change(request: Any) -> Any:
+        nonlocal calls
+        assert resolver is not None
+        result = await resolver(request)
+        calls += 1
+        # Binding and scoped admission precede the helper's first owner await.
+        if calls == 3 and change_evidence:
+            await owner.journal.async_retained_state(
+                row.record.transaction_id, "restored", evidence="c" * 32
+            )
+        return result
+
+    monkeypatch.setattr(provisioner, "_named_owner_resolver", resolve_then_change)
+    if change_evidence:
+        with pytest.raises(pp.PanelProvisioningError, match="provisioning_recovery_required"):
+            await provisioner.async_rollback(row.record.transaction_id, expected_owner=owner.owner)
+        assert await owner.journal.async_retained(row.record.transaction_id) == replace(
+            row, recovery_deployment_id="c" * 32
+        )
+        transport.assert_not_called()
+        assert not harness.events
+    else:
+        await provisioner.async_rollback(row.record.transaction_id, expected_owner=owner.owner)
+        assert await owner.journal.async_retained(row.record.transaction_id) == replace(
+            row, recovery_record=None
+        )
+        transport.assert_called_once()
+
+
+@pytest.mark.parametrize("change_evidence", [False, True])
+async def test_ownerless_cleanup_keeps_separately_admitted_proof(
+    hass: HomeAssistant,
+    durable_connection_storage: None,
+    monkeypatch: pytest.MonkeyPatch,
+    change_evidence: bool,
+) -> None:
+    journal = ProvisioningJournal(hass)
+    original = _baseline()
+    await journal.async_create(original)
+    await journal.async_retained_state(original.transaction_id, "restore_requested")
+    await journal.async_begin_restore(original.transaction_id, original.panel_request.root_password)
+    await journal.async_retained_state(original.transaction_id, "restored", evidence=_EVIDENCE)
+    current = await journal.async_load()
+    row = await journal.async_retained(original.transaction_id)
+    assert current is not None and row is not None
+    provisioner, harness, transport, credentials = _runner(hass, journal, monkeypatch)
+    harness.lookup = pp.TransactionLookup(pp.TransactionLookupState.FLOW_ABORTED_OR_ABSENT)
+    monkeypatch.setattr(provisioner, "_retained_owner_exists", AsyncMock(return_value=False))
+    calls = 0
+
+    async def admit_then_change(**kwargs: Any) -> None:
+        nonlocal calls
+        await journal.async_assert_connection_available(**kwargs)
+        calls += 1
+        # The dedicated flow proves its authority twice before entering cleanup.
+        if calls == 3 and change_evidence:
+            await journal.async_retained_state(
+                original.transaction_id, "restored", evidence="c" * 32
+            )
+
+    monkeypatch.setattr(provisioner, "_connection_admission", admit_then_change)
+    request = current.panel_request
+    identity = await harness.fetch_identity(request.host)
+    if change_evidence:
+        with pytest.raises(pp.PanelProvisioningError, match="provisioning_recovery_required"):
+            await provisioner.async_recover_ownerless_journal(
+                current, request.host, request.root_password, identity
+            )
+        assert await journal.async_retained(original.transaction_id) == replace(
+            row, recovery_deployment_id="c" * 32
+        )
+        assert await journal.async_load() == current
+        transport.assert_not_called()
+        assert not any(event[0] in {"shell_connect", "cleanup_staged"} for event in harness.events)
+    else:
+        await provisioner.async_recover_ownerless_journal(
+            current, request.host, request.root_password, identity
+        )
+        assert await journal.async_retained(original.transaction_id) == row
+        assert await journal.async_load() is None
+        transport.assert_called_once()
+    credentials.assert_not_awaited()
+    assert not any(event[0] == "rollback" for event in harness.events)
 
 
 @pytest.mark.parametrize("reader", ["explicit", "cold", "generic"])
