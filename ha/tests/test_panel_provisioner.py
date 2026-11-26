@@ -564,10 +564,20 @@ class _FakeJournal:
         state: str,
         *,
         evidence: str | None = None,
+        expected: RetainedRollback | None = None,
+        authorize: Callable[[], None] | None = None,
     ) -> None:
         pass
 
-    async def async_begin_restore(self, transaction_id: UUID, root_password: str) -> None:
+    async def async_begin_restore(
+        self,
+        transaction_id: UUID,
+        root_password: str,
+        *,
+        expected: RetainedRollback | None = None,
+        authorize: Callable[[], None] | None = None,
+        manual_action: bool = False,
+    ) -> None:
         assert self.record is not None
         self.record = replace(
             self.record,
@@ -575,7 +585,13 @@ class _FakeJournal:
             phase=ProvisioningPhase.ROLLBACK_PENDING,
         )
 
-    async def async_remove_retained(self, transaction_id: UUID) -> None:
+    async def async_remove_retained(
+        self,
+        transaction_id: UUID,
+        *,
+        expected: RetainedRollback | None = None,
+        authorize: Callable[[], None] | None = None,
+    ) -> None:
         if self.fail_remove_retained:
             raise OSError("retained removal failed")
         current = self.retained.get(transaction_id)
@@ -588,7 +604,13 @@ class _FakeJournal:
         self.events.append(("journal_cleanup_complete",))
         self.record = None
 
-    async def async_complete_absent_rollback(self, transaction_id: UUID) -> None:
+    async def async_complete_absent_rollback(
+        self,
+        transaction_id: UUID,
+        *,
+        expected: RetainedRollback | None = None,
+        authorize: Callable[[], None] | None = None,
+    ) -> None:
         self.events.append(("journal_absent_rollback_complete",))
         self.record = None
 
@@ -700,6 +722,8 @@ class _FakeJournal:
         transaction_id: UUID,
         *,
         verified: bool,
+        expected: RetainedRollback | None = None,
+        authorize: Callable[[], None] | None = None,
     ) -> ProvisioningRecord:
         self.events.append(("journal_rollback_complete", verified))
         assert self.record is not None

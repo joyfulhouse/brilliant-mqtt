@@ -7,7 +7,7 @@ import base64
 import binascii
 import logging
 import re
-from collections.abc import Coroutine, Mapping
+from collections.abc import Callable, Coroutine, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -141,6 +141,10 @@ PROVISIONING_ERROR_CODES = frozenset(
         "health_subscribe_failed",
         "identity_failed",
         "panel_identity_mismatch",
+        "canary_owner_changed",
+        "canary_record_changed",
+        "canary_action_unavailable",
+        "canary_manual_action_required",
         "ownerless_recovery_unavailable",
         "unactivated_baseline_not_proven",
         "ownerless_finalize_reauthentication_required",
@@ -1471,10 +1475,14 @@ class ProvisioningJournal:
         state: str,
         *,
         evidence: str | None = None,
+        expected: RetainedRollback | None = None,
+        authorize: Callable[[], None] | None = None,
     ) -> None:
         records = await self._async_retained_load()
         key = str(_uuid4(transaction_id))
         current = records.get(key)
+        if expected is not None:
+            self._assert_action_row(current, expected, authorize)
         if current is None:
             raise ProvisioningJournalError("journal_transaction_missing")
         allowed = {
@@ -1498,19 +1506,40 @@ class ProvisioningJournal:
         state: str,
         *,
         evidence: str | None = None,
+        expected: RetainedRollback | None = None,
+        authorize: Callable[[], None] | None = None,
     ) -> None:
         async with self._coordinator.lock:
-            await self._async_retained_state(transaction_id, state, evidence=evidence)
+            await self._async_retained_state(
+                transaction_id, state, evidence=evidence, expected=expected, authorize=authorize
+            )
 
     async def async_request_restore(self, transaction_id: UUID) -> None:
         await self.async_retained_state(transaction_id, "restore_requested")
 
-    async def async_begin_restore(self, transaction_id: UUID, root_password: str) -> None:
+    async def async_begin_restore(
+        self,
+        transaction_id: UUID,
+        root_password: str,
+        *,
+        expected: RetainedRollback | None = None,
+        authorize: Callable[[], None] | None = None,
+        manual_action: bool = False,
+    ) -> None:
         async with self._coordinator.lock:
             retained = (await self._async_retained_load()).get(str(_uuid4(transaction_id)))
-            if retained is None or retained.state != "restore_requested":
+            initial_state = "soak" if manual_action else "restore_requested"
+            if (
+                retained is None
+                or retained.state != initial_state
+                or (manual_action and (expected is None or authorize is None))
+            ):
                 raise ProvisioningJournalError("invalid_journal_transition")
             await self._async_reload()
+            if expected is not None:
+                if self._coordinator.record is not None:
+                    raise ProvisioningJournalError("journal_transaction_mismatch")
+                await self._async_assert_action(expected, authorize)
             if (
                 self._coordinator.record is not None
                 and self._coordinator.record.transaction_id != transaction_id
@@ -1527,20 +1556,61 @@ class ProvisioningJournal:
                 panel_request=replace(
                     retained.record.panel_request, root_password=_secret_text(root_password)
                 ),
+                last_error=(
+                    StoredJournalError(stage="recovery", code="canary_manual_action_required")
+                    if manual_action
+                    else retained.record.last_error
+                ),
             )
             if self._coordinator.record != record:
                 await self._async_save(record)
+            if manual_action:
+                # The manual-only marker must survive a cut before retained intent is saved.
+                await self._async_retained_state(
+                    transaction_id, "restore_requested", expected=expected, authorize=authorize
+                )
 
-    async def async_remove_retained(self, transaction_id: UUID) -> None:
+    async def async_remove_retained(
+        self,
+        transaction_id: UUID,
+        *,
+        expected: RetainedRollback | None = None,
+        authorize: Callable[[], None] | None = None,
+    ) -> None:
         async with self._coordinator.lock:
             records = await self._async_retained_load()
             key = str(_uuid4(transaction_id))
+            if expected is not None:
+                self._assert_action_row(records.get(key), expected, authorize)
             if key not in records:
                 return
-            if records[key].state != "finalizing":
+            if records[key].state != "finalizing" and not (
+                expected is not None
+                and authorize is not None
+                and records[key].state in {"soak", "restored"}
+            ):
                 raise ProvisioningJournalError("invalid_journal_transition")
             del records[key]
             await self._async_retained_save(records)
+
+    @staticmethod
+    def _assert_action_row(
+        current: RetainedRollback | None,
+        expected: RetainedRollback,
+        authorize: Callable[[], None] | None,
+    ) -> None:
+        if current != expected:
+            raise ProvisioningJournalError("journal_transaction_mismatch")
+        if authorize is not None:
+            authorize()
+
+    async def _async_assert_action(
+        self, expected: RetainedRollback, authorize: Callable[[], None] | None
+    ) -> None:
+        records = await self._async_retained_load()
+        self._assert_action_row(
+            records.get(str(expected.record.transaction_id)), expected, authorize
+        )
 
     async def async_transition(
         self,
@@ -1620,17 +1690,23 @@ class ProvisioningJournal:
         transaction_id: UUID,
         *,
         verified: bool,
+        expected: RetainedRollback | None = None,
+        authorize: Callable[[], None] | None = None,
     ) -> ProvisioningRecord:
         """Persist rolled_back, then clear only after rollback verification."""
         if verified is not True:
             raise ProvisioningJournalError("rollback_verification_required")
         async with self._coordinator.lock:
             record = await self._async_current(transaction_id)
+            if expected is not None:
+                await self._async_assert_action(expected, authorize)
             if record.phase is ProvisioningPhase.ROLLBACK_PENDING:
                 record = replace(record, phase=ProvisioningPhase.ROLLED_BACK)
                 await self._async_save(record)
             elif record.phase is not ProvisioningPhase.ROLLED_BACK:
                 raise ProvisioningJournalError("invalid_journal_transition")
+            if expected is not None:
+                await self._async_assert_action(expected, authorize)
             await self._async_remove()
             return record
 
@@ -1642,7 +1718,13 @@ class ProvisioningJournal:
                 raise ProvisioningJournalError("invalid_journal_transition")
             await self._async_remove()
 
-    async def async_complete_absent_rollback(self, transaction_id: UUID) -> None:
+    async def async_complete_absent_rollback(
+        self,
+        transaction_id: UUID,
+        *,
+        expected: RetainedRollback | None = None,
+        authorize: Callable[[], None] | None = None,
+    ) -> None:
         """An exact first-install undo has no predecessor MQTT session to verify."""
         async with self._coordinator.lock:
             record = await self._async_current(transaction_id)
@@ -1652,7 +1734,11 @@ class ProvisioningJournal:
             ):
                 raise ProvisioningJournalError("invalid_journal_transition")
             if record.prior_snapshot.baseline is not None:
-                await self._async_retained_state(transaction_id, "restored")
+                await self._async_retained_state(
+                    transaction_id, "restored", expected=expected, authorize=authorize
+                )
+            if expected is not None:
+                await self._async_assert_action(expected, authorize)
             await self._async_remove()
 
     async def async_diagnostics(self) -> dict[str, object]:
