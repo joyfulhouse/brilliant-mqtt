@@ -1,6 +1,6 @@
 [project]
 name = "brilliant-mqtt"
-version = "0.11.4"
+version = "0.12.0"
 description = "Bridge Brilliant Control panels' message bus to MQTT / Home Assistant"
 readme = "README.md"
 license = "MIT"

@@ -67,14 +67,18 @@ followed by `key=value` lines:
 
 The Wi-Fi watchdog requires positive controller binding before its GPIO/usdhc
 reset. A registered `/sys/bus/platform/drivers/sdhci-esdhc-imx` directory alone
-is insufficient. Before releasing that change, confirm on the designated armv7
+is insufficient. Before installing the changed agent/watchdog on any armv7
+panel, including the pilot or a first-time Add panel, confirm on the designated armv7
 pilot that the NUL-terminated device-tree `aliases/mmc1` path resolves to the
 expected controller (for example, `usdhc@02194000` becomes `2194000.mmc`), that
 the driver's controller symlink resolves to an existing device, and that the
 device's `driver` link resolves back to `sdhci-esdhc-imx`. The diagnostic's
 `imx_sdhci_driver_present=1` reports registration only. Missing alias or binding
 evidence downgrades the last rung to reboot-only; live pilot confirmation
-remains required.
+remains required before agent installation. A non-latest integration prerelease
+may be published and installed for HA-side recovery without replacing existing
+panel code. That does not authorize agent installation: complete this read-only
+check before continuing Add panel to installation or running Update/redeploy.
 
 ## Qualification gates
 

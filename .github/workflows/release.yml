@@ -15,9 +15,9 @@ jobs:
       - run: uv python install 3.10
       - name: Guard — manifest version must match the release tag
         run: |
-          TAG="${GITHUB_REF_NAME#v}"
+          TAG="$GITHUB_REF_NAME"
           MANIFEST="$(python -c 'import json; print(json.load(open("custom_components/brilliant_mqtt/manifest.json"))["version"])')"
-          test "$TAG" = "$MANIFEST" || { echo "tag $TAG != manifest $MANIFEST"; exit 1; }
+          test "$TAG" = "v$MANIFEST" || { echo "tag $TAG != v$MANIFEST"; exit 1; }
       - name: Guard — the integration's VOICE_PAYLOAD_VERSION must match brilliant_voice
         run: |
           # The integration builds the voice asset's download URL from this const, so it
