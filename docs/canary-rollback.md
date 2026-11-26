@@ -163,6 +163,20 @@ until it completes; a restart does not reuse the temporary address.
 An interrupted manual rollback is preserved for investigation and cannot be
 resumed through this path.
 
+Before recording a new rollback intent, the action verifies the retained capture
+at the current address. If an interrupted finalize already removed that capture,
+rollback refuses without creating a new execution journal or restoring files.
+
+This manual path refuses restored baselines from an original install or upgrade:
+the stored evidence cannot distinguish an owned restore from completed onboarding
+compensation that had no configured owner. Keep that baseline and its repair for
+maintainer assistance with manual finalization. Restored update baselines remain
+eligible when their fresh restore evidence and current owner are consistent.
+
+If the configured address changes back while the repair form is open, submit a
+new explicitly targeted ordinary action instead. The stale address-change form
+refuses rather than silently changing the action it offers.
+
 If the panel owner, slug, pin, or exact retained record changes during the action,
 or ownership is ambiguous, the action refuses with a typed code and leaves the
 repair available. Another active operation must finish first. Preserve unresolved

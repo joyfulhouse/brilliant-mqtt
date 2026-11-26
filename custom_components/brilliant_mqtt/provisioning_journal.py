@@ -1537,7 +1537,7 @@ class ProvisioningJournal:
                 raise ProvisioningJournalError("invalid_journal_transition")
             await self._async_reload()
             if expected is not None:
-                if self._coordinator.record is not None:
+                if manual_action and self._coordinator.record is not None:
                     raise ProvisioningJournalError("journal_transaction_mismatch")
                 await self._async_assert_action(expected, authorize)
             if (
@@ -1636,12 +1636,17 @@ class ProvisioningJournal:
         self,
         transaction_id: UUID,
         last_error: StoredJournalError,
+        *,
+        expected: RetainedRollback | None = None,
+        authorize: Callable[[], None] | None = None,
     ) -> ProvisioningRecord:
         """Durably replace the redacted failure identity without changing phase."""
         if not isinstance(last_error, StoredJournalError):
             raise _invalid()
         async with self._coordinator.lock:
             record = await self._async_current(transaction_id)
+            if expected is not None:
+                await self._async_assert_action(expected, authorize)
             updated = replace(record, last_error=last_error)
             await self._async_save(updated)
             return updated
@@ -1651,6 +1656,8 @@ class ProvisioningJournal:
         transaction_id: UUID,
         *,
         subentry_id: str,
+        expected: RetainedRollback | None = None,
+        authorize: Callable[[], None] | None = None,
     ) -> ProvisioningRecord:
         """Persist committed, then clear only with proof of subentry creation."""
         if (
@@ -1663,25 +1670,38 @@ class ProvisioningJournal:
             raise ProvisioningJournalError("subentry_creation_not_proven")
         async with self._coordinator.lock:
             record = await self._async_current(transaction_id)
+            if expected is not None:
+                await self._async_assert_action(expected, authorize)
             if record.phase is ProvisioningPhase.PENDING_CONFIG_COMMIT:
                 if record.prior_snapshot.baseline is not None:
-                    await self._async_retained_state(transaction_id, "soak")
+                    await self._async_retained_state(
+                        transaction_id, "soak", expected=expected, authorize=authorize
+                    )
+                    if expected is not None:
+                        expected = replace(expected, state="soak")
                 record = replace(record, phase=ProvisioningPhase.COMMITTED)
                 await self._async_save(record)
             elif record.phase is not ProvisioningPhase.COMMITTED:
                 raise ProvisioningJournalError("invalid_journal_transition")
+            if expected is not None:
+                await self._async_assert_action(expected, authorize)
             await self._async_remove()
             return record
 
     async def async_clear_committed(
         self,
         transaction_id: UUID,
+        *,
+        expected: RetainedRollback | None = None,
+        authorize: Callable[[], None] | None = None,
     ) -> ProvisioningRecord:
         """Retry removal after the durable committed phase already proves creation."""
         async with self._coordinator.lock:
             record = await self._async_current(transaction_id)
             if record.phase is not ProvisioningPhase.COMMITTED:
                 raise ProvisioningJournalError("invalid_journal_transition")
+            if expected is not None:
+                await self._async_assert_action(expected, authorize)
             await self._async_remove()
             return record
 
@@ -1710,12 +1730,20 @@ class ProvisioningJournal:
             await self._async_remove()
             return record
 
-    async def async_complete_cleanup(self, transaction_id: UUID) -> None:
+    async def async_complete_cleanup(
+        self,
+        transaction_id: UUID,
+        *,
+        expected: RetainedRollback | None = None,
+        authorize: Callable[[], None] | None = None,
+    ) -> None:
         """Clear an unactivated candidate after cleanup, without claiming MQTT health."""
         async with self._coordinator.lock:
             record = await self._async_current(transaction_id)
             if record.phase is not ProvisioningPhase.STAGED:
                 raise ProvisioningJournalError("invalid_journal_transition")
+            if expected is not None:
+                await self._async_assert_action(expected, authorize)
             await self._async_remove()
 
     async def async_complete_absent_rollback(
@@ -1737,6 +1765,8 @@ class ProvisioningJournal:
                 await self._async_retained_state(
                     transaction_id, "restored", expected=expected, authorize=authorize
                 )
+                if expected is not None:
+                    expected = replace(expected, state="restored")
             if expected is not None:
                 await self._async_assert_action(expected, authorize)
             await self._async_remove()

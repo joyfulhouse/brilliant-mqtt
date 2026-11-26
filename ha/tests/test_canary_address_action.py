@@ -19,7 +19,10 @@ from custom_components.brilliant_mqtt.const import CONF_HOST, DOMAIN
 from custom_components.brilliant_mqtt.entry_data import FleetPanelStore
 from custom_components.brilliant_mqtt.fleet_manager import FleetManager
 from custom_components.brilliant_mqtt.manager import PanelManager
-from custom_components.brilliant_mqtt.panel_provisioner import PanelProvisioner
+from custom_components.brilliant_mqtt.panel_provisioner import (
+    PanelProvisioner,
+    PanelProvisioningError,
+)
 from custom_components.brilliant_mqtt.provisioning_journal import (
     ProvisioningJournal,
     ProvisioningPhase,
@@ -313,7 +316,8 @@ async def test_queued_old_host_finalize_cannot_replay_after_address_edit(
     await journal.async_retained_state(retained.record.transaction_id, "finalizing")
     monkeypatch.setattr(fleet_manager, "AsyncsshShell", lambda *args: contacts.append(args))
     provisioner = fleet_manager._build_panel_provisioner(hass, harness.fetch_identity)
-    await provisioner.async_recover(expected_record=retained.record)
+    with pytest.raises(PanelProvisioningError, match="provisioning_recovery_required"):
+        await provisioner.async_recover(expected_record=retained.record)
     assert contacts == []
     assert await journal.async_retained(retained.record.transaction_id) is not None
 
@@ -325,10 +329,16 @@ async def test_cancelled_cleanup_settles_without_removing_retained_row(
     retained = (await journal.async_retained_records())[0]
     entered = asyncio.Event()
     release = asyncio.Event()
+    settling = asyncio.Event()
 
     async def finalize(*args: Any) -> None:
         entered.set()
-        await release.wait()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            settling.set()
+            await release.wait()
+            raise
 
     monkeypatch.setattr(harness.operations, "finalize_baseline", finalize)
     action = asyncio.create_task(
@@ -336,7 +346,7 @@ async def test_cancelled_cleanup_settles_without_removing_retained_row(
     )
     await entered.wait()
     action.cancel()
-    await asyncio.sleep(0)
+    await asyncio.wait_for(settling.wait(), 2)
     assert provisioner._lock.locked()
     assert not action.done()
     release.set()
@@ -345,6 +355,12 @@ async def test_cancelled_cleanup_settles_without_removing_retained_row(
     assert await journal.async_retained(retained.record.transaction_id) == retained
     assert not provisioner._lock.locked()
     assert ("shell_close",) in harness.events
+    assert (
+        ir.async_get(hass).async_get_issue(
+            DOMAIN, f"canary_new_address_{retained.record.transaction_id.hex}"
+        )
+        is not None
+    )
 
 
 @pytest.mark.parametrize("problem", ["pin", "slug", "duplicate", "duplicate_key", "active"])
@@ -430,12 +446,18 @@ async def test_cancelled_rollback_keeps_manual_journal_and_verified_evidence(
     retained = (await journal.async_retained_records())[0]
     entered = asyncio.Event()
     release = asyncio.Event()
+    settling = asyncio.Event()
     operation: Callable[..., Any] = getattr(harness.operations, cut)
 
     async def blocked(*args: Any, **kwargs: Any) -> None:
         await operation(*args, **kwargs)
         entered.set()
-        await release.wait()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            settling.set()
+            await release.wait()
+            raise
 
     monkeypatch.setattr(harness.operations, cut, blocked)
     action = asyncio.create_task(
@@ -443,7 +465,7 @@ async def test_cancelled_rollback_keeps_manual_journal_and_verified_evidence(
     )
     await entered.wait()
     action.cancel()
-    await asyncio.sleep(0)
+    await asyncio.wait_for(settling.wait(), 2)
     assert provisioner._lock.locked()
     release.set()
     with pytest.raises(asyncio.CancelledError):

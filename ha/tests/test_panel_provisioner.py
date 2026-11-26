@@ -600,7 +600,13 @@ class _FakeJournal:
         del self.retained[transaction_id]
         self.events.append(("journal_remove_retained",))
 
-    async def async_complete_cleanup(self, transaction_id: UUID) -> None:
+    async def async_complete_cleanup(
+        self,
+        transaction_id: UUID,
+        *,
+        expected: RetainedRollback | None = None,
+        authorize: Callable[[], None] | None = None,
+    ) -> None:
         self.events.append(("journal_cleanup_complete",))
         self.record = None
 
@@ -680,6 +686,9 @@ class _FakeJournal:
         self,
         transaction_id: UUID,
         last_error: StoredJournalError,
+        *,
+        expected: RetainedRollback | None = None,
+        authorize: Callable[[], None] | None = None,
     ) -> ProvisioningRecord:
         self.events.append(("journal_error", last_error.stage, last_error.code))
         if self.fail_record_error:
@@ -694,6 +703,8 @@ class _FakeJournal:
         transaction_id: UUID,
         *,
         subentry_id: str,
+        expected: RetainedRollback | None = None,
+        authorize: Callable[[], None] | None = None,
     ) -> ProvisioningRecord:
         self.events.append(("journal_commit", subentry_id))
         self.complete_commit_started.set()
@@ -708,6 +719,9 @@ class _FakeJournal:
     async def async_clear_committed(
         self,
         transaction_id: UUID,
+        *,
+        expected: RetainedRollback | None = None,
+        authorize: Callable[[], None] | None = None,
     ) -> ProvisioningRecord:
         self.events.append(("journal_clear_committed",))
         assert self.record is not None

@@ -280,11 +280,24 @@ async def test_queued_explicit_rollback_revalidates_its_current_authority(
         report.assert_not_awaited()
     else:
         dispatch.assert_not_awaited()
-        report.assert_awaited_once_with(
-            rollback.transaction_id,
-            original_code="restart_recovery",
-            rollback_code="rollback_credentials_unavailable",
-        )
+        if revoke == "host":
+            report.assert_not_awaited()
+            retained = await journal.async_retained(rollback.transaction_id)
+            assert retained is not None
+            issue = ir.async_get(hass).async_get_issue(DOMAIN, address_issue_id(retained))
+            assert issue is not None and issue.is_fixable
+            assert (
+                ir.async_get(hass).async_get_issue(
+                    DOMAIN, fm._provisioning_repair_issue_id(rollback.transaction_id)
+                )
+                is None
+            )
+        else:
+            report.assert_awaited_once_with(
+                rollback.transaction_id,
+                original_code="restart_recovery",
+                rollback_code="rollback_credentials_unavailable",
+            )
     assert await journal.async_load() == rollback
 
 

@@ -34,7 +34,11 @@ class CanaryAddressRepairFlow(RepairsFlow):
                 transaction = UUID(str(data.get("transaction_id", "")))
                 operation = str(user_input.get("action", ""))
                 await async_run_canary(
-                    self.hass, FleetPanelStore(self.hass, entry, panel), operation, transaction
+                    self.hass,
+                    FleetPanelStore(self.hass, entry, panel),
+                    operation,
+                    transaction,
+                    require_changed_address=True,
                 )
             except PanelProvisioningError as error:
                 errors["base"] = "action_refused"

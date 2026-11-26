@@ -1298,6 +1298,21 @@ class FleetManager:
         except asyncio.CancelledError:
             raise
         except Exception as error:
+            if isinstance(error, PanelProvisioningError) and error.code in {
+                "provisioning_recovery_required",
+                "rollback_credentials_unavailable",
+                "canary_manual_action_required",
+            }:
+                try:
+                    retained = await ProvisioningJournal(self.hass).async_retained(
+                        record.transaction_id
+                    )
+                    if retained is not None and async_defer_address_action(
+                        self.hass, retained, required=error.code == "canary_manual_action_required"
+                    ):
+                        return
+                except Exception:
+                    pass
             await reporter.async_report_rollback_failure(
                 record.transaction_id,
                 original_code="restart_recovery",
@@ -1377,7 +1392,23 @@ class FleetManager:
                         )
                     if password is None:
                         raise EntryDataError("rollback_credentials_unavailable")
-                    await journal.async_begin_restore(retained.record.transaction_id, password)
+
+                    def authorize_restore(expected: RetainedRollback = retained) -> None:
+                        if async_defer_address_action(self.hass, expected):
+                            raise PanelProvisioningError("rollback_credentials_unavailable")
+
+                    try:
+                        await journal.async_begin_restore(
+                            retained.record.transaction_id,
+                            password,
+                            expected=retained,
+                            authorize=authorize_restore,
+                        )
+                    except PanelProvisioningError as error:
+                        if error.code != "rollback_credentials_unavailable":
+                            raise
+                        deferred.add(retained.record.transaction_id)
+                        continue
                     record = await journal.async_load()
                 elif (
                     retained.state == "finalizing"

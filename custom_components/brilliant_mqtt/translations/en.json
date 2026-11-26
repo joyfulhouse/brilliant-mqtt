@@ -866,7 +866,7 @@
           }
         },
         "error": {
-          "action_refused": "The action did not finish. The retained baseline and this repair remain. Check the result code and the canary recovery documentation before retrying."
+          "action_refused": "The action did not finish cleanly. Check the result code and the canary recovery documentation before retrying."
         },
         "abort": {
           "rollback_complete": "Rollback was verified. The retained baseline remains. Open this repair again and choose finalize after checking the panel."

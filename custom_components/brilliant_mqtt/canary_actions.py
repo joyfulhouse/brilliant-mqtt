@@ -15,13 +15,15 @@ from homeassistant.helpers import issue_registry as ir
 from .const import (
     CONF_HOST,
     CONF_IDENTITY_FINGERPRINT,
+    CONF_MANAGEMENT_ID,
     CONF_PANEL,
+    CONF_PROVISIONING_TRANSACTION_ID,
     CONF_ROOT_PASSWORD,
     CONF_SSH_HOST_KEY,
     DOMAIN,
 )
 from .entry_data import FleetPanelStore, PanelConfigStore
-from .panel_provisioner import PanelProvisioningError
+from .panel_provisioner import PanelProvisioningError, _settle
 from .provisioning_journal import ProvisioningJournal, RetainedRollback
 from .shell import HostIdentity, PanelIdentityError
 
@@ -42,12 +44,18 @@ def _candidates(hass: HomeAssistant, retained: RetainedRollback) -> list[tuple[A
             if (
                 owner.data.get(CONF_PANEL) == request.slug
                 or owner.data.get(CONF_IDENTITY_FINGERPRINT) == request.fingerprint
+                or owner.data.get(CONF_MANAGEMENT_ID) == request.fingerprint
+                or owner.data.get(CONF_PROVISIONING_TRANSACTION_ID)
+                == str(retained.record.transaction_id)
                 or _pin(owner.data, fingerprint=request.fingerprint) == identity
             ):
                 result.append((entry, owner))
         if not entry.subentries and (
             entry.data.get(CONF_PANEL) == request.slug
             or entry.data.get(CONF_IDENTITY_FINGERPRINT) == request.fingerprint
+            or entry.data.get(CONF_MANAGEMENT_ID) == request.fingerprint
+            or entry.data.get(CONF_PROVISIONING_TRANSACTION_ID)
+            == str(retained.record.transaction_id)
             or _pin(entry.data, fingerprint=request.fingerprint) == identity
         ):
             result.append((entry, None))
@@ -121,7 +129,12 @@ def async_defer_address_action(
 
 
 async def async_run_canary(
-    hass: HomeAssistant, store: PanelConfigStore, operation: str, transaction: UUID
+    hass: HomeAssistant,
+    store: PanelConfigStore,
+    operation: str,
+    transaction: UUID,
+    *,
+    require_changed_address: bool = False,
 ) -> None:
     """Use one ephemeral current-address grant; never rewrite stored ownership."""
     from .fleet_manager import _get_recovery_provisioner
@@ -140,23 +153,38 @@ async def async_run_canary(
         raise PanelProvisioningError("canary_action_unavailable")
     target = owner.data if owner is not None else store.data
     if request.host != target.get(CONF_HOST):
-        async_defer_address_action(hass, retained, required=True)
         if owner is None:
             raise PanelProvisioningError("canary_owner_changed")
         owner.check(retained)
+        async_defer_address_action(hass, retained, required=True)
         provisioner = _get_recovery_provisioner(
             hass, expected_identity=HostIdentity(request.public_key, request.fingerprint)
         )
-        await provisioner.async_canary_at_address(
-            operation,
-            retained,
-            owner.data[CONF_HOST],
-            owner.data[CONF_ROOT_PASSWORD],
-            lambda: owner.check(retained),
-        )
-        if await ProvisioningJournal(hass).async_retained(transaction) is None:
-            ir.async_delete_issue(hass, DOMAIN, address_issue_id(retained))
+
+        async def clear_retired_issue() -> None:
+            if await ProvisioningJournal(hass).async_retained(transaction) is None:
+                ir.async_delete_issue(hass, DOMAIN, address_issue_id(retained))
+
+        completed = False
+        try:
+            await provisioner.async_canary_at_address(
+                operation,
+                retained,
+                owner.data[CONF_HOST],
+                owner.data[CONF_ROOT_PASSWORD],
+                lambda: owner.check(retained),
+            )
+            completed = True
+        finally:
+            # Late transport errors do not undo confirmed journal retirement.
+            reconciled = await _settle(clear_retired_issue())
+            if reconciled.cancellation is not None:
+                raise reconciled.cancellation from None
+            if reconciled.error is not None and completed:
+                raise PanelProvisioningError("canary_record_changed") from None
         return
+    if require_changed_address:
+        raise PanelProvisioningError("canary_action_unavailable")
     if owner is not None:
         owner.check(retained)
     if request.slug != store.data.get(CONF_PANEL) or request.public_key != store.data.get(
