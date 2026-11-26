@@ -16,7 +16,7 @@ import pytest
 from brilliant_mqtt import bus as bus_mod
 from brilliant_mqtt.bridge import Bridge, _CommandSupersession
 from brilliant_mqtt.commands import VarSet
-from brilliant_mqtt.model import BrilliantDevice
+from brilliant_mqtt.model import BrilliantDevice, CaptureProvenance
 from brilliant_mqtt.write_admission import (
     AdmissionTicket,
     CommandAdmission,
@@ -134,18 +134,26 @@ async def test_pre_acceptance_snapshot_is_not_contradiction(rig: Rig) -> None:
 
 async def test_fresh_contradiction_after_native_return_is_not_lost(rig: Rig) -> None:
     (native,) = rig.adapter._write_tasks
-    delivered: list[bool] = []
+    delivered: list[tuple[bool, bool]] = []
 
     async def deliver() -> None:
-        delivered.append(native.done() and native.result() == "'ok'")
+        delivered.append(
+            (native.done() and native.result() == "'ok'", not rig.mqtt.publish_started.is_set())
+        )
         await rig.notify()
 
     rig.clock.advance(5)
+    rig.mqtt.block_next_state_publish = True
     rig.observer.release.set()
     delivery = asyncio.create_task(deliver())
     await delivery
     await turns()
-    assert delivered == [True]
+    assert delivered == [(True, True)]
+    assert rig.mqtt.publish_started.is_set()
+    assert not rig.mqtt.release_publish.is_set()
+    assert rig.bridge._mesh_feedback[MESH_PID].status == "contradicted"
+    rig.mqtt.release_publish.set()
+    await turns()
     rig.assert_terminal("contradicted", "ON")
     assert not rig.bridge._pending_mesh
     assert not rig.timers()
@@ -311,27 +319,88 @@ async def test_detached_rpc_late_outcome_settles_only_its_own_pending(
 
 
 @pytest.mark.parametrize("late", ["accepted", "failed"])
-async def test_superseded_write_late_outcome_is_ignored(rig: Rig, late: str) -> None:
+async def test_superseded_write_late_outcome_is_ignored(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, late: str
+) -> None:
     old = rig.bridge._pending_mesh[MESH_PID]
+    old_timer = rig.timers()[MESH_PID]
     (native,) = rig.adapter._write_tasks
+    successor_entered, successor_release = asyncio.Event(), asyncio.Event()
+
+    async def successor_native() -> None:
+        successor_entered.set()
+        await successor_release.wait()
+
+    monkeypatch.setattr(rig.observer, "_block", successor_native)
+    # Keep the replacement caller waiting throughout the stale-only interval;
+    # its own native return remains behind an independent transport gate.
+    monkeypatch.setattr(bus_mod, "_WRITE_DEADLINE_S", 60)
     if late == "failed":
         rig.observer._fail_with = RuntimeError("late")
         native.add_done_callback(lambda _task: setattr(rig.observer, "_fail_with", None))
-    replacement = asyncio.create_task(rig.mqtt.inject(MESH_SET_TOPIC, '{"state":"ON"}'))
-    await turns()
-    assert rig.bridge._pending_mesh.get(MESH_PID) is not old
-    rig.observer.release.set()
-    await replacement
-    await turns()
-    rig.assert_pending(target="1")
-    current = rig.bridge._pending_mesh[MESH_PID]
-    assert current.targets == {"on": "1"}
-    assert current is not old
-    assert rig.sleeper.requested == [80, 80]
-    assert len(rig.timers()) == 1
-    assert rig.observer.max_in_flight == 1
-    assert len(rig.observer.writes) == 2
-    assert all(payload[1].find('"on": "0"') == -1 for payload in _mesh_states(rig.mqtt)[-1:])
+    command = CommandAdmission()
+    token = command_admission.set(command)
+    try:
+        replacement = asyncio.create_task(rig.mqtt.inject(MESH_SET_TOPIC, '{"state":"ON"}'))
+    finally:
+        command_admission.reset(token)
+    try:
+        await turns()
+        assert rig.bridge._pending_mesh.get(MESH_PID) is not old
+        successor = rig.bridge._mesh_feedback[MESH_PID]
+        generation = rig.bridge._mesh_write_generation[MESH_PID]
+        admission = rig.adapter._write_admissions[command.ticket]
+        assert admission.ticket is command.ticket
+        assert admission.values == {"on": "1"}
+        assert not admission.issued
+        assert not successor_entered.is_set()
+        assert not native.done() and rig.observer.in_flight == 1
+        assert rig.adapter._write_locks["ble_mesh"].locked()
+        assert not rig.observer.write_cancelled
+        assert old_timer.cancelled()
+        assert not rig.timers()
+        assert rig.sleeper.requested == [80]
+
+        rig.mqtt.published.clear()
+        rig.clock.advance(5)
+        rig.observer.release.set()
+        await asyncio.wait_for(successor_entered.wait(), 1)
+        await turns()
+        assert native.done()
+        if late == "failed":
+            assert isinstance(native.exception(), RuntimeError)
+        else:
+            assert native.result() == "'ok'"
+        assert not successor_release.is_set()
+        assert not replacement.done()
+        assert rig.observer.in_flight == 1
+        assert rig.adapter._write_locks["ble_mesh"].locked()
+        assert rig.bridge._mesh_feedback[MESH_PID] is successor
+        assert rig.bridge._mesh_write_generation[MESH_PID] == generation
+        assert rig.adapter._write_admissions.get(command.ticket) is admission
+        assert admission.ticket is command.ticket
+        assert admission.values == {"on": "1"} and admission.issued
+        assert _mesh_states(rig.mqtt) == []
+        assert not rig.timers()
+        assert rig.sleeper.requested == [80]
+
+        successor_release.set()
+        await replacement
+        await turns()
+        rig.assert_pending(target="1", deadline=1085)
+        current = rig.bridge._pending_mesh[MESH_PID]
+        assert current is not old
+        assert current.targets == {"on": "1"}
+        assert rig.bridge._mesh_write_generation[MESH_PID] == generation
+        assert rig.tickets[-1] is command.ticket
+        assert rig.sleeper.requested == [80, 80]
+        assert len(rig.timers()) == 1
+        assert rig.observer.max_in_flight == 1
+        assert rig.native_payloads == [{"on": "0"}, {"on": "1"}]
+    finally:
+        rig.observer.release.set()
+        successor_release.set()
+        await replacement
 
 
 @pytest.mark.parametrize("revocation", ["supersede", "withdraw"])
@@ -570,13 +639,30 @@ async def test_normal_success_preserves_native_receipt_and_acceptance_fence(
     captured = await rig.adapter.get_all()
     rig.clock.advance(4)
     monkeypatch.setattr(bus_mod, "_WRITE_DEADLINE_S", 1)
-    await rig.mqtt.inject(MESH_SET_TOPIC, '{"state":"OFF"}')
+    command = CommandAdmission()
+    token = command_admission.set(command)
+    try:
+        await rig.mqtt.inject(MESH_SET_TOPIC, '{"state":"OFF"}')
+    finally:
+        command_admission.reset(token)
     record = rig.bridge._pending_mesh[MESH_PID]
+    accepted = getattr(record, "accepted_at", None)
+    ticket_accepted = getattr(command.ticket, "accepted_at", None)
+    resolved = getattr(record, "rpc_unresolved", None)
     assert record.receipt == "'ok'"
     await rig.bridge.poll_once(captured)
     rig.assert_pending(deadline=1085)
     assert rig.bridge._pending_mesh[MESH_PID] is record
     assert record.last_observed_at is None
+    assert rig.tickets[-1] is command.ticket
+    assert resolved is False
+    assert settlement(command.ticket).settled
+    assert isinstance(accepted, CaptureProvenance)
+    assert accepted == ticket_accepted
+    provenance = captured[0].capture_provenance
+    assert provenance is not None
+    assert provenance.source_generation == accepted.source_generation
+    assert provenance.sequence < accepted.sequence
 
 
 async def test_native_acceptance_before_caller_timeout_preserves_receipt_and_fence(
@@ -588,11 +674,22 @@ async def test_native_acceptance_before_caller_timeout_preserves_receipt_and_fen
     captured = await rig.adapter.get_all()
     rig.clock.advance(4)
     deferred: list[tuple[bus_mod._WriteAdmission, asyncio.Task[str]]] = []
+    boundary: list[tuple[object, str, bool, object]] = []
     original = rig.adapter._finish_admission
 
     def hold(admission: bus_mod._WriteAdmission, native: asyncio.Task[str]) -> None:
         assert native.done() and native.result() == "'ok'"
         assert not admission.result.done()
+        # Record missing future facts as missing, rather than raising inside
+        # the callback or substituting settlement after the caller wakes.
+        boundary.append(
+            (
+                getattr(admission.ticket, "settled", None),
+                native.result(),
+                admission.result.done(),
+                getattr(admission.ticket, "accepted_at", None),
+            )
+        )
         deferred.append((admission, native))
 
     monkeypatch.setattr(rig.adapter, "_finish_admission", hold)
@@ -607,12 +704,15 @@ async def test_native_acceptance_before_caller_timeout_preserves_receipt_and_fen
         rig.assert_pending(deadline=1085)
         assert rig.bridge._pending_mesh[MESH_PID] is record
         assert record.last_observed_at is None
-        # The native outcome must be stored before result delivery can wake a
-        # caller. This contract check follows the main behavioral assertion.
-        assert settlement(admission.ticket).settled
-        accepted = settlement(admission.ticket).accepted_at
+        assert admission.ticket is rig.tickets[-1]
+        assert len(boundary) == 1
+        settled, receipt, result_done, accepted = boundary[0]
+        assert (settled, receipt, result_done) == (True, "'ok'", False)
+        assert isinstance(accepted, CaptureProvenance)
+        assert getattr(record, "accepted_at", None) == accepted
+        assert getattr(record, "rpc_unresolved", None) is False
         provenance = captured[0].capture_provenance
-        assert accepted is not None and provenance is not None
+        assert provenance is not None
         assert provenance.source_generation == accepted.source_generation
         assert provenance.sequence < accepted.sequence
     finally:
