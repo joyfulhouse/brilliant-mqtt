@@ -242,7 +242,7 @@ class MeshCommands:
         if not self.registry.live(owner):
             return Superseded()
         admission = command_admission.get() if not maintenance else None
-        if admission is not None and admission.mesh_owner is not owner:
+        if not maintenance and (admission is None or admission.mesh_owner is not owner):
             return Superseded()
         ticket = AdmissionTicket() if admission is None else admission.ticket
         hook = admission.try_supersede if admission is not None else None

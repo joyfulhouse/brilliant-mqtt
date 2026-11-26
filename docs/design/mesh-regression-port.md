@@ -292,3 +292,89 @@ The final XML/log records all passing nodes too. These are the actual failures:
   allow admitted discovery metadata but keep primary unknown, and release unknown
   only on a genuinely later trusted primary capture. This note does not claim
   that proposed schedule has run or passed.
+
+## Task 4B Connected Adaptations
+
+The original 75-ID mapping and 148-case baseline above remain historical evidence.
+Task 4B connects the reviewed owner/registry/driver to Bridge and runs all 148
+cases successfully. Baseline logs/XML are unchanged; new evidence uses
+`S9/task4b-*` names. No case is skipped, marked xfail or removed.
+
+- Diagnostics now read the actual `Bridge.mesh_registry`, immutable owner
+  `view`/`render`, and `Bridge.mesh_driver` timer/child/diff-cache views. The old
+  mutable pending/feedback/counter dictionaries and resolver functions are gone.
+  Lifetime identity compares the same owner; late acceptance compares a fresh
+  exact window token, and supersession compares captured command IDs/window
+  tokens. Targets, receipt, acceptance/return envelope, deadline, physical lock,
+  cancel-before-gate-release, immutable-view and cleanup assertions remain.
+- `test_older_same_generation_capture_cannot_replace_newer_evidence` now actually
+  holds the older native read after its read-start reservation, delivers a newer
+  capture, then returns the frozen older native snapshot. Its original newer
+  evidence, matching/contradiction, deadline and terminal wire assertions remain.
+  Sequential successful `get_all()` calls already reduce synchronously and cannot
+  defer an admitted earlier contradiction until an asynchronous poll callback.
+- The approved active branch of
+  `test_detached_rpc_outcome_cannot_settle_or_rearm_feedback` now expects actual
+  late acceptance to start its fresh 80-second window, or actual rejection to
+  publish failed. Its withdrawn branches still require exactly zero wire effects,
+  no rearm and no timer. The former hybrid FakeBus/real-write-only adapter fixture
+  is replaced with one production adapter for capture, issue and actual return.
+  Separate worker-abandonment schedules keep state unknown through real return.
+- The two production scheduling fixtures now establish real owners using native
+  `get_peripheral` snapshots, stamp original `_InboundMessage.mesh_owner`, and
+  owner-bind the physical blocker/successor tickets. The mesh numeric aux case
+  uses the real LIGHT `motion_high_threshold` route (0..255) instead of a synthetic
+  LIGHT `screen_brightness` descriptor. The exact final value 120, one native
+  replacement, ordering, nonpreemption, peak concurrency and timer assertions
+  remain. Nonmesh `screen_brightness` cases retain their original payloads.
+- FakeBus supplies primitive source/generation/sequence/capture time, inventory
+  before captures, and first actual native return; FakeMqtt stamps original owner
+  at injection. They contain no settlement policy. Fixtures explicitly share the
+  adapter/Bridge/deriver monotonic clock. Metadata-only mesh carriers remain empty;
+  compatibility assertions materialize the current owner on demand.
+- The old superseding-command test drains and asserts the current Begin's
+  legitimate superseded document while the new native call stays gated. It then
+  clears the wire log, snapshots the actual successor command/window/targets,
+  releases the old deadline and still requires zero additional publications or
+  warnings, unchanged successor identity, and no old request escape.
+- Initial or terminal MQTT failures are contained by the final driver lane and
+  retain reducer debt. The former caller-exception assertion is replaced with
+  zero successful wire publications plus actual outstanding owner debt; the next
+  existing observation must repair the same pending/null document. Warning
+  assertions follow the actual mesh driver. A settled native timeout retains
+  its actual TIMEOUT/return fence and no invented pending-RPC receipt.
+- The broker-recorded pending test checks the actual driver diff cache and
+  admitted owner evidence while the single MQTT child is blocked. Expiry must
+  cancel/join that child and repair the terminal wire document; a duplicate
+  pending child is no longer required merely to acknowledge a matching capture.
+- Private desired-enforcement fixtures acquire the registry and deliver their
+  inventory through the native fake before enforcement. Direct stale/unscoped
+  snapshots cannot create owners. Batching, caps, retry/backoff, spacing, scope,
+  missing-variable and persistence assertions remain. The per-variable backoff
+  case uses LIGHT `motion_low_threshold` instead of MOTION_CONFIG-only
+  `enable_pir_motion_score`, preserving all attempt counts and timing assertions.
+- The deferred-intent snapshot-loss schedule uses a wired device, whose snapshot
+  remains the translation source. Separate mesh schedules prove metadata-cache
+  loss does not block a valid owner-stamped command or projection, while actual
+  owner loss rejects stale aux commands before recording intent. Heartbeat/read
+  exception cases use wired devices, with a HARDWARE aux payload for the existing
+  MQTT exception-propagation assertion; primary final lanes contain failures.
+  An acquired-mesh poll separately requires heartbeat and owner-state publication.
+- The standby normalization check still requires zero work and publications. Its
+  first acquired mesh push now requires zero legacy normalization/Variable
+  allocation and all 40 state publications through primitive owner ingress.
+  Nonmesh deferred-normalization assertions remain unchanged.
+- Nonmesh diagnostic clock-read and measurement assertions remain unchanged.
+  Only mesh native returns allocate return provenance and advance creation floor;
+  wired issue retains field eras and current-generation provenance, reusing the
+  lock-acquisition timestamp without an intervening await or another clock read.
+
+Additional connected production schedules cover synchronous native return before
+caller resumption; merged MQTT fold ownership before the replacement handler;
+issue preparation followed by actual commit refusal; worker cancellation during
+native wait and after stored return; original queued owner across reappearance;
+auxiliary return/native contradiction/delayed caller; ordinary cleanup failure
+repaired only by existing reconcile; dynamic standby/shared panel scoping; twelve
+distinct peripheral IDs with bounded live maps; unsupported infrastructure; and
+exact inherited completion listeners across registered loop/foreign reconnect
+hooks and withdrawal/reacquisition.

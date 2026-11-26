@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 
 import pytest
 
@@ -12,7 +13,7 @@ from tests.fakes import FakeBus, FakeMqtt
 
 
 def _light(pid: str = "p") -> BrilliantDevice:
-    return BrilliantDevice("ble_mesh", pid, pid, DeviceKind.LIGHT, 27, {"on": Variable("on", "1")})
+    return BrilliantDevice("panel", pid, pid, DeviceKind.LIGHT, 27, {"on": Variable("on", "1")})
 
 
 class _RaisingBus(FakeBus):
@@ -113,7 +114,15 @@ async def test_poll_once_does_not_swallow_mqtt_publish_timeout(
     timeout_type: type[Exception],
 ) -> None:
     b = Bridge(
-        FakeBus([_light()]),
+        FakeBus(
+            [
+                replace(
+                    _light(),
+                    kind=DeviceKind.HARDWARE,
+                    variables={"screen_brightness": Variable("screen_brightness", "7")},
+                )
+            ]
+        ),
         _TimeoutMqtt(timeout_type("mqtt publish timed out")),
         "mesh",
     )
@@ -159,6 +168,20 @@ async def test_poll_beats() -> None:
     b = Bridge(FakeBus([_light()]), FakeMqtt(), "mesh", heartbeat=lambda: beats.append(1))
     await b.poll_once()
     assert beats
+
+
+async def test_acquired_mesh_poll_beats_and_publishes_owner_state() -> None:
+    beats: list[int] = []
+    mqtt = FakeMqtt()
+    bus = FakeBus([replace(_light(), device_id="ble_mesh")])
+    bridge = Bridge(bus, mqtt, "mesh", heartbeat=lambda: beats.append(1))
+    assert bridge.mesh_registry is not None
+    bridge.mesh_registry.acquire()
+
+    await bridge.poll_once()
+
+    assert beats == [1]
+    assert any(topic == "brilliant/mesh/p/state" for topic, _, _ in mqtt.published)
 
 
 @pytest.mark.asyncio

@@ -259,8 +259,8 @@ class Bridge:
         # command topic → (peripheral_id, descriptor). descriptor is None for the
         # PRIMARY JSON light/switch topic; an EntityDescriptor for each aux topic.
         self._by_cmd_topic: dict[str, tuple[str, EntityDescriptor | None]] = {}
-        # Admission ownership, separate from mesh confirmation generations.
-        # Keep epochs across withdrawal/rebinding to reject an A -> B -> A route.
+        # Wired admission epochs survive withdrawal/rebinding. Mesh commands use
+        # the exact registry owner stamped at MQTT ingress instead.
         self._command_generation: dict[str, int] = {}
         # Command topics this session has already SUBSCRIBEd (#76): the periodic
         # resync must not re-issue them. Bridge lifetime == MQTT session, and
@@ -628,11 +628,9 @@ class Bridge:
     async def reconcile(self) -> None:
         """Publish availability, discovery configs, and initial state for all devices.
 
-        Idempotent for re-publishing and additions: safe to call repeatedly;
-        already-subscribed command topics are skipped. Stale
-        peripherals are NOT pruned — out of scope; removal is handled
-        operationally by clearing the retained config topic (see
-        docs/reference/deployment.md).
+        Already-subscribed command topics are skipped. Mesh inventory removal
+        retains a bounded absence publication and exact route/config cleanup;
+        wired discovery retains its existing operational cleanup policy.
         """
         # Read the bus and stamp the liveness heartbeat BEFORE any broker-dependent
         # publish. A broker that rejects or hangs the availability PUBLISH (or
@@ -830,15 +828,9 @@ class Bridge:
         everything fresh via reconcile(). Safe to call on a bridge that never
         reconciled (no-op).
         """
-        # Step down SYNCHRONOUSLY, before ANY await. Clearing the command
-        # routing first means a command already queued in the MQTT lane that
-        # begins mid-withdraw finds no route — it can neither perform an
-        # ex-leader bus write nor arm a fresh pending/confirm task the sweep
-        # below would never see. Then revoke mesh pendings and their confirm
-        # timers: an ex-leader must not resolve confirmations it no longer
-        # owns, and a deadline elapsing during the unsubscribe handoff must
-        # not publish one (the registry union also reaches a resolver already
-        # past its pending entry, mid-publish).
+        # Close routing and registry synchronously before joining effects or
+        # awaiting the broker. Queued commands and ready expiry lose ownership
+        # at this boundary, while actual native RPCs retain their physical lock.
         topics = list(self._by_cmd_topic)
         for peripheral_id in self._command_generation:
             self._command_generation[peripheral_id] += 1
@@ -1100,9 +1092,7 @@ class Bridge:
         the wire-payload comparison for publish parity. *force* bypasses both
         checks for reconcile's level-triggered repair.
 
-        The pending-mesh overlay is applied BEFORE either cache, so every
-        publish path — echo, push, poll, and forced reconcile alike — holds
-        `state: null` while a mesh write awaits confirmation.
+        Mesh publication delegates entirely to its owner and final driver lane.
 
         The caches commit only AFTER the broker accepted the publish: a failed
         publish must not leave them claiming the wire carries this payload, or

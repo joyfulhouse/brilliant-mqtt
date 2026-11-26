@@ -129,6 +129,20 @@ async def test_command_without_original_owner_is_rejected(
     assert harness.write_starts == []
 
 
+async def test_direct_mesh_translation_without_original_context_cannot_admit_native_work(
+    connected: Connected,
+) -> None:
+    rig = connected
+    rig.harness.write_release.set()
+    owner = rig.owner()
+    before = owner.view.command_id
+    await rig.bridge._handle_primary_command(
+        command_topic("mesh", "load"), "load", '{"state":"OFF"}'
+    )
+    assert rig.harness.write_starts == []
+    assert owner.view.command_id == before
+
+
 async def test_owner_created_by_sync_ingress_before_async_repair(
     connected: Connected,
 ) -> None:

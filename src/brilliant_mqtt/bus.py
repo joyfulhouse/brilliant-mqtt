@@ -916,10 +916,12 @@ class RpcBusAdapter:
             return True
 
     def _native_return(self, admission: _WriteAdmission, outcome: str | BaseException) -> None:
-        boundary = self._next_capture_provenance("native")
         if admission.device_id == "ble_mesh":
+            boundary = self._next_capture_provenance("native")
             self.advance_mesh_creation_floor(boundary)
-        admission.ticket.mark_settled(outcome, boundary)
+            admission.ticket.mark_settled(outcome, boundary)
+        else:
+            admission.ticket.mark_settled(outcome)
 
     def fail_mesh(self, error: Exception) -> None:
         """Latch the existing adapter fatal for a noncooperative owner effect."""
@@ -1122,14 +1124,16 @@ class RpcBusAdapter:
     def _next_capture_provenance(self, origin: str = "capture") -> CaptureProvenance:
         return self._allocate_capture_provenance(origin, self._capture_generation_snapshot())
 
-    def _allocate_capture_provenance(self, origin: str, generation: int) -> CaptureProvenance:
+    def _allocate_capture_provenance(
+        self, origin: str, generation: int, *, captured_at: float | None = None
+    ) -> CaptureProvenance:
         self._capture_sequence += 1
         return CaptureProvenance(
             generation,
             self._capture_sequence,
             incarnation=self._capture_source,
             origin=origin,
-            captured_at=self._clock(),
+            captured_at=self._clock() if captured_at is None else captured_at,
         )
 
     def reserve_mesh_boundary(self, origin: str) -> CaptureProvenance:
@@ -2027,8 +2031,14 @@ class RpcBusAdapter:
             )
             cap = asyncio.get_running_loop().call_later(_WRITE_HARD_CAP_S, self._cap_write, record)
             try:
+                # Wired issue follows lock acquisition without an await; reuse
+                # its stamp to preserve the existing write clock-read budget.
                 boundary = replace(
-                    self._next_capture_provenance("issue"),
+                    self._next_capture_provenance("issue")
+                    if admission.device_id == "ble_mesh"
+                    else self._allocate_capture_provenance(
+                        "issue", self._capture_generation_snapshot(), captured_at=record.started_at
+                    ),
                     issued_values=tuple(admission.values.items()),
                 )
                 if admission.device_id == "ble_mesh":
