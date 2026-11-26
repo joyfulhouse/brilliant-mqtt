@@ -17,7 +17,7 @@ from homeassistant import config_entries
 from homeassistant.const import CONF_NAME
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.util.file import WriteError
+from homeassistant.helpers import issue_registry as ir
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.brilliant_mqtt import fleet_manager, panel_ops
@@ -30,6 +30,7 @@ from custom_components.brilliant_mqtt.const import (
     OPT_TRUST_HOST_KEY_CHANGES,
 )
 from custom_components.brilliant_mqtt.flow import gateway
+from custom_components.brilliant_mqtt.panel_provisioner import PanelProvisioningError
 from custom_components.brilliant_mqtt.provisioning_journal import (
     _JOURNAL_COORDINATOR_KEY,
     JOURNAL_STORAGE_KEY,
@@ -67,9 +68,147 @@ from tests.test_manager import _legacy_manager
 pytestmark = pytest.mark.usefixtures("durable_journal")
 
 
+@pytest.mark.parametrize("later_edit", ["none", "host", "login"])
+@pytest.mark.parametrize("old_format", [False, True])
+async def test_pending_address_change_requires_fresh_verified_flow(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch, later_edit: str, old_format: bool
+) -> None:
+    entry, panel = _fleet(hass)
+    record = _baseline_record(host=_OLD_HOST)
+    await _arm_soak(hass, record)
+    with monkeypatch.context() as fault:
+        fault.setattr(
+            ProvisioningJournal,
+            "_async_retained_save",
+            AsyncMock(side_effect=ProvisioningJournalError("journal_save_failed")),
+        )
+        result = await _change(
+            hass,
+            entry,
+            panel,
+            **{CONF_HOST: _NEW_HOST, CONF_ROOT_PASSWORD: panel.data[CONF_ROOT_PASSWORD]},
+        )
+        assert result["errors"]["base"] == "journal_failed"
+    journal = ProvisioningJournal(hass)
+    saved = await journal._store.async_load()
+    assert saved is not None
+    if old_format:
+        saved["pending_owner"].pop("entry_id")
+        saved["pending_owner"].pop("subentry_id")
+        await journal._store.async_save(saved)
+    if later_edit != "none":
+        changed = (
+            {CONF_HOST: "later-office.example"}
+            if later_edit == "host"
+            else {CONF_ROOT_PASSWORD: "later-login"}
+        )
+        hass.config_entries.async_update_subentry(entry, panel, data={**panel.data, **changed})
+    await hass.config_entries._store.async_save(hass.config_entries._data_to_save())
+    before = dict(panel.data)
+    retained_before = _storage_data(hass, JOURNAL_STORAGE_KEY + ".retained")
+    for _ in range(2):
+        hass.data.pop(_JOURNAL_COORDINATOR_KEY, None)
+        assert await ProvisioningJournal(hass).async_load() is None
+    assert dict(panel.data) == before
+    assert _storage_data(hass, JOURNAL_STORAGE_KEY) == saved
+    assert _storage_data(hass, JOURNAL_STORAGE_KEY + ".retained") == retained_before
+    issues = [issue for (domain, _), issue in ir.async_get(hass).issues.items() if domain == DOMAIN]
+    assert len(issues) == 1
+    assert issues[0].translation_key == "address_change_incomplete"
+    assert issues[0].translation_placeholders == {"panel": "office"}
+    assert issues[0].severity == ir.IssueSeverity.ERROR
+    assert await fleet_manager._async_rollback_credential(hass, record.panel_request) is None
+    result = await _change(
+        hass,
+        entry,
+        panel,
+        **{CONF_HOST: _NEW_HOST, CONF_ROOT_PASSWORD: panel.data[CONF_ROOT_PASSWORD]},
+    )
+    assert result["reason"] == "reconfigure_successful"
+    retained = await ProvisioningJournal(hass).async_retained(record.transaction_id)
+    assert retained is not None and retained.record.panel_request.host == _NEW_HOST
+    assert not [
+        issue for (domain, _), issue in ir.async_get(hass).issues.items() if domain == DOMAIN
+    ]
+    assert not await hass.async_add_executor_job(Path(journal._store.path).exists)
+
+
+async def test_two_interrupted_panels_keep_independent_pending_records(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    entry, office = _fleet(hass)
+    kitchen = _subentry(
+        slug="kitchen",
+        subentry_id="panel-kitchen",
+        priority=2,
+        public_key=_OTHER_PUBLIC_KEY,
+        fingerprint=_OTHER_FINGERPRINT,
+    )
+    hass.config_entries.async_add_subentry(entry, kitchen)
+    kitchen = entry.subentries[kitchen.subentry_id]
+    first = _baseline_record(host=office.data[CONF_HOST])
+    second = _baseline_record(
+        slug="kitchen",
+        host=kitchen.data[CONF_HOST],
+        public_key=_OTHER_PUBLIC_KEY,
+        fingerprint=_OTHER_FINGERPRINT,
+        transaction_id=uuid4(),
+    )
+    await _arm_soak(hass, first)
+    await _arm_soak(hass, second)
+    with monkeypatch.context() as fault:
+        fault.setattr(
+            ProvisioningJournal,
+            "_async_retained_save",
+            AsyncMock(side_effect=ProvisioningJournalError("journal_save_failed")),
+        )
+        for panel, host, key, fingerprint in (
+            (office, _NEW_HOST, _PUBLIC_KEY, _FINGERPRINT),
+            (kitchen, "new-kitchen.example", _OTHER_PUBLIC_KEY, _OTHER_FINGERPRINT),
+        ):
+            with pytest.raises(ProvisioningJournalError, match="journal_save_failed"):
+                await ProvisioningJournal(hass).async_adopt_verified_host(
+                    entry_id=entry.entry_id,
+                    subentry_id=panel.subentry_id,
+                    slug=panel.data[CONF_PANEL],
+                    public_key=key,
+                    fingerprint=fingerprint,
+                    host=host,
+                    expected_host=panel.data[CONF_HOST],
+                    expected_password=panel.data[CONF_ROOT_PASSWORD],
+                    root_password=panel.data[CONF_ROOT_PASSWORD],
+                    repair_pending=True,
+                )
+    saved = _storage_data(hass, JOURNAL_STORAGE_KEY)
+    assert len(saved["pending_owners"]) == 2
+    hass.data.pop(_JOURNAL_COORDINATOR_KEY)
+    assert await ProvisioningJournal(hass).async_load() is None
+    assert _storage_data(hass, JOURNAL_STORAGE_KEY) == saved
+    # Resolving kitchen leaves office's evidence and repair in place.
+    await ProvisioningJournal(hass).async_adopt_verified_host(
+        entry_id=entry.entry_id,
+        subentry_id=kitchen.subentry_id,
+        slug="kitchen",
+        public_key=_OTHER_PUBLIC_KEY,
+        fingerprint=_OTHER_FINGERPRINT,
+        host="new-kitchen.example",
+        expected_host=kitchen.data[CONF_HOST],
+        expected_password=kitchen.data[CONF_ROOT_PASSWORD],
+        root_password=kitchen.data[CONF_ROOT_PASSWORD],
+        repair_pending=True,
+    )
+    assert _storage_data(hass, JOURNAL_STORAGE_KEY)["pending_owner"] == saved["pending_owners"][0]
+    assert (
+        len([issue for (domain, _), issue in ir.async_get(hass).issues.items() if domain == DOMAIN])
+        == 1
+    )
+    retained = await ProvisioningJournal(hass).async_retained(first.transaction_id)
+    assert retained is not None and retained.record.panel_request.host == office.data[CONF_HOST]
+
+
 @pytest.mark.parametrize("later_edit", [False, True])
 @pytest.mark.parametrize("old_format", [False, True])
-async def test_legacy_replay_preserves_later_saved_address(
+async def test_legacy_pending_change_preserves_later_saved_address(
     hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch, later_edit: bool, old_format: bool
 ) -> None:
     monkeypatch.setattr(config_entries, "SAVE_DELAY", 0.01)
@@ -94,22 +233,26 @@ async def test_legacy_replay_preserves_later_saved_address(
     expected_host = _NEW_HOST
     if later_edit:
         expected_host = "later-office.example"
-        form = await _open_legacy_reconfigure_step(hass, entry, "reconfigure_connection")
-        result = await _submit_legacy_reconfigure(
-            hass,
-            form,
-            {CONF_HOST: expected_host, CONF_ROOT_PASSWORD: ""},
-            AsyncMock(return_value=_PUBLIC_KEY),
-        )
-        assert result["reason"] == "reconfigure_successful"
+        hass.config_entries.async_update_entry(entry, data={**entry.data, CONF_HOST: expected_host})
         await hass.config_entries._store.async_save(hass.config_entries._data_to_save())
     assert entry.data[CONF_HOST] == expected_host
     assert await ProvisioningJournal(hass).async_load() is None
     assert entry.data[CONF_HOST] == expected_host
     retained = await ProvisioningJournal(hass).async_retained(record.transaction_id)
     assert retained is not None
-    assert retained.record.panel_request.host == (_OLD_HOST if later_edit else _NEW_HOST)
+    assert retained.record.panel_request.host == _OLD_HOST
     assert retained.state == "soak"
+    assert "pending_owner" in _storage_data(hass, JOURNAL_STORAGE_KEY)
+    form = await _open_legacy_reconfigure_step(hass, entry, "reconfigure_connection")
+    result = await _submit_legacy_reconfigure(
+        hass,
+        form,
+        {CONF_HOST: expected_host, CONF_ROOT_PASSWORD: ""},
+        AsyncMock(return_value=_PUBLIC_KEY),
+    )
+    assert result["reason"] == "reconfigure_successful"
+    retained = await ProvisioningJournal(hass).async_retained(record.transaction_id)
+    assert retained is not None and retained.record.panel_request.host == expected_host
     assert not await hass.async_add_executor_job(
         Path(hass.config.path(".storage", JOURNAL_STORAGE_KEY)).exists
     )
@@ -198,7 +341,7 @@ async def test_dispatched_canary_cannot_use_replacement_owner(
     assert await ProvisioningJournal(hass).async_load() is None
 
 
-async def test_durable_legacy_repin_retires_only_its_pending_intent(
+async def test_legacy_repin_keeps_evidence_and_does_not_block_another_panel(
     hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     office, manager = _legacy_runtime(hass, host=_NEW_HOST, public_key=_PUBLIC_KEY)
@@ -252,9 +395,7 @@ async def test_durable_legacy_repin_retires_only_its_pending_intent(
     assert retained is not None
     assert retained.record.panel_request.public_key == _PUBLIC_KEY
     assert retained.record.panel_request.host == _OLD_HOST
-    assert not await hass.async_add_executor_job(
-        Path(hass.config.path(".storage", JOURNAL_STORAGE_KEY)).exists
-    )
+    assert "pending_owner" in _storage_data(hass, JOURNAL_STORAGE_KEY)
 
 
 @pytest.mark.parametrize("boundary", ["unflushed", "invalid_pin", "active"])
@@ -335,15 +476,16 @@ async def test_adoption_keeps_intent_until_config_reaches_disk(
     assert await hass.async_add_executor_job(Path(core_store.path).read_bytes) == before
     assert "pending_owner" in _storage_data(hass, JOURNAL_STORAGE_KEY)
 
-    # A later load retries the durable handoff rather than losing the intent.
     await core_store.async_save(hass.config_entries._data_to_save())
-    healed = await ProvisioningJournal(hass).async_load()
-    assert healed is not None
-    await fleet_manager._async_authorize_recorded_recovery(hass, healed)
-    assert "pending_owner" not in _storage_data(hass, JOURNAL_STORAGE_KEY)
+    pending = _storage_data(hass, JOURNAL_STORAGE_KEY)
+    loaded = await ProvisioningJournal(hass).async_load()
+    assert loaded is not None
+    with pytest.raises(PanelProvisioningError, match="provisioning_recovery_required"):
+        await fleet_manager._async_authorize_recorded_recovery(hass, loaded)
+    assert _storage_data(hass, JOURNAL_STORAGE_KEY) == pending
 
 
-async def test_cancelled_disk_proof_preserves_replayable_intent(
+async def test_cancelled_disk_proof_requires_fresh_flow(
     hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     entry, panel = _fleet(hass)
@@ -368,7 +510,13 @@ async def test_cancelled_disk_proof_preserves_replayable_intent(
     await hass.config_entries._store.async_save(hass.config_entries._data_to_save())
     record = await ProvisioningJournal(hass).async_load()
     assert record is not None
-    await fleet_manager._async_authorize_recorded_recovery(hass, record)
+    with pytest.raises(PanelProvisioningError, match="provisioning_recovery_required"):
+        await fleet_manager._async_authorize_recorded_recovery(hass, record)
+    assert "pending_owner" in _storage_data(hass, JOURNAL_STORAGE_KEY)
+    result = await _change(
+        hass, entry, panel, **{CONF_HOST: _NEW_HOST, CONF_ROOT_PASSWORD: "new-login"}
+    )
+    assert result["reason"] == "reconfigure_successful"
     assert "pending_owner" not in _storage_data(hass, JOURNAL_STORAGE_KEY)
 
 
@@ -539,37 +687,6 @@ async def test_canary_dispatch_serializes_with_verified_repair(
         assert await ProvisioningJournal(hass).async_retained(record.transaction_id) is None
 
 
-async def test_failed_core_write_is_rescheduled_on_replay(
-    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    entry, panel = _fleet(hass)
-    store = hass.config_entries._store
-    await store.async_save(hass.config_entries._data_to_save())
-    await ProvisioningJournal(hass).async_create(_managed_record(host=_OLD_HOST))
-    monkeypatch.setattr(config_entries, "SAVE_DELAY", 0.01)
-    monkeypatch.setattr(fleet_manager, "_CONFIG_ENTRY_PERSISTENCE_TIMEOUT_SECONDS", 0.4)
-    monkeypatch.setattr(fleet_manager, "_CONFIG_ENTRY_PERSISTENCE_POLL_SECONDS", 0.01)
-    with monkeypatch.context() as fault:
-        failure = AsyncMock(side_effect=WriteError("test core write failure"))
-        fault.setattr(store, "_async_write_data", failure)
-        result = await _change(
-            hass,
-            entry,
-            panel,
-            **{
-                CONF_HOST: _NEW_HOST,
-                CONF_ROOT_PASSWORD: "verified-login",
-            },
-        )
-        assert result["errors"]["base"] == "journal_failed"
-        failure.assert_awaited()
-    assert store._data is None
-    loaded = await ProvisioningJournal(hass).async_load()
-    assert loaded is not None
-    await fleet_manager._async_authorize_recorded_recovery(hass, loaded)
-    assert "pending_owner" not in _storage_data(hass, JOURNAL_STORAGE_KEY)
-
-
 async def test_unflushed_owner_removal_preserves_recovery_intent(
     hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -610,9 +727,9 @@ async def test_unflushed_owner_removal_preserves_recovery_intent(
     retained = await ProvisioningJournal(hass).async_retained(record.transaction_id)
     assert retained is not None
     assert (
-        await fleet_manager._async_rollback_credential(hass, retained.record.panel_request)
-        == "verified-new-login"
+        await fleet_manager._async_rollback_credential(hass, retained.record.panel_request) is None
     )
+    assert "pending_owner" in _storage_data(hass, JOURNAL_STORAGE_KEY)
 
 
 async def test_queued_repair_refuses_replacement_subentry(
@@ -710,6 +827,6 @@ async def test_other_panel_handoff_preserves_pending_owner(
     retained = await ProvisioningJournal(hass).async_retained(office_record.transaction_id)
     assert retained is not None
     assert (
-        await fleet_manager._async_rollback_credential(hass, retained.record.panel_request)
-        == "verified-office-login"
+        await fleet_manager._async_rollback_credential(hass, retained.record.panel_request) is None
     )
+    assert "pending_owner" in _storage_data(hass, JOURNAL_STORAGE_KEY)

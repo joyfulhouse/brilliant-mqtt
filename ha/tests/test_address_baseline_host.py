@@ -449,13 +449,13 @@ def _retained_host(payload: dict[str, Any], transaction_id: UUID) -> str:
 
 
 @pytest.mark.parametrize("boundary", ["journal", "retained", "config", "cancel"])
-async def test_partial_verified_adoption_recovers_on_reload(
+async def test_partial_verified_adoption_requires_verified_retry(
     hass: HomeAssistant,
     durable_journal: None,
     monkeypatch: pytest.MonkeyPatch,
     boundary: str,
 ) -> None:
-    """A crash between the journal, retained store, and config owner finishes on load."""
+    """An interrupted change stays untouched until a fresh verified address flow."""
     del durable_journal
     panel = _subentry()
     entry = _fleet_entry(hass, panel)
@@ -545,9 +545,10 @@ async def test_partial_verified_adoption_recovers_on_reload(
         assert _journal_host(journal_payload) == _OLD_HOST
         assert _retained_host(retained_payload, record.transaction_id) == _OLD_HOST
         assert config_host == _OLD_HOST
-        await _async_authorize_recorded_recovery(
-            hass, ProvisioningRecord._from_storage(journal_payload["record"])
-        )
+        with pytest.raises(PanelProvisioningError, match="provisioning_recovery_required"):
+            await _async_authorize_recorded_recovery(
+                hass, ProvisioningRecord._from_storage(journal_payload["record"])
+            )
     else:
         assert _journal_host(journal_payload) == _NEW_HOST
         if boundary == "retained":
@@ -560,6 +561,21 @@ async def test_partial_verified_adoption_recovers_on_reload(
                 hass, ProvisioningRecord._from_storage(journal_payload["record"])
             )
 
+    await ProvisioningJournal(hass).async_load()
+    assert _storage_data(hass, JOURNAL_STORAGE_KEY) == journal_payload
+    assert _storage_data(hass, JOURNAL_STORAGE_KEY + ".retained") == retained_payload
+    assert entry.subentries[panel.subentry_id].data[CONF_HOST] == config_host
+    form = await _start_panel_reconfigure_step(hass, entry, stored, "address")
+    with (
+        patch.object(
+            flow_gateway, "async_fetch_host_identity", AsyncMock(return_value=_identity())
+        ),
+        patch.object(flow_gateway, "_async_inspect_candidate", AsyncMock(return_value=None)),
+    ):
+        result = await hass.config_entries.subentries.async_configure(
+            form["flow_id"], {CONF_HOST: _NEW_HOST}
+        )
+    assert result["reason"] == "reconfigure_successful"
     healed = await ProvisioningJournal(hass).async_load()
     assert healed is not None
     assert healed.panel_request.host == _NEW_HOST

@@ -540,64 +540,6 @@ async def async_wait_config_entry_persisted(
         await asyncio.sleep(min(_CONFIG_ENTRY_PERSISTENCE_POLL_SECONDS, remaining))
 
 
-def _stored_owner_removed(stored: object, entry_id: str, subentry_id: str | None) -> bool:
-    """Prove absence only from a valid fresh core-config envelope."""
-    if not isinstance(stored, Mapping) or stored.get("key") != "core.config_entries":
-        return False
-    data = stored.get("data")
-    if not isinstance(data, Mapping) or not isinstance(entries := data.get("entries"), list):
-        return False
-    if any(
-        not isinstance(row, Mapping) or not isinstance(row.get("entry_id"), str) for row in entries
-    ):
-        return False
-    matches = [row for row in entries if row["entry_id"] == entry_id]
-    if not matches:
-        return True
-    if len(matches) != 1 or subentry_id is None:
-        return False
-    subentries = matches[0].get("subentries")
-    return isinstance(subentries, list) and all(
-        isinstance(row, Mapping)
-        and isinstance(row.get("subentry_id"), str)
-        and row["subentry_id"] != subentry_id
-        for row in subentries
-    )
-
-
-async def async_wait_config_owner_removed(
-    hass: HomeAssistant, entry_id: str, subentry_id: str | None
-) -> bool:
-    """Retain an owner's intent until its removal is proven on disk and in RAM."""
-    deadline = hass.loop.time() + _CONFIG_ENTRY_PERSISTENCE_TIMEOUT_SECONDS
-    path = hass.config.path(_CONFIG_ENTRIES_STORAGE_FILE)
-    while True:
-        try:
-            stored = await hass.async_add_executor_job(json_util.load_json, path)
-        except Exception:
-            stored = None
-        current = hass.config_entries.async_get_entry(entry_id)
-        absent = current is None or (
-            subentry_id is not None and subentry_id not in current.subentries
-        )
-        if not absent:
-            return False
-        core_store = hass.config_entries._store
-        valid_envelope = (
-            isinstance(stored, Mapping)
-            and type(stored.get("version")) is int
-            and stored.get("version") == core_store.version
-            and type(stored.get("minor_version")) is int
-            and stored.get("minor_version") == core_store.minor_version
-        )
-        if valid_envelope and _stored_owner_removed(stored, entry_id, subentry_id):
-            return True
-        remaining = deadline - hass.loop.time()
-        if remaining <= 0:
-            return False
-        await asyncio.sleep(min(_CONFIG_ENTRY_PERSISTENCE_POLL_SECONDS, remaining))
-
-
 async def _async_duplicate_fingerprint(
     hass: HomeAssistant,
     fingerprint: str,
@@ -717,6 +659,8 @@ async def _async_rollback_credential(
     subentry_id: str | None = None,
 ) -> str | None:
     """Resolve the login only from a current, exactly matching config owner."""
+    if await ProvisioningJournal(hass).async_has_pending_address_change(request):
+        return None
     matches: list[str] = []
     for entry in hass.config_entries.async_entries(DOMAIN):
         if entry_id is not None and entry.entry_id != entry_id:
@@ -768,6 +712,8 @@ async def _async_authorize_recorded_recovery(
     expected_entry: ConfigEntry[Any] | None = None,
 ) -> None:
     """Prove current operation authority before using recorded panel credentials."""
+    if await ProvisioningJournal(hass).async_has_pending_address_change(record.panel_request):
+        raise PanelProvisioningError("provisioning_recovery_required")
     try:
         if record.operation is ProvisioningOperation.UPDATE:
             owner, _panel_id = _managed_update_owner(hass, record)

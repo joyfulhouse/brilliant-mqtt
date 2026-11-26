@@ -41,6 +41,8 @@ from ..const import (
     ENTRY_KIND_FLEET,
 )
 from ..migration_coordinator import migration_blocks_entry_writes
+from ..provisioning_journal import ProvisioningJournal, ProvisioningJournalError
+from ..shell import validated_public_key_fingerprint
 from ..voice_payload import VoicePayloadError
 from . import gateway
 from .schemas import (
@@ -187,7 +189,23 @@ class LegacyPanelReconfigureFlow(_Base):
             # Connected fine, but writing the env / restarting failed.
             return {"base": "cannot_apply"}, None
 
-        new_data: dict[str, Any] = {**data, **updates, DATA_SSH_HOST_KEY: host_key}
+        if CONF_HOST in updates and host_key == data.get(DATA_SSH_HOST_KEY):
+            try:
+                await ProvisioningJournal(self.hass).async_adopt_verified_host(
+                    entry_id=entry.entry_id,
+                    subentry_id=None,
+                    slug=panel,
+                    public_key=host_key,
+                    fingerprint=validated_public_key_fingerprint(host_key),
+                    host=host,
+                    expected_host=str(data[CONF_HOST]),
+                    expected_password=str(data[CONF_ROOT_PASSWORD]),
+                    root_password=password,
+                    repair_pending=True,
+                )
+            except ProvisioningJournalError:
+                return {"base": "cannot_apply"}, None
+        new_data: dict[str, Any] = {**entry.data, **updates, DATA_SSH_HOST_KEY: host_key}
         for key in remove_keys:
             new_data.pop(key, None)
         if desired_components is not None:

@@ -114,19 +114,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of the generic `canary_operation_failed`.
 - A version-3 panel that stored an SSH host key and no fingerprint can still
   finalize or roll back when that key matches the baseline. A different key is
-  refused. An interrupted verified address or credential change is completed
-  from its saved intent on the next load, so the active journal, retained
-  baseline, and panel configuration stay on one owner. A stale canary or an
-  older repair cannot overwrite a newer verified host or password. Retained
-  baselines stay password-free.
-- Verified owner changes retain their recovery intent until Home Assistant's
-  configuration is proven on disk, including after cancellation. Address and
-  credential repairs serialize with canary rollback/finalization, preserve
-  concurrent renames, and bind interrupted changes to the original config
-  owner so removing it cannot block another panel's retained baseline once
-  removal is durable. Completing another panel's transaction preserves that
-  intent, and replay retries a failed HA configuration save. A queued repair
-  cannot retarget a replacement subentry. Refs #259.
+  refused. Retained baselines stay password-free.
+- Interrupted verified address changes keep their pending records and raise
+  an address-change repair asking to re-run **Change network address**. Loading
+  never replays the old change or overwrites a later saved connection. A fresh
+  verified flow resolves the repair; unrelated panels remain available.
+- Verified address changes serialize with canary rollback/finalization,
+  preserve concurrent renames, and stay bound to the original config owner.
+  A queued repair or canary cannot use a replacement subentry. Completing
+  another panel's transaction preserves pending address records. Refs #259.
 
 ## [0.12.2] - 2026-11-17
 

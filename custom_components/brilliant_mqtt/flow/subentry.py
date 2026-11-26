@@ -293,7 +293,7 @@ class PanelSubentryFlow(ConfigSubentryFlow, _PanelOnboardingMixin):
         Returns None when the journal, retained rows, and configuration owner
         all show the new values. Returns ``parent_changed`` when a newer repair
         won the race, without leaving a retargeted journal behind. A storage
-        failure leaves a restart-recoverable intent instead of a split owner.
+        failure keeps the pending record and asks for a fresh verified retry.
         """
         from ..provisioning_journal import ProvisioningJournal, ProvisioningJournalError
 
@@ -312,6 +312,7 @@ class PanelSubentryFlow(ConfigSubentryFlow, _PanelOnboardingMixin):
                 expected_host=panel.host,
                 expected_password=panel.root_password,
                 root_password=root_password,
+                repair_pending=True,
             )
         except ProvisioningJournalError as error:
             if error.code == "owner_changed":
