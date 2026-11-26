@@ -172,7 +172,7 @@ async def test_nonfinite_wall_clock_cannot_supply_a_confirmation_deadline(epoch:
     bus = FakeBus([_mesh_dimmer_at("1")])
     mqtt = FakeMqtt()
     sleeper = FakeSleeper()
-    bridge = Bridge(bus, mqtt, "mesh", wall_clock=lambda: epoch, sleep=sleeper)
+    bridge = Bridge(bus, mqtt, "mesh", clock=FakeClock(), wall_clock=lambda: epoch, sleep=sleeper)
     await bridge.reconcile()
     await mqtt.inject(MESH_SET_TOPIC, '{"state":"OFF"}')
     fields = json.loads(_mesh_states(mqtt)[-1][1])
@@ -256,12 +256,13 @@ async def test_shutdown_fences_sleeping_resolver_without_sweeping_it() -> None:
     await mqtt.inject(MESH_SET_TOPIC, '{"state":"OFF"}')
     resolver = bridge._mesh_confirm_tasks[MESH_PID]
     await bridge.shutdown_mesh_feedback()
-    assert not resolver.done()  # pre-existing timer sweep remains out of scope
     mqtt.published.clear()
     clock.advance(80.0)
     await sleeper.release_all()
     assert resolver.done()
     assert mqtt.published == []
+    assert bridge._mesh_confirm_tasks == {}
+    assert bridge._mesh_feedback_tasks == {}
 
 
 async def test_restart_replaces_retained_pending_with_unrelated_idle() -> None:
@@ -305,8 +306,11 @@ async def test_contradiction_revokes_blocked_publish_with_same_generation() -> N
     command = asyncio.create_task(mqtt.inject(MESH_SET_TOPIC, '{"state":"OFF"}'))
     await asyncio.wait_for(mqtt.publish_started.wait(), 1)
     generation = bridge._mesh_write_generation[MESH_PID]
+    blocked = list(bridge._mesh_feedback_tasks)
     await bus.emit(_mesh_dimmer_at("1"))
     assert bridge._mesh_write_generation[MESH_PID] == generation
+    assert not mqtt.release_publish.is_set()
+    assert blocked and all(task.cancelled() for task in blocked)
     mqtt.release_publish.set()
     await command
     assert [json.loads(p[1]) for p in _mesh_states(mqtt)] == [

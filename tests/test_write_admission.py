@@ -11,8 +11,15 @@ import pytest
 from brilliant_mqtt import bus as bus_mod
 from brilliant_mqtt.bus import RpcBusAdapter
 from brilliant_mqtt.commands import VarSet
-from brilliant_mqtt.write_admission import AdmissionTicket, Superseded, WriteClass, WriteResult
+from brilliant_mqtt.write_admission import (
+    AdmissionTicket,
+    Superseded,
+    WriteCancelled,
+    WriteClass,
+    WriteResult,
+)
 from tests.fakes import FakeClock
+from tests.mesh_regression_support import settlement
 
 
 async def _settle() -> None:
@@ -656,3 +663,107 @@ async def test_literal_status_strings_remain_successful_receipts(
     await harness.drain()
     assert await caller == repr(receipt)
     assert not isinstance(caller.result(), Superseded)
+
+
+def test_mark_settled_keeps_only_the_first_outcome() -> None:
+    ticket = AdmissionTicket()
+    seen: list[object] = []
+    settlement(ticket).set_settle_callback(seen.append)
+    assert not settlement(ticket).settled
+
+    settlement(ticket).mark_settled("first")
+    settlement(ticket).mark_settled(RuntimeError("second"))
+
+    assert settlement(ticket).settled
+    assert seen == ["first"]
+
+
+def test_settle_callback_replays_immediately_on_settled_ticket() -> None:
+    ticket = AdmissionTicket()
+    error = RuntimeError("late")
+    settlement(ticket).mark_settled(error)
+    seen: list[object] = []
+
+    settlement(ticket).set_settle_callback(seen.append)
+
+    assert seen == [error]
+
+
+def test_settle_callback_replay_failure_is_contained(caplog: pytest.LogCaptureFixture) -> None:
+    ticket = AdmissionTicket()
+    settlement(ticket).mark_settled("ok")
+
+    def fail(_outcome: object) -> None:
+        raise RuntimeError("private-payload-sentinel")
+
+    with caplog.at_level(logging.WARNING):
+        settlement(ticket).set_settle_callback(fail)
+
+    assert [r.getMessage() for r in caplog.records] == ["WRITE_SETTLE_CALLBACK_FAILED RuntimeError"]
+    assert caplog.records[0].exc_info is None
+    assert "private-payload-sentinel" not in caplog.text
+
+
+def test_clear_settle_callback_stops_delivery() -> None:
+    ticket = AdmissionTicket()
+    seen: list[object] = []
+    settlement(ticket).set_settle_callback(seen.append)
+
+    settlement(ticket).clear_settle_callback()
+    settlement(ticket).mark_settled("ok")
+
+    assert seen == []
+    assert settlement(ticket).settled
+
+
+async def test_cancel_waiting_before_issue_settles_write_cancelled(harness: _Harness) -> None:
+    await harness.queue("blocker", {"on": "1"})
+    ticket = AdmissionTicket()
+    seen: list[object] = []
+    settlement(ticket).set_settle_callback(seen.append)
+    caller = await harness.queue("light", {"on": "0"}, ticket=ticket)
+
+    ticket.cancel_waiting()
+    await _settle()
+
+    assert len(seen) == 1 and isinstance(seen[0], WriteCancelled)
+    assert harness.observer.calls == [("ble_mesh", "blocker", {"on": "1"})]
+    await asyncio.gather(caller, return_exceptions=True)
+
+
+async def test_fast_success_settles_before_set_variables_returns(harness: _Harness) -> None:
+    harness.observer.release_all = True
+    ticket = AdmissionTicket()
+
+    receipt = await harness.adapter.set_variables(
+        "ble_mesh", "light", [VarSet("on", "1")], ticket=ticket
+    )
+
+    assert receipt == "'ok'"
+    assert settlement(ticket).settled
+
+
+async def test_superseded_shared_ticket_settles_once_with_replacement_receipt(
+    harness: _Harness,
+) -> None:
+    await harness.queue("blocker", {"on": "1"})
+    ticket = AdmissionTicket()
+    seen: list[object] = []
+    settlement(ticket).set_settle_callback(seen.append)
+    original = await harness.queue(
+        "light", {"on": "0"}, write_class=WriteClass.INTERACTIVE_LATEST, ticket=ticket
+    )
+    assert harness.adapter.try_supersede(ticket, [VarSet("on", "1")])
+    assert isinstance(await original, Superseded)
+    assert seen == []  # supersession is not the native outcome
+    replacement = await harness.queue(
+        "light", {"on": "1"}, write_class=WriteClass.INTERACTIVE_LATEST, ticket=ticket
+    )
+    harness.observer.receipt = "replacement"
+
+    await harness.drain()
+    await _settle()
+
+    assert await replacement == "'replacement'"
+    assert seen == ["'replacement'"]
+    assert harness.observer.calls[-1] == ("ble_mesh", "light", {"on": "1"})

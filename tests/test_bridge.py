@@ -1961,8 +1961,9 @@ class TestMeshConfirmedWrites:
 
         await asyncio.sleep(0)
         assert sleeper.requested == [80.0]  # only the ON command armed a timer
-        clock.advance(80.0)
+        clock.advance(75.0)
         await bus.emit(_mesh_dimmer_at("1"))
+        clock.advance(5.0)
         await sleeper.release_all()
         payloads = [json.loads(p[1]) for p in _mesh_states(mqtt)]
         assert payloads == [
