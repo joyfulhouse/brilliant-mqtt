@@ -62,6 +62,7 @@ from custom_components.brilliant_mqtt.panel_provisioner import (
 )
 from custom_components.brilliant_mqtt.provisioning_journal import (
     ProvisioningJournal,
+    ProvisioningJournalError,
     ProvisioningOperation,
     ProvisioningPhase,
     ProvisioningRecord,
@@ -1514,6 +1515,53 @@ async def test_broker_preflight_retained_cleanup_failure_stays_actionable_and_re
 
     harness.operations.fail_at.discard("finalize_baseline")
     harness.journal.fail_remove_retained = False
+    provisioner = harness.provisioner()
+
+    async def unowned(_retained: RetainedRollback) -> bool:
+        return False
+
+    provisioner._retained_owner_exists = unowned
+    await provisioner.async_discard_unactivated_ownerless_baseline(
+        retained,
+        "office.iot.example",
+        "SECRET-root-password",
+        HostIdentity(_PUBLIC_KEY, _FINGERPRINT),
+    )
+    assert _TRANSACTION_ID not in harness.journal.retained
+
+
+async def test_broker_preflight_postclear_retained_read_failure_stays_actionable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed storage read during the cleanup handoff retains recovery and repair."""
+    harness = _Harness()
+    harness.journal.track_retained = True
+    harness.preflight_error = OperationError.for_code(
+        OperationStage.FLEET_AUTH,
+        "broker_connect_failed",
+    )
+    original_read = harness.journal.async_retained
+
+    async def fail_after_clear(transaction_id: UUID) -> RetainedRollback | None:
+        if ("journal_cleanup_complete",) in harness.events:
+            raise ProvisioningJournalError("journal_load_failed")
+        return await original_read(transaction_id)
+
+    monkeypatch.setattr(harness.journal, "async_retained", fail_after_clear)
+    with pytest.raises(PanelProvisioningError) as raised:
+        await harness.provisioner().async_install(_request(), _fleet(), harness.progress)
+
+    assert harness.journal.record is None
+    retained = harness.journal.retained[_TRANSACTION_ID]
+    assert retained.state == "armed"
+    assert raised.value.code == "preflight_failed"
+    assert raised.value.detail is not None
+    assert raised.value.detail.code == "broker_connect_failed"
+    assert raised.value.cleanup_code == "cleanup_failed"
+    assert ("repair", _TRANSACTION_ID, "preflight_failed", "cleanup_failed") in harness.events
+    assert ("finalize_baseline",) not in harness.events
+
+    monkeypatch.setattr(harness.journal, "async_retained", original_read)
     provisioner = harness.provisioner()
 
     async def unowned(_retained: RetainedRollback) -> bool:

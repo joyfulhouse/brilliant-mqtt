@@ -1708,12 +1708,13 @@ class PanelProvisioner:
             )
         except (PanelOpError, PanelProvisioningError, ValueError, TypeError):
             return False
+        state.pending_retained_cleanup = True
         await self._journal.async_complete_cleanup(state.transaction_id)
         state.journal_phase = None
         retained = await self._journal.async_retained(state.transaction_id)
         if retained is None or not retained.ownerless_unactivated_discard_allowed:
+            state.pending_retained_cleanup = False
             return True
-        state.pending_retained_cleanup = True
         current = await self._journal.async_begin_ownerless_unactivated_discard(retained)
         await self._operations.finalize_baseline(
             state.shell,
