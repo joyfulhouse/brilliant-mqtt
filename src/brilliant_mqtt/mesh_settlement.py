@@ -249,7 +249,7 @@ class MeshSettlement:
             names = self._supported if isinstance(event, PeripheralAbsent) else _PRIMARY
             changed = False
             for name in names:
-                changed |= self._merge(name, None, envelope, True, effects)
+                changed |= self._merge(name, None, envelope, effects)
             if changed:
                 self._touch(effects)
         elif isinstance(event, Begin):
@@ -502,6 +502,9 @@ class MeshSettlement:
         if not same_source_return and not self._admitted(envelope):
             return ()
         self._completion_hold = None
+        if not self._hold_blocks_primary:
+            # Ordinary superseded work releases only the physical issue barrier.
+            return ()
         self._hold_blocks_primary = False
         self._retire(envelope)
         effects: list[Effect] = []
@@ -523,14 +526,14 @@ class MeshSettlement:
                 continue
             present.add(name)
             reliable = capture.reliable and name in reported
-            if name in _PRIMARY and not reliable:
+            if not reliable:
                 continue
-            changed |= self._merge(name, field, event.envelope, reliable, effects, seed=seed)
+            changed |= self._merge(name, field, event.envelope, effects, seed=seed)
         removed = capture.removed if capture.reliable else frozenset()
         if capture.complete and capture.reliable:
             removed = removed | (self._supported - present)
         for name in removed & self._supported:
-            changed |= self._merge(name, None, event.envelope, True, effects, seed=seed)
+            changed |= self._merge(name, None, event.envelope, effects, seed=seed)
         if (
             capture.reliable
             and "motion_score" in reported
@@ -546,7 +549,6 @@ class MeshSettlement:
         name: str,
         field: PrimitiveField | None,
         envelope: Envelope,
-        reliable: bool,
         effects: list[Effect],
         *,
         seed: bool = False,
@@ -560,11 +562,9 @@ class MeshSettlement:
             self._fields.pop(name, None)
         else:
             self._fields[name] = field
-        if reliable and envelope.sequence > self._projection_fences.get(name, envelope.sequence):
+        if envelope.sequence > self._projection_fences.get(name, envelope.sequence):
             self._projection_fences.pop(name, None)
             self._projections.pop(name, None)
-        if not reliable:
-            return True
         if name == "enable_motion_score" and (field is None or field.value != "1"):
             self._last_hot = None
         if name in _PRIMARY:

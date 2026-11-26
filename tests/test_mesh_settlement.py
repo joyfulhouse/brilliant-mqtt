@@ -334,6 +334,7 @@ def test_worker_abandonment_keeps_real_completion_floor(return_first: bool) -> N
         assert slot.render(5)["state"] is None
         slot.dispatch(Completion(env(slot, 7, 6), ticket))
         assert slot.render(6)["state"] is None
+        assert slot.view.retirement_sequence == 7
         observe(slot, 8, 7, on="1")
     assert slot.render(7)["state"] == ("ON" if not return_first else "OFF")
     assert slot.view.window is None
@@ -365,6 +366,7 @@ def test_successor_only_inherits_physical_hold_and_old_completion_cannot_settle_
     successor.dispatch(Completion(replace(env(successor, 8, 7), generation=1), ticket))
     assert successor.view.phase is Phase.ISSUING
     assert successor.view.targets == (("on", "0"),)
+    assert successor.view.retirement_sequence == 8
     assert successor.render(7)["state"] is None
     successor.dispatch(Observe(fresh(9, 8), PrimitiveCapture((PrimitiveField("on", "1"),), True)))
     assert successor.render(8)["state"] == "ON"
@@ -824,3 +826,81 @@ def test_abandoned_native_outcome_does_not_rearm_and_exact_completion_is_require
     slot.dispatch(Completion(env(slot, 7, 6), ticket))
     assert slot.view.completion_hold is None
     assert slot.render(6)["state"] is None
+
+
+@pytest.mark.parametrize("caller_timed_out", [False, True])
+@pytest.mark.parametrize("targets", [(("on", "1"),), (("intensity", "600"),)])
+def test_superseded_physical_completion_preserves_current_intent_render_and_debt(
+    caller_timed_out: bool,
+    targets: tuple[tuple[str, str], ...],
+) -> None:
+    slot = owner()
+    observe(slot, 2, 0, on="1", intensity="600", power="100")
+    first = begin(slot, seq=3, at=1, targets=(("on", "0"),))
+    issue(slot, first, seq=4, at=2)
+    if caller_timed_out:
+        slot.dispatch(CallerTimeout(env(slot, 5, 7), slot.view.command_id, first))
+    second = begin(slot, seq=6, at=8, targets=targets)
+    before = slot.view
+    document = slot.render(8)
+    session = object()
+    token = slot.publication_token(session)
+    assert before.phase is Phase.ISSUING
+    assert before.status == "superseded"
+    assert document["state"] == "ON"
+    assert before.completion_hold is not None
+    assert before.completion_hold.ticket is first
+
+    effects = slot.dispatch(Completion(env(slot, 7, 9), first))
+
+    assert slot.view == replace(before, completion_hold=None)
+    assert slot.render(9) == document
+    assert slot.publication_token(session) == token
+    assert effects == ()
+    issue(slot, second, seq=8, at=10)
+    issued = slot.view
+    assert issued.ticket is second and issued.targets == targets
+    assert issued.issue_boundary is not None and issued.issue_boundary.sequence == 8
+    assert issued.completion_hold is not None and issued.completion_hold.ticket is second
+    assert issued.phase is Phase.ISSUING
+
+
+@pytest.mark.parametrize("aux_actually_reported", [False, True])
+def test_aux_replay_ignores_copied_mirror_but_yields_to_actual_native_report(
+    aux_actually_reported: bool,
+) -> None:
+    slot = owner()
+    ticket = object()
+    slot.dispatch(AuxIssue(env(slot, 2, 1), ticket, (("enable_motion_score", "1"),)))
+    returned = env(slot, 3, 2)
+    reported = frozenset(("power", "enable_motion_score") if aux_actually_reported else ("power",))
+    observe(slot, 4, 3, reported=reported, power="100", enable_motion_score="0")
+
+    slot.dispatch(AuxAccepted(returned, ticket))
+
+    expected = "0" if aux_actually_reported else "1"
+    assert slot.materialize(3).variables["enable_motion_score"].value == expected
+    assert slot.render(3)["power"] == 10
+    if aux_actually_reported:
+        assert slot.view.projections == ()
+        assert dict(slot.view.watermarks)["enable_motion_score"] == 4
+    else:
+        projection = dict(slot.view.projections)["enable_motion_score"]
+        assert projection.value == "1" and projection.timestamp_ms is None
+        assert "enable_motion_score" not in dict(slot.view.watermarks)
+        assert "enable_motion_score" not in dict(slot.view.observed)
+
+    slot.dispatch(
+        Observe(
+            env(slot, 5, 4),
+            PrimitiveCapture(
+                (PrimitiveField("enable_motion_score", expected, timestamp_ms=1234),),
+                complete=False,
+                reported=frozenset(("enable_motion_score",)),
+            ),
+        )
+    )
+    assert slot.view.projections == ()
+    native = slot.materialize(4).variables["enable_motion_score"]
+    assert native.value == expected and native.timestamp_ms == 1234
+    assert dict(slot.view.watermarks)["enable_motion_score"] == 5
