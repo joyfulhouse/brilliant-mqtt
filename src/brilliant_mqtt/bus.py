@@ -1011,11 +1011,14 @@ class RpcBusAdapter:
             if field_name in admitted_fields and variable.value is not None
         }
         for sink, fields in scopes:
-            reliable = complete or (
-                mask is not None
-                and mask.reliable
-                and mask.reported.intersection(fields) <= snapshot.variables.keys()
-                and not mask.removed.intersection(fields).intersection(snapshot.variables)
+            reliable = bool(fields) and (
+                complete
+                or (
+                    mask is not None
+                    and mask.reliable
+                    and mask.reported.intersection(fields) <= snapshot.variables.keys()
+                    and not mask.removed.intersection(fields).intersection(snapshot.variables)
+                )
             )
             values = tuple(value for name, value in primitive_fields.items() if name in fields)
             self._mesh_deliver(
@@ -1024,7 +1027,7 @@ class RpcBusAdapter:
                     metadata,
                     PrimitiveCapture(
                         values,
-                        complete=complete,
+                        complete=complete and bool(fields),
                         reliable=reliable,
                         reported=mask.reported.intersection(fields)
                         if reliable and mask

@@ -483,3 +483,17 @@ async def test_actual_read_push_overlap_merges_owner_fields_independently(newer_
         assert owner.view.status == "contradicted"
         assert rendered["state"] == "ON"
     await adapter.shutdown()
+
+
+async def test_metadata_only_field_scope_does_not_infer_target_absence() -> None:
+    from brilliant_mqtt.mesh_ingress import MeshCapture
+
+    adapter, _, _ = adapter_for(_RawDevice("ble_mesh", {"p": _RawPeripheral()}))
+    seen: list[object] = []
+    adapter.register_mesh_sink(seen.append, want_fields=lambda _pid: frozenset())
+    await adapter.get_all()
+    capture = next(event for event in seen if isinstance(event, MeshCapture))
+    assert capture.capture.fields == ()
+    assert not capture.capture.complete
+    assert not capture.capture.reliable
+    await adapter.shutdown()
