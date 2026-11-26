@@ -347,33 +347,73 @@ class Bridge:
                     registry.enabled
                     and registry.acquisition is acquisition
                     and registry.bus.mesh_admission_open
-                    and (payload == "offline" or not registry.disabled and registry.inventory_ready)
+                    and (payload == "offline" or self._mesh_online_ready())
                 ),
                 payload=payload,
             ),
-            revoke=payload == "offline",
+            revoke=True,
+        )
+
+    def _mesh_online_ready(self) -> bool:
+        registry = self._mesh
+        if (
+            registry is None
+            or not registry.enabled
+            or registry.disabled
+            or not registry.inventory_ready
+            or registry.retired
+            or self._mesh_driver is None
+        ):
+            return False
+        expected: set[str] = set()
+        for owner in registry.owners:
+            if (
+                not registry.live(owner)
+                or self._mesh_driver.published_fields(owner) is None
+                or owner.view.terminal is not None
+                or owner.view.in_flight is not None
+            ):
+                return False
+            pid = owner.metadata.peripheral_id
+            descriptors = entities_for(owner.materialize(self._clock()), self._panel)
+            if self._mesh_descriptors.get(owner) != tuple(descriptors):
+                return False
+            for descriptor in descriptors:
+                topic = config_topic(descriptor)
+                expected.add(topic)
+                record = self._mesh_routing.records.get(topic)
+                if (
+                    record is None
+                    or record.desired.payload is None
+                    or not self._mesh_routing.repaired(topic, owner, payload=record.desired.payload)
+                ):
+                    return False
+                command = self._command_topic_for(pid, descriptor)
+                if command is None:
+                    continue
+                expected.add(command)
+                if (
+                    not self._mesh_routing.repaired(command, owner, membership=True)
+                    or command not in self._subscribed
+                    or self._resolve_mesh_owner(command) is not owner
+                    or self._by_cmd_topic.get(command)
+                    != (pid, descriptor if descriptor.command_var is not None else None)
+                ):
+                    return False
+        return all(
+            record.peripheral_id is None or topic in expected
+            for topic, record in self._mesh_routing.records.items()
         )
 
     async def _repair_mesh_availability(self) -> None:
         registry = self._mesh
         if registry is None or not registry.enabled or self._panel != _MESH_PANEL:
             return
-        ready = (
-            not registry.disabled
-            and registry.inventory_ready
-            and not registry.retired
-            and all(
-                registry.live(owner)
-                and self._mesh_driver is not None
-                and self._mesh_driver.published_fields(owner) is not None
-                and owner.view.terminal is None
-                and owner.view.in_flight is None
-                for owner in registry.owners
-            )
-        )
-        await asyncio.shield(self._queue_mesh_availability("online" if ready else "offline"))
+        payload = "online" if self._mesh_online_ready() else "offline"
+        await asyncio.shield(self._queue_mesh_availability(payload))
 
     def _mesh_revoked(self, owner: MeshSettlement) -> None:
+        self._mesh_status_changed()
         self._mesh_routing.revoke(owner)
         if self._mesh_commands is not None:
             self._mesh_commands.revoke(owner)

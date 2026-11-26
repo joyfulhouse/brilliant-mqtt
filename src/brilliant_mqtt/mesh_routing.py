@@ -54,6 +54,26 @@ class MeshRouting:
             if record.peripheral_id is not None
         )
 
+    def repaired(
+        self,
+        topic: str,
+        owner: object,
+        *,
+        payload: str | None = None,
+        membership: bool | None = None,
+    ) -> bool:
+        record = self.records.get(topic)
+        return (
+            record is not None
+            and record.desired.owner is owner
+            and record.desired.payload == payload
+            and record.desired.membership is membership
+            and not record.desired.forget
+            and record.applied is record.desired
+            and (payload is None or record.payload == payload)
+            and (membership is None or record.membership is membership)
+        )
+
     def request(
         self, topic: str, desired: DesiredTopic, *, force: bool = False, revoke: bool = False
     ) -> asyncio.Task[None]:
@@ -121,6 +141,8 @@ class MeshRouting:
 
     async def _publish(self, topic: str, record: TopicRepair, desired: DesiredTopic) -> None:
         assert desired.payload is not None
+        if record.desired is not desired or not desired.valid():
+            return
         await self.publish(topic, desired.payload)
         record.payload, record.applied = desired.payload, desired
 
@@ -145,6 +167,8 @@ class MeshRouting:
                 # the latest desired value, even if their owner was replaced.
                 if record.desired is not desired:
                     continue
+                if record.applied is not desired:
+                    return
             if desired.membership is not None and desired.membership != record.membership:
                 await self._operation(record, self._membership(topic, record, desired.membership))
                 if record.desired is not desired:

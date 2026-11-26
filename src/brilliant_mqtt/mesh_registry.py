@@ -36,7 +36,7 @@ from brilliant_mqtt.mesh_settlement_types import (
     UpdateMetadata,
     WakePublication,
 )
-from brilliant_mqtt.model import CaptureProvenance
+from brilliant_mqtt.model import CaptureProvenance, DeviceKind
 from brilliant_mqtt.protocols import MeshBusClient
 from brilliant_mqtt.write_admission import AdmissionTicket
 
@@ -247,8 +247,11 @@ class MeshRegistry:
         if not owner.accepts_capture(boundary):
             return
         # Field absence remains useful even if newer disjoint presence kept topology.
+        routing_before = self._routing_shape(owner)
         self.dispatch(owner, PeripheralAbsent(self.envelope(owner, boundary)))
         if boundary.sequence <= binding.existence_sequence:
+            if self._routing_shape(owner) != routing_before:
+                self.changed()
             return
         pid = owner.metadata.peripheral_id
         self._bindings.pop(pid, None)
@@ -363,13 +366,29 @@ class MeshRegistry:
             if seed:
                 self.dispatch(owner, SeedBinding(self.envelope(owner, birth), event.capture))
             self.effects(owner, (WakePublication(owner),))
+            self.changed()
             return
         owner = binding.owner
+        routing_before = self._routing_shape(owner)
         binding.existence_sequence = max(binding.existence_sequence, boundary.sequence)
         if boundary.sequence > binding.metadata_sequence:
             binding.metadata_sequence = boundary.sequence
             self.dispatch(owner, UpdateMetadata(self.envelope(owner, boundary), metadata))
         self.dispatch(owner, Observe(self.envelope(owner, boundary), event.capture))
+        if self._routing_shape(owner) != routing_before:
+            self.changed()
+
+    @staticmethod
+    def _routing_shape(owner: MeshSettlement) -> tuple[MeshMetadata, frozenset[str]]:
+        fields = dict(owner.view.observed)
+        visible = {
+            spec.var
+            for spec in AUX_SPECS[owner.metadata.kind]
+            if spec.var in fields and fields[spec.var].value not in spec.skip_values
+        }
+        if owner.metadata.kind is DeviceKind.BINARY_SENSOR and "lux" in fields:
+            visible.add("lux")
+        return owner.metadata, frozenset(visible)
 
     def _new(
         self, metadata: MeshMetadata, boundary: CaptureProvenance, *, replaced: bool = False
