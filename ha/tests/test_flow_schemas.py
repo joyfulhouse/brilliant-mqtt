@@ -298,6 +298,66 @@ def test_new_broker_schema_never_serializes_a_supplied_password() -> None:
     assert SECRET_UNCHANGED not in encoded
 
 
+@pytest.mark.parametrize(
+    "host",
+    [
+        "core-mosquitto",
+        "homeassistant.local.hass.io",
+        "local.hass.io",
+        "a0d7b954-mosquitto.local.hass.io",
+        "127.0.0.1",
+        "localhost",
+        "a0d7b954-mosquitto",
+        "a0d7b954-mosquitto.",
+    ],
+)
+def test_normalize_broker_input_rejects_hosts_panels_cannot_reach(host: str) -> None:
+    with pytest.raises(FlowInputError) as raised:
+        normalize_broker_input(
+            BrokerKind.EXISTING_BROKER,
+            _valid_broker_input(**{CONF_MQTT_HOST: host}),
+        )
+
+    assert dict(raised.value.errors) == {CONF_MQTT_HOST: "broker_host_not_panel_reachable"}
+
+
+@pytest.mark.parametrize("host", ["mqtt-broker", "my-broker", "b0c1d2e3-addon"])
+def test_normalize_broker_input_accepts_hyphenated_lan_names(host: str) -> None:
+    normalized = normalize_broker_input(
+        BrokerKind.EXISTING_BROKER,
+        _valid_broker_input(**{CONF_MQTT_HOST: host}),
+    )
+
+    assert normalized[CONF_MQTT_HOST] == host
+
+
+@pytest.mark.parametrize("kind", [BrokerKind.OFFICIAL_MOSQUITTO, BrokerKind.EXISTING_BROKER])
+@pytest.mark.parametrize("reconfigure", [False, True], ids=["setup", "reconfigure"])
+@pytest.mark.parametrize(
+    "host",
+    [
+        "a0d7b954-mosquitto.lan",
+        " A0D7B954-ESPHome.Example.Test. ",
+        "core-mosquitto.lan",
+    ],
+)
+def test_normalize_broker_input_accepts_dotted_lan_names_with_addon_prefixes(
+    kind: BrokerKind,
+    reconfigure: bool,
+    host: str,
+) -> None:
+    password = SECRET_UNCHANGED if reconfigure else "mqtt-secret"
+    normalized = normalize_broker_input(
+        kind,
+        _valid_broker_input(**{CONF_MQTT_HOST: host, CONF_MQTT_PASSWORD: password}),
+        stored_password="mqtt-secret" if reconfigure else None,
+    )
+
+    assert normalized[CONF_MQTT_HOST] == host.strip().lower()
+    assert normalized[CONF_BROKER_KIND] == kind.value
+    assert normalized[CONF_MQTT_PASSWORD] == "mqtt-secret"
+
+
 def test_normalize_broker_input_flattens_shared_advanced_values() -> None:
     ca = ca_pem("broker-ca")
     normalized = normalize_broker_input(

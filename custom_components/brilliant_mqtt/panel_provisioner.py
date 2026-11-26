@@ -20,6 +20,7 @@ from homeassistant.const import CONF_NAME
 from homeassistant.core import HomeAssistant
 
 from .broker import BrokerProfile
+from .broker_host import format_broker_endpoint
 from .broker_validation import BrokerValidationResult
 from .const import (
     COMPONENT_BRIDGE,
@@ -184,6 +185,15 @@ _MAX_JSON_NODES = 4096
 _PROGRESS_TIMEOUT_SECONDS = 5.0
 RECOVERY_TIMEOUT_SECONDS = 300.0
 INSTALL_LOCK_TIMEOUT_SECONDS = 30.0
+_BROKER_PREFLIGHT_DISCARD_CODES = frozenset(
+    {
+        "broker_connect_failed",
+        "broker_timeout",
+        "broker_unavailable",
+        "broker_connection_rejected",
+    }
+)
+_BROKER_REACHABILITY_CAUSES = frozenset({"ok", "dns", "connection_refused", "timeout", "connect"})
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -198,6 +208,8 @@ class ProvisioningFailureDetail:
     redacted_detail: str
     cleanup_stage: OperationStage | None = None
     cleanup_code: str | None = None
+    broker_endpoint: str = ""
+    connect_cause: str = ""
 
     def __post_init__(self) -> None:
         valid = False
@@ -213,6 +225,10 @@ class ProvisioningFailureDetail:
                 valid = valid and self.cleanup_stage is None and self.cleanup_code is None
             else:
                 OperationError.for_code(self.cleanup_stage, self.cleanup_code)
+            OperationError.for_code(self.stage, self.code).with_connect_context(
+                broker_endpoint=self.broker_endpoint,
+                connect_cause=self.connect_cause,
+            )
         except (TypeError, ValueError):
             valid = False
         if not valid:
@@ -233,6 +249,8 @@ class ProvisioningFailureDetail:
             redacted_detail=error.redacted_detail,
             cleanup_stage=cleanup.stage if cleanup is not None else None,
             cleanup_code=cleanup.code if cleanup is not None else None,
+            broker_endpoint=error.broker_endpoint,
+            connect_cause=error.connect_cause,
         )
 
     def redacted_dict(self) -> dict[str, object]:
@@ -244,6 +262,8 @@ class ProvisioningFailureDetail:
             "summary_key": self.summary_key,
             "documentation_slug": self.documentation_slug,
             "redacted_detail": self.redacted_detail,
+            "broker_endpoint": self.broker_endpoint,
+            "connect_cause": self.connect_cause,
             "cleanup_error": (
                 None
                 if self.cleanup_stage is None
@@ -846,6 +866,13 @@ class PanelOperations(Protocol):
         staged: StagedRelease,
     ) -> None: ...
 
+    async def probe_broker_reachability(
+        self,
+        shell: PanelShell,
+        host: str,
+        port: int,
+    ) -> str: ...
+
 
 class _HealthObserver(Protocol):
     async def async_subscribe(self) -> None: ...
@@ -891,6 +918,8 @@ class _InstallState:
     journal_phase: ProvisioningPhase | None = None
     failure_code: str = "invalid_provisioning_dependency"
     failure_stage: str = "provisioning"
+    discard_unactivated_baseline: bool = False
+    pending_retained_cleanup: bool = False
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -1022,6 +1051,12 @@ class PanelProvisioner:
                     else state.failure_code
                 )
             except OperationError as error:
+                if (
+                    state.failure_code == "preflight_failed"
+                    and state.journal_phase is not None
+                    and error.code in _BROKER_PREFLIGHT_DISCARD_CODES
+                ):
+                    state.discard_unactivated_baseline = True
                 detail = (
                     ProvisioningFailureDetail.from_operation_error(error)
                     if state.failure_code == "preflight_failed"
@@ -1056,7 +1091,10 @@ class PanelProvisioner:
                 )
                 if (
                     compensation.error is not None
-                    and state.journal_phase is ProvisioningPhase.STAGED
+                    and (
+                        state.journal_phase is ProvisioningPhase.STAGED
+                        or state.pending_retained_cleanup
+                    )
                     and cancellation is None
                     and primary is not None
                 ):
@@ -1322,6 +1360,7 @@ class PanelProvisioner:
         assert state.shell is not None
         assert state.transaction_id is not None
         assert state.setup_id is not None
+        await self._async_require_panel_broker_reachability(state, fleet)
         state.failure_code = "progress_failed"
         state.failure_stage = "progress"
         await _report(progress, ProvisioningProgressStage.SNAPSHOTTING)
@@ -1596,9 +1635,95 @@ class PanelProvisioner:
                 )
             )
         await self._operations.cleanup_staged(state.shell, state.staged)
+        if (
+            state.journal_phase is ProvisioningPhase.STAGED
+            and state.discard_unactivated_baseline
+            and await self._async_try_discard_unactivated_baseline(state)
+        ):
+            return
         if state.journal_phase is ProvisioningPhase.STAGED:
             await self._journal.async_complete_cleanup(state.transaction_id)
             state.journal_phase = None
+
+    async def _async_require_panel_broker_reachability(
+        self,
+        state: _InstallState,
+        fleet: FleetConfig,
+    ) -> None:
+        """Fail before a baseline exists when the panel cannot open the broker.
+
+        The full MQTT preflight has to run the staged candidate, and that candidate
+        is journaled first so a crash can be recovered. A read-only DNS/TCP probe
+        does not mutate the panel, so it runs before the baseline is captured.
+        """
+        assert state.shell is not None
+        state.failure_code = "preflight_failed"
+        state.failure_stage = "preflight"
+        cause = "connect"
+        try:
+            cause = await self._operations.probe_broker_reachability(
+                state.shell,
+                fleet.broker.host,
+                fleet.broker.port,
+            )
+        except PanelOpError:
+            cause = "connect"
+        if cause == "ok":
+            return
+        if cause not in _BROKER_REACHABILITY_CAUSES:
+            cause = "connect"
+        code = "broker_timeout" if cause == "timeout" else "broker_connect_failed"
+        raise OperationError.for_code(OperationStage.FLEET_AUTH, code).with_connect_context(
+            broker_endpoint=format_broker_endpoint(fleet.broker.host, fleet.broker.port),
+            connect_cause=cause,
+        )
+
+    async def _async_try_discard_unactivated_baseline(self, state: _InstallState) -> bool:
+        """Drop an armed pre-activation baseline after a broker preflight failure.
+
+        Proof matches the ownerless unactivated discard, including a fresh live
+        snapshot. Drift leaves the armed baseline in place. A later retained
+        finalize or removal failure stays pending so the original broker error
+        still reports cleanup and a fresh-auth retry can finish it.
+        """
+        if (
+            state.shell is None
+            or state.snapshot is None
+            or state.staged is None
+            or state.transaction_id is None
+        ):
+            return False
+        retained = await self._journal.async_retained(state.transaction_id)
+        if retained is None or not retained.ownerless_unactivated_discard_allowed:
+            return False
+        record = await self._journal.async_load()
+        password = ""
+        if isinstance(record, ProvisioningRecord) and record.transaction_id == state.transaction_id:
+            password = record.panel_request.root_password
+        try:
+            await self._async_prove_unactivated_panel(
+                state.shell,
+                retained,
+                password=password,
+            )
+        except (PanelOpError, PanelProvisioningError, ValueError, TypeError):
+            return False
+        state.pending_retained_cleanup = True
+        await self._journal.async_complete_cleanup(state.transaction_id)
+        state.journal_phase = None
+        retained = await self._journal.async_retained(state.transaction_id)
+        if retained is None or not retained.ownerless_unactivated_discard_allowed:
+            state.pending_retained_cleanup = False
+            return True
+        current = await self._journal.async_begin_ownerless_unactivated_discard(retained)
+        await self._operations.finalize_baseline(
+            state.shell,
+            self._snapshot_from_stored(current.record.prior_snapshot),
+        )
+        await self._journal.async_remove_retained(current.record.transaction_id)
+        await self._repair_reporter.async_clear_rollback_failure(current.record.transaction_id)
+        state.pending_retained_cleanup = False
+        return True
 
     async def _async_reopen_compensate_and_close(
         self,
@@ -1634,22 +1759,26 @@ class PanelProvisioner:
         original_code: str,
         compensation: _Settlement,
     ) -> None:
+        retained_cleanup_pending = state.pending_retained_cleanup
         if (
             compensation.error is None
-            or state.journal_phase
-            not in {
-                ProvisioningPhase.STAGED,
-                ProvisioningPhase.ACTIVATION_PENDING,
-                ProvisioningPhase.ACTIVATED,
-                ProvisioningPhase.VERIFYING,
-                ProvisioningPhase.ROLLBACK_PENDING,
-            }
             or state.transaction_id is None
+            or (
+                state.journal_phase
+                not in {
+                    ProvisioningPhase.STAGED,
+                    ProvisioningPhase.ACTIVATION_PENDING,
+                    ProvisioningPhase.ACTIVATED,
+                    ProvisioningPhase.VERIFYING,
+                    ProvisioningPhase.ROLLBACK_PENDING,
+                }
+                and not retained_cleanup_pending
+            )
         ):
             return
         compensation_code = (
             "cleanup_failed"
-            if state.journal_phase is ProvisioningPhase.STAGED
+            if retained_cleanup_pending or state.journal_phase is ProvisioningPhase.STAGED
             else "rollback_failed"
         )
         await _settle(

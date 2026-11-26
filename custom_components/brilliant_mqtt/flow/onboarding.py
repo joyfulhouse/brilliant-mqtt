@@ -5,14 +5,18 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
+from datetime import datetime
+from functools import wraps
 from types import MappingProxyType
 from typing import Any, cast
 
 import asyncssh
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.core import callback
+from homeassistant.data_entry_flow import FlowResultType, UnknownFlow
 from homeassistant.helpers import issue_registry as ir
+from homeassistant.helpers.event import async_call_later
 
 from ..const import (
     CONF_HOST,
@@ -60,6 +64,7 @@ from .support import (
     _CORE_COMPONENTS,
     _PANEL_ONBOARDING_DOCUMENTATION_URL,
     _PROVISIONING_STAGE_ORDER,
+    PROVISIONING_STARTED_CONTEXT,
     _duplicate_panel,
     _DuplicatePanel,
     _facts_placeholders,
@@ -76,6 +81,36 @@ from .support import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+PANEL_ADD_IDLE_TIMEOUT_SECONDS = 15 * 60
+
+
+def _serialize_confirmation[Step: Callable[..., Awaitable[_OnboardingResult]]](
+    step: Step,
+) -> Step:
+    """Let one submission own the step while other clients read its form."""
+
+    @wraps(step)
+    async def _step(
+        self: _PanelOnboardingMixin, user_input: dict[str, Any] | None = None
+    ) -> _OnboardingResult:
+        if user_input is None or self._submitted_operation_task is not None:
+            return await step(self, None)
+        owner = asyncio.current_task()
+        assert owner is not None
+        self._submitted_operation_task = owner
+        result: _OnboardingResult | None = None
+        try:
+            result = await step(self, user_input)
+            return result
+        finally:
+            if self._submitted_operation_task is owner:
+                self._submitted_operation_task = None
+                if self._provision_task is None:
+                    self._clear_submitted_operation()
+                    if result is not None and result["type"] is FlowResultType.FORM:
+                        self._arm_preprovision_idle_timeout()
+
+    return cast(Step, _step)
 
 
 class _PanelOnboardingMixin:
@@ -131,6 +166,82 @@ class _PanelOnboardingMixin:
         self._journal_recover = None
         self._aarch64_opt_in_required = False
         self._allow_aarch64 = False
+        self._idle_unsub: Callable[[], None] | None = None
+        self._submitted_operation_task: asyncio.Task[Any] | None = None
+
+    def _provisioning_started(self) -> bool:
+        context = cast(_FlowSurface, self).context
+        return (
+            CONF_PROVISIONING_TRANSACTION_ID in context
+            or context.get(PROVISIONING_STARTED_CONTEXT) is True
+        )
+
+    def _mark_submitted_operation(self) -> None:
+        """Own the flow before its first await so an idle abort cannot race it."""
+        self._cancel_idle_timeout()
+        cast(dict[str, Any], cast(_FlowSurface, self).context)[PROVISIONING_STARTED_CONTEXT] = True
+
+    def _clear_submitted_operation(self) -> None:
+        """Return a pre-provision form to idle after a submission does not start."""
+        context = cast(dict[str, Any], cast(_FlowSurface, self).context)
+        if CONF_PROVISIONING_TRANSACTION_ID not in context:
+            context.pop(PROVISIONING_STARTED_CONTEXT, None)
+
+    def _submitted_operation_owned(self) -> bool:
+        """True only for the submitting task while HA still owns this flow."""
+        if (
+            self._submitted_operation_task is not asyncio.current_task()
+            or not self._provisioning_started()
+        ):
+            return False
+        flow = cast(_FlowSurface, self)
+        flow_id = getattr(self, "flow_id", None)
+        if not isinstance(flow_id, str) or not flow_id:
+            return False
+        try:
+            flow.hass.config_entries.subentries.async_get(flow_id)
+        except UnknownFlow:
+            return False
+        return True
+
+    def _cancel_idle_timeout(self) -> None:
+        unsub = self._idle_unsub
+        self._idle_unsub = None
+        if unsub is not None:
+            unsub()
+
+    def _arm_preprovision_idle_timeout(self) -> None:
+        """Abort this Add panel flow if naming or confirm stays idle."""
+        self._cancel_idle_timeout()
+        if self._submitted_operation_task is not None or self._provisioning_started():
+            return
+        flow = cast(_FlowSurface, self)
+        flow_id = getattr(self, "flow_id", None)
+        if not isinstance(flow_id, str) or not flow_id:
+            return
+        if not any(
+            item["flow_id"] == flow_id
+            for item in flow.hass.config_entries.subentries.async_progress(
+                include_uninitialized=True
+            )
+        ):
+            return
+
+        @callback
+        def _expire(_now: datetime) -> None:
+            self._idle_unsub = None
+            if self._provisioning_started():
+                return
+            try:
+                flow.hass.config_entries.subentries.async_abort(flow_id)
+            except UnknownFlow:
+                return
+
+        self._idle_unsub = async_call_later(
+            flow.hass,
+            PANEL_ADD_IDLE_TIMEOUT_SECONDS,
+            _expire,
+        )
 
     def _onboarding_parent_entry(self) -> ConfigEntry[Any] | None:
         raise NotImplementedError
@@ -231,7 +342,16 @@ class _PanelOnboardingMixin:
 
     def _remove_panel_onboarding(self) -> None:
         """Schedule settlement when HA removes a marked flow before commit."""
+        self._cancel_idle_timeout()
         context = cast(dict[str, Any], cast(_FlowSurface, self).context)
+        task = self._provision_task
+        if (
+            context.pop(PROVISIONING_STARTED_CONTEXT, None) is True
+            and CONF_PROVISIONING_TRANSACTION_ID not in context
+            and task is not None
+            and not task.done()
+        ):
+            task.cancel()
         if (
             self._retained_finalize is not None
             or self._journal_recover is not None
@@ -367,6 +487,7 @@ class _PanelOnboardingMixin:
                 return await self.async_step_panel_confirm()
             self._panel_failure = failure
 
+        self._arm_preprovision_idle_timeout()
         return flow.async_show_form(
             step_id="panel_connect",
             data_schema=panel_connect_schema(self._panel_source),
@@ -434,6 +555,7 @@ class _PanelOnboardingMixin:
             description_placeholders={"documentation_url": _PANEL_ONBOARDING_DOCUMENTATION_URL},
         )
 
+    @_serialize_confirmation
     async def async_step_panel_discard_unactivated(
         self, user_input: dict[str, Any] | None = None
     ) -> _OnboardingResult:
@@ -448,24 +570,31 @@ class _PanelOnboardingMixin:
             if user_input.get("confirm_discard") is not True:
                 errors["base"] = "confirmation_required"
             else:
-                self._unactivated_discard = None
+                self._mark_submitted_operation()
+                if not self._submitted_operation_owned():
+                    return flow.async_abort(reason="invalid_flow_state")
                 try:
                     if self._onboarding_parent_entry() is None:
                         return flow.async_abort(reason="invalid_parent")
                     provisioner = gateway._get_panel_provisioner(
                         flow.hass, expected_identity=identity
                     )
+                    if not self._submitted_operation_owned():
+                        return flow.async_abort(reason="invalid_flow_state")
                     await provisioner.async_discard_unactivated_ownerless_baseline(
                         retained, host, password, identity
                     )
                 except asyncio.CancelledError:
+                    self._unactivated_discard = None
                     self._panel_root_password = None
                     raise
                 except PanelProvisioningError as error:
+                    self._unactivated_discard = None
                     self._panel_root_password = None
                     self._panel_failure = _provisioning_failure(error)
                     return await self.async_step_panel_connect()
                 except Exception as error:
+                    self._unactivated_discard = None
                     secrets = (
                         password,
                         host,
@@ -497,7 +626,11 @@ class _PanelOnboardingMixin:
                         storage_reason=reason or type(error).__name__,
                     )
                     return await self.async_step_panel_connect()
+                if not self._submitted_operation_owned():
+                    return flow.async_abort(reason="invalid_flow_state")
+                self._unactivated_discard = None
                 return await self.async_step_panel_confirm()
+        self._arm_preprovision_idle_timeout()
         return flow.async_show_form(
             step_id="panel_discard_unactivated",
             data_schema=panel_discard_unactivated_schema(),
@@ -510,6 +643,7 @@ class _PanelOnboardingMixin:
             },
         )
 
+    @_serialize_confirmation
     async def async_step_panel_recover_journal(
         self, user_input: dict[str, Any] | None = None
     ) -> _OnboardingResult:
@@ -524,34 +658,47 @@ class _PanelOnboardingMixin:
             if user_input.get("confirm_recover") is not True:
                 errors["base"] = "confirmation_required"
             else:
-                self._journal_recover = None
+                self._mark_submitted_operation()
+                if not self._submitted_operation_owned():
+                    return flow.async_abort(reason="invalid_flow_state")
                 try:
                     if self._onboarding_parent_entry() is None:
                         return flow.async_abort(reason="invalid_parent")
                     provisioner = gateway._get_panel_provisioner(
                         flow.hass, expected_identity=identity
                     )
+                    if not self._submitted_operation_owned():
+                        return flow.async_abort(reason="invalid_flow_state")
                     await provisioner.async_recover_ownerless_journal(
                         record, host, password, identity
                     )
+                    if not self._submitted_operation_owned():
+                        return flow.async_abort(reason="invalid_flow_state")
                     retained = await gateway.async_ownerless_recovery_candidate(
                         flow.hass, host, identity
                     )
                 except asyncio.CancelledError:
+                    self._journal_recover = None
                     self._panel_root_password = None
                     raise
                 except PanelProvisioningError as error:
+                    self._journal_recover = None
                     self._panel_root_password = None
                     self._panel_failure = _provisioning_failure(error)
                     return await self.async_step_panel_connect()
                 except Exception:
+                    self._journal_recover = None
                     self._panel_root_password = None
                     self._panel_failure = _panel_failure("recovery_failed", stage="recovery")
                     return await self.async_step_panel_connect()
+                if not self._submitted_operation_owned():
+                    return flow.async_abort(reason="invalid_flow_state")
+                self._journal_recover = None
                 if retained is None:
                     return await self.async_step_panel_confirm()
                 self._retained_finalize = retained
                 return await self.async_step_panel_finalize_retained()
+        self._arm_preprovision_idle_timeout()
         return flow.async_show_form(
             step_id="panel_recover_journal",
             data_schema=panel_recover_journal_schema(),
@@ -572,6 +719,7 @@ class _PanelOnboardingMixin:
             },
         )
 
+    @_serialize_confirmation
     async def async_step_panel_finalize_retained(
         self, user_input: dict[str, Any] | None = None
     ) -> _OnboardingResult:
@@ -585,12 +733,17 @@ class _PanelOnboardingMixin:
             if user_input.get("confirm_finalize") is not True:
                 errors["base"] = "confirmation_required"
             else:
+                self._mark_submitted_operation()
+                if not self._submitted_operation_owned():
+                    return flow.async_abort(reason="invalid_flow_state")
                 try:
                     if self._onboarding_parent_entry() is None:
                         return flow.async_abort(reason="invalid_parent")
                     provisioner = gateway._get_panel_provisioner(
                         flow.hass, expected_identity=identity
                     )
+                    if not self._submitted_operation_owned():
+                        return flow.async_abort(reason="invalid_flow_state")
                     await provisioner.async_finalize_ownerless_restored(
                         retained, host, password, identity
                     )
@@ -610,8 +763,11 @@ class _PanelOnboardingMixin:
                         "ownerless_finalize_reauthentication_required", stage="recovery"
                     )
                     return await self.async_step_panel_connect()
+                if not self._submitted_operation_owned():
+                    return flow.async_abort(reason="invalid_flow_state")
                 self._retained_finalize = None
                 return await self.async_step_panel_confirm()
+        self._arm_preprovision_idle_timeout()
         return flow.async_show_form(
             step_id="panel_finalize_retained",
             data_schema=panel_finalize_retained_schema(),
@@ -623,6 +779,7 @@ class _PanelOnboardingMixin:
             },
         )
 
+    @_serialize_confirmation
     async def async_step_panel_confirm(
         self,
         user_input: dict[str, Any] | None = None,
@@ -648,6 +805,9 @@ class _PanelOnboardingMixin:
                 parent = self._onboarding_parent_entry()
                 if parent is None:
                     return flow.async_abort(reason="invalid_parent")
+                self._mark_submitted_operation()
+                if not self._submitted_operation_owned():
+                    return flow.async_abort(reason="invalid_flow_state")
                 try:
                     await gateway._async_wait_config_entry_persisted(flow.hass, parent)
                 except asyncio.CancelledError:
@@ -658,6 +818,8 @@ class _PanelOnboardingMixin:
                         stage="storage",
                     )
                 else:
+                    if not self._submitted_operation_owned():
+                        return flow.async_abort(reason="invalid_flow_state")
                     ir.async_delete_issue(
                         flow.hass,
                         DOMAIN,
@@ -713,6 +875,10 @@ class _PanelOnboardingMixin:
                         self._release_override = (
                             dict(override) if isinstance(override, dict) else None
                         )
+                        if not self._submitted_operation_owned():
+                            return flow.async_abort(reason="invalid_flow_state")
+                        self._cancel_idle_timeout()
+                        cast(dict[str, Any], flow.context)[PROVISIONING_STARTED_CONTEXT] = True
                         self._provision_task = flow.hass.async_create_task(
                             self._async_provision(),
                             "brilliant-mqtt-panel-provision",
@@ -721,6 +887,7 @@ class _PanelOnboardingMixin:
 
         failure = self._panel_failure
         suggested_name = self._panel_name or _suggested_panel_name(facts)
+        self._arm_preprovision_idle_timeout()
         return flow.async_show_form(
             step_id="panel_confirm",
             data_schema=panel_confirm_schema(
@@ -822,19 +989,17 @@ class _PanelOnboardingMixin:
             self._release_override = None
             self._identity_refusal = error.release_override
             self._panel_failure = _provisioning_failure(error)
-            cast(dict[str, Any], flow.context).pop(
-                CONF_PROVISIONING_TRANSACTION_ID,
-                None,
-            )
+            context = cast(dict[str, Any], flow.context)
+            context.pop(CONF_PROVISIONING_TRANSACTION_ID, None)
+            context.pop(PROVISIONING_STARTED_CONTEXT, None)
         except Exception:
             self._panel_failure = _panel_failure(
                 "provisioning_failed",
                 stage="provisioning",
             )
-            cast(dict[str, Any], flow.context).pop(
-                CONF_PROVISIONING_TRANSACTION_ID,
-                None,
-            )
+            context = cast(dict[str, Any], flow.context)
+            context.pop(CONF_PROVISIONING_TRANSACTION_ID, None)
+            context.pop(PROVISIONING_STARTED_CONTEXT, None)
         finally:
             self._provision_task = None
 

@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
+import threading
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -103,6 +104,7 @@ from custom_components.brilliant_mqtt.flow.schemas import (
     BROKER_MENU_OPTIONS,
     SECRET_UNCHANGED,
 )
+from custom_components.brilliant_mqtt.flow.support import PROVISIONING_STARTED_CONTEXT
 from custom_components.brilliant_mqtt.manager import PanelManager
 from custom_components.brilliant_mqtt.panel_health import PanelHealthEvidence
 from custom_components.brilliant_mqtt.panel_inspection import (
@@ -165,6 +167,22 @@ _PANEL_INPUT = {
     CONF_HOST: "office.iot.example",
     CONF_ROOT_PASSWORD: _ROOT_PASSWORD,
 }
+
+
+@pytest.fixture(autouse=True)
+def _close_leftover_subentry_flows(hass: HomeAssistant) -> Iterator[None]:
+    """Drop Add panel flows so idle-timeout timers do not outlive a test."""
+    yield
+    from homeassistant.data_entry_flow import UnknownFlow
+
+    for item in list(hass.config_entries.subentries.async_progress(include_uninitialized=True)):
+        flow_id = item.get("flow_id")
+        if not isinstance(flow_id, str):
+            continue
+        try:
+            hass.config_entries.subentries.async_abort(flow_id)
+        except UnknownFlow:
+            continue
 
 
 @pytest.fixture(autouse=True)
@@ -798,6 +816,41 @@ async def test_user_menu_offers_recommended_and_existing_brokers_equally(
     assert result["type"] is FlowResultType.MENU
     assert result["step_id"] == "user"
     assert tuple(cast(Iterable[str], result["menu_options"])) == BROKER_MENU_OPTIONS
+
+
+async def test_setup_and_options_reject_addon_internal_broker_host(
+    hass: HomeAssistant,
+) -> None:
+    """Panels cannot resolve Home Assistant's internal add-on DNS name."""
+    setup = await _start_broker_form(hass, BrokerKind.EXISTING_BROKER)
+    rejected = await hass.config_entries.flow.async_configure(
+        setup["flow_id"],
+        {**_BROKER_INPUT, CONF_MQTT_HOST: "core-mosquitto"},
+    )
+
+    assert rejected["type"] is FlowResultType.FORM
+    assert rejected["step_id"] == "broker"
+    assert rejected["errors"] == {CONF_MQTT_HOST: "broker_host_not_panel_reachable"}
+    placeholders = rejected["description_placeholders"]
+    assert placeholders is not None
+    description = placeholders["documentation_url"]
+    assert isinstance(description, str) and description
+
+    entry = _fleet_entry(hass)
+    options = await _start_fleet_broker_options(hass, entry)
+    options_rejected = await hass.config_entries.options.async_configure(
+        options["flow_id"],
+        {
+            **_BROKER_INPUT,
+            CONF_MQTT_HOST: "127.0.0.1",
+            CONF_MQTT_PASSWORD: SECRET_UNCHANGED,
+        },
+    )
+
+    assert options_rejected["type"] is FlowResultType.FORM
+    assert options_rejected["step_id"] == "broker_profile"
+    assert options_rejected["errors"] == {CONF_MQTT_HOST: "broker_host_not_panel_reachable"}
+    assert entry.data[CONF_MQTT_HOST] == "mqtt.iot.example"
 
 
 async def test_official_broker_prefills_editable_local_host_and_port(
@@ -2959,10 +3012,18 @@ async def test_empty_fleet_broker_update_rejects_active_pre_journal_add_flow(
     ) as load_journal:
         result = await hass.config_entries.options.async_configure(options_flow_id)
 
-    assert result["type"] is FlowResultType.ABORT
-    assert result["reason"] == "broker_change_blocked_by_panel_onboarding"
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "broker_abort_idle_panel_flow"
     assert entry.data == original_data
     load_journal.assert_awaited_once()
+    declined = await hass.config_entries.options.async_configure(
+        options_flow_id,
+        {"confirm_abort_idle_panel_flow": False},
+    )
+    assert declined["type"] is FlowResultType.ABORT
+    assert declined["reason"] == "broker_change_blocked_by_add_panel_flow"
+    assert entry.data == original_data
+    assert hass.config_entries.subentries.async_progress(include_uninitialized=True)
 
 
 async def test_empty_fleet_broker_update_rejects_journal_without_subentry(
@@ -2980,7 +3041,7 @@ async def test_empty_fleet_broker_update_rejects_journal_without_subentry(
         result = await hass.config_entries.options.async_configure(options_flow_id)
 
     assert result["type"] is FlowResultType.ABORT
-    assert result["reason"] == "broker_change_blocked_by_panel_onboarding"
+    assert result["reason"] == "broker_change_blocked_by_active_journal"
     assert entry.data == original_data
     assert not entry.subentries
 
@@ -3000,7 +3061,7 @@ async def test_empty_fleet_broker_update_fails_closed_when_journal_is_unreadable
         result = await hass.config_entries.options.async_configure(options_flow_id)
 
     assert result["type"] is FlowResultType.ABORT
-    assert result["reason"] == "broker_change_blocked_by_panel_onboarding"
+    assert result["reason"] == "broker_change_blocked_by_journal_read_error"
     assert entry.data == original_data
 
 
@@ -3036,9 +3097,493 @@ async def test_empty_fleet_broker_update_rechecks_add_flow_after_journal_read(
             finish_journal_read.set()
             result = await asyncio.wait_for(commit_task, timeout=1)
 
-    assert result["type"] is FlowResultType.ABORT
-    assert result["reason"] == "broker_change_blocked_by_panel_onboarding"
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "broker_abort_idle_panel_flow"
     assert entry.data == original_data
+
+
+async def test_idle_add_panel_flow_can_be_aborted_before_broker_update(
+    hass: HomeAssistant,
+) -> None:
+    entry = _fleet_entry(hass)
+    options_flow_id = await _prepare_fleet_broker_commit(hass, entry)
+    add_flow = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, SUBENTRY_TYPE_PANEL),
+        context={"source": "user"},
+    )
+    assert add_flow["step_id"] == "panel_connect"
+    with patch.object(ProvisioningJournal, "async_load", AsyncMock(return_value=None)):
+        offered = await hass.config_entries.options.async_configure(options_flow_id)
+        assert offered["step_id"] == "broker_abort_idle_panel_flow"
+        result = await hass.config_entries.options.async_configure(
+            options_flow_id,
+            {"confirm_abort_idle_panel_flow": True},
+        )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+    assert entry.data[CONF_MQTT_HOST] == "replacement-broker.iot.example"
+    assert not hass.config_entries.subentries.async_progress(include_uninitialized=True)
+
+
+@pytest.mark.parametrize("replace_first", [False, True])
+async def test_idle_panel_abort_consent_reprompts_for_added_or_replacement_flow(
+    hass: HomeAssistant,
+    replace_first: bool,
+) -> None:
+    """Consent for the offered flow cannot discard a different user's later form."""
+    entry = _fleet_entry(hass)
+    original_data = dict(entry.data)
+    options_flow_id = await _prepare_fleet_broker_commit(hass, entry)
+    manager = hass.config_entries.subentries
+    first = await manager.async_init(
+        (entry.entry_id, SUBENTRY_TYPE_PANEL), context={"source": "user"}
+    )
+    with patch.object(ProvisioningJournal, "async_load", AsyncMock(return_value=None)):
+        offered = await hass.config_entries.options.async_configure(options_flow_id)
+        assert offered["step_id"] == "broker_abort_idle_panel_flow"
+        if replace_first:
+            manager.async_abort(first["flow_id"])
+        second = await manager.async_init(
+            (entry.entry_id, SUBENTRY_TYPE_PANEL), context={"source": "user"}
+        )
+        result = await hass.config_entries.options.async_configure(
+            options_flow_id, {"confirm_abort_idle_panel_flow": True}
+        )
+
+        assert result["type"] is FlowResultType.FORM
+        assert result["step_id"] == "broker_abort_idle_panel_flow"
+        assert entry.data == original_data
+        assert second["flow_id"] in manager._progress
+        assert (first["flow_id"] in manager._progress) is (not replace_first)
+
+        confirmed = await hass.config_entries.options.async_configure(
+            options_flow_id, {"confirm_abort_idle_panel_flow": True}
+        )
+
+    assert confirmed["type"] is FlowResultType.ABORT
+    assert confirmed["reason"] == "reconfigure_successful"
+    assert entry.data[CONF_MQTT_HOST] == "replacement-broker.iot.example"
+    assert not manager.async_progress(include_uninitialized=True)
+
+
+@pytest.mark.parametrize(
+    ("blocker", "reason"),
+    [
+        ("busy", "broker_change_blocked_by_add_panel_flow"),
+        ("journal", "broker_change_blocked_by_active_journal"),
+        ("unreadable", "broker_change_blocked_by_journal_read_error"),
+    ],
+)
+async def test_idle_panel_abort_confirmation_rechecks_provisioning_guards(
+    hass: HomeAssistant,
+    blocker: str,
+    reason: str,
+) -> None:
+    entry = _fleet_entry(hass)
+    original_data = dict(entry.data)
+    options_flow_id = await _prepare_fleet_broker_commit(hass, entry)
+    manager = hass.config_entries.subentries
+    add_flow = await manager.async_init(
+        (entry.entry_id, SUBENTRY_TYPE_PANEL), context={"source": "user"}
+    )
+    with patch.object(
+        ProvisioningJournal, "async_load", AsyncMock(return_value=None)
+    ) as load_journal:
+        offered = await hass.config_entries.options.async_configure(options_flow_id)
+        assert offered["step_id"] == "broker_abort_idle_panel_flow"
+        if blocker == "busy":
+            handler = manager._progress[add_flow["flow_id"]]
+            cast(dict[str, Any], handler.context)[PROVISIONING_STARTED_CONTEXT] = True
+        elif blocker == "journal":
+            load_journal.return_value = object()
+        else:
+            load_journal.side_effect = RuntimeError("journal storage unavailable")
+        result = await hass.config_entries.options.async_configure(
+            options_flow_id, {"confirm_abort_idle_panel_flow": True}
+        )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == reason
+    assert entry.data == original_data
+    assert add_flow["flow_id"] in manager._progress
+
+
+async def test_started_add_panel_flow_cannot_be_aborted_for_broker_update(
+    hass: HomeAssistant,
+) -> None:
+    entry = _fleet_entry(hass)
+    original_data = dict(entry.data)
+    options_flow_id = await _prepare_fleet_broker_commit(hass, entry)
+    add_flow = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, SUBENTRY_TYPE_PANEL),
+        context={"source": "user"},
+    )
+    handler = hass.config_entries.subentries._progress[add_flow["flow_id"]]
+    cast(dict[str, Any], handler.context)[PROVISIONING_STARTED_CONTEXT] = True
+    with patch.object(ProvisioningJournal, "async_load", AsyncMock(return_value=None)):
+        result = await hass.config_entries.options.async_configure(options_flow_id)
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "broker_change_blocked_by_add_panel_flow"
+    assert entry.data == original_data
+    assert hass.config_entries.subentries.async_progress(include_uninitialized=True)
+
+
+async def test_idle_add_panel_flow_expires_before_provisioning(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from datetime import timedelta
+
+    from homeassistant.util import dt as dt_util
+    from pytest_homeassistant_custom_component.common import async_fire_time_changed
+
+    monkeypatch.setattr(
+        "custom_components.brilliant_mqtt.flow.onboarding.PANEL_ADD_IDLE_TIMEOUT_SECONDS",
+        30,
+    )
+    entry = _fleet_entry(hass)
+    add_flow = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, SUBENTRY_TYPE_PANEL),
+        context={"source": "user"},
+    )
+    assert add_flow["step_id"] == "panel_connect"
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=31))
+    await hass.async_block_till_done()
+    assert not hass.config_entries.subentries.async_progress(include_uninitialized=True)
+
+
+async def test_idle_add_panel_expiry_callback_runs_on_the_event_loop(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """HA must schedule the idle abort on the loop, not its executor."""
+    from datetime import timedelta
+
+    from homeassistant.util import dt as dt_util
+    from pytest_homeassistant_custom_component.common import async_fire_time_changed
+
+    monkeypatch.setattr(
+        "custom_components.brilliant_mqtt.flow.onboarding.PANEL_ADD_IDLE_TIMEOUT_SECONDS",
+        30,
+    )
+    entry = _fleet_entry(hass)
+    add_flow = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, SUBENTRY_TYPE_PANEL),
+        context={"source": "user"},
+    )
+    assert add_flow["step_id"] == "panel_connect"
+    loop_thread = threading.get_ident()
+    seen: list[int] = []
+    original = hass.config_entries.subentries.async_abort
+
+    def spy(flow_id: str) -> None:
+        seen.append(threading.get_ident())
+        original(flow_id)
+
+    monkeypatch.setattr(hass.config_entries.subentries, "async_abort", spy)
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=31))
+    await hass.async_block_till_done()
+
+    assert seen == [loop_thread]
+    assert not hass.config_entries.subentries.async_progress(include_uninitialized=True)
+
+
+async def test_submitted_panel_confirm_stays_busy_while_persistence_is_held(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Broker edits must not abort a confirm that is waiting on parent storage."""
+    from datetime import timedelta
+
+    from homeassistant.util import dt as dt_util
+    from pytest_homeassistant_custom_component.common import async_fire_time_changed
+
+    monkeypatch.setattr(
+        "custom_components.brilliant_mqtt.flow.onboarding.PANEL_ADD_IDLE_TIMEOUT_SECONDS",
+        30,
+    )
+    entry = _fleet_entry(hass)
+    original_host = entry.data[CONF_MQTT_HOST]
+    confirm = await _start_subentry_confirm(hass, entry)
+    options_flow_id = await _prepare_fleet_broker_commit(hass, entry)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def hold(
+        _hass: HomeAssistant,
+        _entry: object,
+        *,
+        subentry_id: str | None = None,
+    ) -> None:
+        del subentry_id
+        entered.set()
+        await release.wait()
+
+    provisioner = _FakeProvisioner(_identity(other=True), gate=asyncio.Event())
+    monkeypatch.setattr(flow_gateway, "_async_wait_config_entry_persisted", hold)
+    with patch.object(flow_gateway, "_get_panel_provisioner", return_value=provisioner):
+        configure = asyncio.create_task(
+            hass.config_entries.subentries.async_configure(
+                confirm["flow_id"],
+                {CONF_NAME: "Office"},
+            )
+        )
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            handler = hass.config_entries.subentries._progress[confirm["flow_id"]]
+            assert handler.context.get(PROVISIONING_STARTED_CONTEXT) is True
+            async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=31))
+            await hass.async_block_till_done()
+            assert confirm["flow_id"] in hass.config_entries.subentries._progress
+            with patch.object(ProvisioningJournal, "async_load", AsyncMock(return_value=None)):
+                blocked = await hass.config_entries.options.async_configure(options_flow_id)
+            assert blocked["type"] is FlowResultType.ABORT
+            assert blocked["reason"] == "broker_change_blocked_by_add_panel_flow"
+            assert entry.data[CONF_MQTT_HOST] == original_host
+        finally:
+            release.set()
+        result = await asyncio.wait_for(configure, timeout=2)
+    assert result["type"] is FlowResultType.SHOW_PROGRESS
+    assert len(provisioner.install_calls) == 1
+    assert entry.data[CONF_MQTT_HOST] == original_host
+    hass.config_entries.subentries.async_abort(confirm["flow_id"])
+    assert provisioner.gate is not None
+    provisioner.gate.set()
+    await hass.async_block_till_done()
+
+
+@pytest.mark.parametrize("interaction", ["read", "invalid", "valid"])
+async def test_panel_confirm_refresh_preserves_submission_ownership(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    interaction: str,
+) -> None:
+    """A second client cannot cancel or replace a confirm waiting for storage."""
+    entry = _fleet_entry(hass)
+    manager = hass.config_entries.subentries
+    form = await _start_subentry_confirm(hass, entry)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def hold(*_args: object, **_kwargs: object) -> None:
+        entered.set()
+        await release.wait()
+
+    monkeypatch.setattr(flow_gateway, "_async_wait_config_entry_persisted", hold)
+    provisioner = _FakeProvisioner(_identity(other=True), gate=asyncio.Event())
+    competing_input = {
+        "read": None,
+        "invalid": {CONF_NAME: ""},
+        "valid": {CONF_NAME: "Other Room"},
+    }[interaction]
+    with patch.object(flow_gateway, "_get_panel_provisioner", return_value=provisioner):
+        submission = asyncio.create_task(
+            manager.async_configure(form["flow_id"], {CONF_NAME: "Office"})
+        )
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            competing = asyncio.create_task(
+                manager.async_configure(form["flow_id"], competing_input)
+            )
+            refreshed = await asyncio.wait_for(competing, timeout=1)
+            assert refreshed["type"] is FlowResultType.FORM
+            assert refreshed["step_id"] == "panel_confirm"
+        finally:
+            release.set()
+            result = await asyncio.wait_for(submission, timeout=2)
+            if form["flow_id"] in manager._progress:
+                manager.async_abort(form["flow_id"])
+            assert provisioner.gate is not None
+            provisioner.gate.set()
+            await hass.async_block_till_done()
+        assert result["type"] is FlowResultType.SHOW_PROGRESS
+        assert len(provisioner.install_calls) == 1
+        assert provisioner.install_calls[0][0].display_name == "Office"
+
+
+@pytest.mark.parametrize("storage_failure", [False, True])
+async def test_panel_confirm_unsuccessful_submission_returns_to_idle(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    storage_failure: bool,
+) -> None:
+    from datetime import timedelta
+
+    from homeassistant.util import dt as dt_util
+    from pytest_homeassistant_custom_component.common import async_fire_time_changed
+
+    monkeypatch.setattr(
+        "custom_components.brilliant_mqtt.flow.onboarding.PANEL_ADD_IDLE_TIMEOUT_SECONDS", 30
+    )
+    entry = _fleet_entry(hass)
+    form = await _start_subentry_confirm(hass, entry)
+    with (
+        patch.object(
+            flow_gateway, "_async_wait_config_entry_persisted", side_effect=OSError("unavailable")
+        ) as persisted,
+        patch.object(flow_gateway, "_get_panel_provisioner") as provisioner,
+    ):
+        result = await hass.config_entries.subentries.async_configure(
+            form["flow_id"], {CONF_NAME: "Office" if storage_failure else ""}
+        )
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"]
+    assert persisted.call_count == int(storage_failure)
+    provisioner.assert_not_called()
+    handler = cast(
+        config_flow.PanelSubentryFlow,
+        hass.config_entries.subentries._progress[form["flow_id"]],
+    )
+    assert not handler._provisioning_started()
+    assert handler._idle_unsub is not None
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=31))
+    await hass.async_block_till_done()
+    assert form["flow_id"] not in hass.config_entries.subentries._progress
+
+
+@pytest.mark.parametrize("interaction", ["read", "invalid", "valid"])
+@pytest.mark.parametrize("kind", ["discard", "finalize", "recover"])
+async def test_recovery_confirmation_is_busy_before_its_panel_call(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    kind: str,
+    interaction: str,
+) -> None:
+    """Recovery confirmations are not idle while their first panel call is in flight."""
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def hold(*_args: object, **_kwargs: object) -> None:
+        entered.set()
+        await release.wait()
+        if kind == "recover":
+            restored = await _restored_ownerless_record(hass)
+            monkeypatch.setattr(ProvisioningJournal, "async_load", AsyncMock(return_value=None))
+            monkeypatch.setattr(
+                ProvisioningJournal, "async_retained_records", AsyncMock(return_value=(restored,))
+            )
+
+    if kind == "discard":
+        retained = replace(
+            await _restored_ownerless_record(hass),
+            state="armed",
+            recovery_deployment_id=None,
+        )
+        monkeypatch.setattr(
+            ProvisioningJournal,
+            "async_retained_records",
+            AsyncMock(return_value=(retained,)),
+        )
+        confirmation = {"confirm_discard": True}
+        method = "async_discard_unactivated_ownerless_baseline"
+    elif kind == "finalize":
+        retained = await _restored_ownerless_record(hass)
+        monkeypatch.setattr(
+            ProvisioningJournal,
+            "async_retained_records",
+            AsyncMock(return_value=(retained,)),
+        )
+        confirmation = {"confirm_finalize": True}
+        method = "async_finalize_ownerless_restored"
+    else:
+        await _stuck_ownerless_journal(hass, tmp_path, monkeypatch)
+        confirmation = {"confirm_recover": True}
+        method = "async_recover_ownerless_journal"
+    entry = _fleet_entry(hass)
+    original_host = entry.data[CONF_MQTT_HOST]
+    form = await _start_subentry_confirm(hass, entry, identity=_identity())
+    handler = cast(
+        config_flow.PanelSubentryFlow,
+        hass.config_entries.subentries._progress[form["flow_id"]],
+    )
+    options_flow_id = await _prepare_fleet_broker_commit(hass, entry)
+    provisioner = SimpleNamespace(
+        async_discard_unactivated_ownerless_baseline=AsyncMock(),
+        async_finalize_ownerless_restored=AsyncMock(),
+        async_recover_ownerless_journal=AsyncMock(),
+    )
+    operation = AsyncMock(side_effect=hold)
+    setattr(provisioner, method, operation)
+    with patch.object(flow_gateway, "_get_panel_provisioner", return_value=provisioner):
+        configure = asyncio.create_task(
+            hass.config_entries.subentries.async_configure(form["flow_id"], confirmation)
+        )
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            assert handler.context.get(PROVISIONING_STARTED_CONTEXT) is True
+            with patch.object(ProvisioningJournal, "async_load", AsyncMock(return_value=None)):
+                blocked = await hass.config_entries.options.async_configure(options_flow_id)
+            assert blocked["type"] is FlowResultType.ABORT
+            assert blocked["reason"] == "broker_change_blocked_by_add_panel_flow"
+            assert entry.data[CONF_MQTT_HOST] == original_host
+            competing_input = (
+                None
+                if interaction == "read"
+                else dict.fromkeys(confirmation, interaction == "valid")
+            )
+            refreshed = await asyncio.wait_for(
+                hass.config_entries.subentries.async_configure(form["flow_id"], competing_input),
+                timeout=1,
+            )
+            assert refreshed["type"] is FlowResultType.FORM
+            assert refreshed["step_id"] == form["step_id"]
+            assert handler.context.get(PROVISIONING_STARTED_CONTEXT) is True
+        finally:
+            release.set()
+            try:
+                result = await asyncio.wait_for(configure, timeout=2)
+                idle_rearmed = handler._idle_unsub is not None
+            finally:
+                handler._cancel_idle_timeout()
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == (
+        "panel_finalize_retained" if kind == "recover" else "panel_confirm"
+    )
+    assert not handler._provisioning_started()
+    assert idle_rearmed
+    operation.assert_awaited_once()
+
+
+async def test_aborted_panel_confirm_does_not_install_after_persistence(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A flow removed while storage is flushing must not start provisioning."""
+    entry = _fleet_entry(hass)
+    confirm = await _start_subentry_confirm(hass, entry)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def hold(
+        _hass: HomeAssistant,
+        _entry: object,
+        *,
+        subentry_id: str | None = None,
+    ) -> None:
+        del subentry_id
+        entered.set()
+        await release.wait()
+
+    provisioner = _FakeProvisioner(_identity(other=True))
+    monkeypatch.setattr(flow_gateway, "_async_wait_config_entry_persisted", hold)
+    configure = asyncio.create_task(
+        hass.config_entries.subentries.async_configure(
+            confirm["flow_id"],
+            {CONF_NAME: "Office"},
+        )
+    )
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    with patch.object(flow_gateway, "_get_panel_provisioner", return_value=provisioner):
+        hass.config_entries.subentries.async_abort(confirm["flow_id"])
+        release.set()
+        try:
+            await asyncio.wait_for(configure, timeout=2)
+        except Exception:
+            pass
+        await hass.async_block_till_done()
+    assert provisioner.install_calls == []
 
 
 async def test_empty_fleet_broker_update_rechecks_snapshot_after_journal_read(

@@ -1716,6 +1716,32 @@ async def test_raw_settings_ca_and_broker_exception_text_are_redacted(
         assert raw not in caplog.text
 
 
+async def test_connect_dns_and_refusal_use_stable_redacted_codes() -> None:
+    import socket
+
+    request = _request()
+    dns = _successful_mqtt(request)
+    dns.failures[("connect",)] = socket.gaierror(-2, "broker.example")
+    dns_report = await async_run_preflight(
+        _settings(),
+        request,
+        mqtt_factory=lambda *args, **kw: dns,
+    )
+    assert dns_report.error_code == "mqtt_dns"
+    assert dns_report.detail == "MQTT name resolution failed"
+    assert "broker.example" not in dns_report.to_json()
+
+    refused = _successful_mqtt(request)
+    refused.failures[("connect",)] = ConnectionRefusedError("refused")
+    refused_report = await async_run_preflight(
+        _settings(),
+        request,
+        mqtt_factory=lambda *args, **kw: refused,
+    )
+    assert refused_report.error_code == "mqtt_refused"
+    assert refused_report.detail == "MQTT connection refused"
+
+
 async def test_real_adapter_close_failure_maps_to_redacted_cleanup_failure(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
