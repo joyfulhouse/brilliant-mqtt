@@ -949,14 +949,14 @@ class Bridge:
             capture_order = (provenance.source_generation, provenance.sequence)
         if (
             capture_order[0] == self._bus.capture_generation
-            and capture_order >= self._discovery_capture_order
+            # A real read can tie a later absence's conservative fallback.
+            and capture_order > self._discovery_capture_order
         ):
             self._discovery_capture_order = capture_order
             sw_version = _sw_version_from(devices)
             if self._discovery_sw_version != sw_version:
                 self._discovery_sw_version = sw_version
                 self._mesh_status_changed()
-        sw_version = self._discovery_sw_version
         self._observe_privacy_snapshot(devices)
 
         # A broker await may admit a command or native push. Apply this captured
@@ -977,8 +977,8 @@ class Bridge:
             meta: dict[str, object] = {"agent_version": __version__}
             if self._deployment_id is not None:
                 meta["deployment_id"] = self._deployment_id
-            if sw_version is not None:
-                meta["panel_firmware"] = sw_version
+            if self._discovery_sw_version is not None:
+                meta["panel_firmware"] = self._discovery_sw_version
             if self._diagnostics is not None:
                 meta["diag"] = self._diagnostics.meta()
             await self._async_publish_retained(
@@ -1013,7 +1013,7 @@ class Bridge:
                     for descriptor in descriptors:
                         await self._async_publish_retained(
                             config_topic(descriptor),
-                            config_payload(descriptor, sw_version=sw_version),
+                            config_payload(descriptor, sw_version=self._discovery_sw_version),
                         )
                         if not self._feedback_alive(lifecycle):
                             return
@@ -1030,7 +1030,7 @@ class Bridge:
                 for descriptor in descriptors:
                     await self._async_publish_retained(
                         config_topic(descriptor),
-                        config_payload(descriptor, sw_version=sw_version),
+                        config_payload(descriptor, sw_version=self._discovery_sw_version),
                     )
                     if not self._feedback_alive(lifecycle):
                         return

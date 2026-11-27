@@ -727,3 +727,36 @@ affected cases across 69 files, preserving all 1,969 prior nodes; historical
 mypy pass. The preservation audit retains 75 mapping rows, 16 baseline
 digests and all 33 schedule groups. Payload rebuilding/parity, fresh internal
 reviews and shipping remain controller-owned; this is source completion only.
+
+### Round Four Firmware Spec Correction
+
+Fresh spec review of `6bd42fd29511e7397a266bd59ed4f7f262aa23d8` found two
+remaining firmware races. A delayed real HARDWARE capture could tie a newer
+absence fallback and undo an accepted clear. Separately, an older reconcile
+retained coroutine-local firmware across MQTT awaits, constructing later local
+meta and hardware/wired discovery with stale firmware despite a newer context.
+
+The typed permanent port in `tests/test_mesh_round4_firmware_corrections.py`
+first reproduces all five semantic failures from the unchanged reviewer and
+controller probes, including the controller's failed config-debt retry and
+four-existing-read bound. Context admission now requires strictly newer
+existing provenance, preserving an accepted clear on a tie. Each local meta
+or config payload uses accepted current firmware when constructed after an
+await; already-issued transport retains its original bytes. No state,
+counter, allocated stamp, side bit, map, read or retry mechanism is added.
+
+The new module's 28 cases cover absent/incomplete/excluded HARDWARE ties,
+genuinely newer restoration, and nonempty/removed/empty firmware across
+availability, meta, hardware config, wired config and subscription awaits.
+Source gates pass 209 focused, 2,028 affected across 70 files, historical 148,
+and 45 unchanged external executions (two intentional frozen-parent method
+controls). All prior 2,000 affected nodes, including the previous 31 round-four
+cases, remain unchanged and present. Ruff, format check and strict mypy pass;
+75 mapping rows, 16 baseline digests and 33 schedule groups remain preserved.
+New `pr297-r4fix-specfix-*` artifacts retain both five-failure RED runs, the
+prior 17 artifact hashes and the new report/probes. Source completion remains
+separate from controller-owned fresh spec/quality and payload/shipping gates.
+The final Kimi round-four probe contributes four passing executions to that
+external selection, including its later F3 recovery assertion; its three
+findings overlap the corrected capacity/readiness/firmware areas. The frozen
+final report/probe hashes are preserved with the spec artifacts.
