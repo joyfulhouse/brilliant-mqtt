@@ -442,20 +442,36 @@ class Bridge:
 
     async def _repair_mesh_availability(self) -> None:
         registry = self._mesh
-        if registry is None or not registry.enabled or self._panel != _MESH_PANEL:
+        if registry is None or not registry.enabled:
             return
-        # A negative inventory can merge fields on an owner whose newer
-        # existence kept it out of this batch's metadata carriers.
+        # Repair known routes even without a carrier. Initial/in-progress work
+        # and ownerless withdrawal keep their existing repair boundaries.
         for owner in registry.owners:
+            records = tuple(
+                self._mesh_routing.records[topic]
+                for topic in self._mesh_routing.topics(owner.metadata.peripheral_id)
+            )
             if (
                 registry.live(owner)
-                and owner in self._mesh_descriptors
-                and self._mesh_descriptors[owner]
-                != tuple(entities_for(owner.materialize(self._clock()), self._panel))
+                and (
+                    owner in self._mesh_descriptors
+                    or any(record.desired.owner is not self._mesh_routing for record in records)
+                )
+                and (
+                    self._mesh_descriptors.get(owner)
+                    != tuple(entities_for(owner.materialize(self._clock()), self._panel))
+                    or any(
+                        (record.worker is None or record.worker.done())
+                        and (record.applied is not None or record.desired.forget)
+                        and record.applied is not record.desired
+                        for record in records
+                    )
+                )
             ):
                 await self._repair_mesh(owner.metadata.peripheral_id, force=False)
-        payload = "online" if self._mesh_online_ready() else "offline"
-        await asyncio.shield(self._queue_mesh_availability(payload))
+        if self._panel == _MESH_PANEL:
+            payload = "online" if self._mesh_online_ready() else "offline"
+            await asyncio.shield(self._queue_mesh_availability(payload))
 
     def _mesh_revoked(self, owner: MeshSettlement) -> None:
         self._mesh_status_changed()

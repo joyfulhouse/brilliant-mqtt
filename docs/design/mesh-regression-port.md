@@ -600,3 +600,49 @@ selection remains 148 passing nodes; the audit retains all 75 mapping rows,
 separate under `pr297-r2-*` in S9, and original reviewer probes and baseline
 artifacts remain unchanged. These off-device schedules establish ordering and
 bounded work, not physical responsiveness or the live i.MX6 CPU budget.
+
+## PR297 Round-Three Continuation Corrections
+
+The unchanged external ten-case probe and its typed permanent port in
+`tests/test_mesh_round3_corrections.py` each reproduce seven semantic failures
+and three passing controls on both baseline source and the unchanged committed
+payload at `a36a599fd5eb96d2397facce7fdad4c73fa7cab9`. Separate logs/XML under
+`pr297-r3fix-red-*` in S9 preserve those four runs before runtime edits.
+
+Winning inventory counts use existing inventory ordering independently of the
+creation floor advanced by native return. A winning oversize disables service;
+an older oversize cannot override a newer fitting inventory. Fitting readiness,
+new slot creation and the combined 256-record bound keep their existing fences.
+Shadowed capability replacement checks metadata and existence sequences as well
+as field watermarks, then uses its existing fresh birth boundary. No old intent,
+window or evidence transfers; only the exact outstanding physical completion
+condition can survive.
+
+Existing poll/reconcile repairs known owner routes in both default and shared
+mesh scopes, including unapplied config/membership/forget debt and replacement
+owners without metadata carriers. Shared availability publication keeps its
+separate scope guard. Repair uses the existing per-peripheral topic index and
+does not force healthy unrelated topics or add reads. Ownerless withdrawal debt
+retains its existing retry boundary and issue-time validity checks. Synchronous
+owner revocation uses the same topic index with exact desired-owner identity
+and actual child checks: the permanent counter records 32 topic visits for
+10 owners/33 topics and 122 visits for 40 owners/123 topics, replacing the
+baseline's 330 and 4,920 visits.
+
+The permanent module adds controls for accepted/rejected primary and auxiliary
+returns, later fitting recovery, poll and reconcile repair in both scopes,
+healthy topic deduplication, unchanged read counts, metadata-only and
+existence-only presence with an outstanding ticket, and actual child
+cancellation with old/current/unrelated owner identities. The prior ownerless
+issue-guard schedules remain unchanged. Source completion is separate from
+shipping readiness: generated payload rebuilding, payload GREEN/parity and
+spec then quality review remain controller-owned.
+
+Final source validation passes 1,949 affected cases across 66 files, including
+all 27 permanent round-three cases. The focused adjacent run passes 133 cases;
+the exact historical selection remains 148 passing nodes. Root Ruff/check,
+format check and strict mypy pass. The preservation audit confirms all 75
+mapping rows, 16 baseline digests and 33 prior schedule groups. Logs/XML and
+exact command JSON remain separate under `pr297-r3fix-*` in S9, including
+intermediate failures and the interrupted initial affected run. Generated
+payload and versions remain unchanged in this source-only continuation.

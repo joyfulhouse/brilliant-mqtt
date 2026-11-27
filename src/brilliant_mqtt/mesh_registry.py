@@ -219,10 +219,15 @@ class MeshRegistry:
                 self._absence(binding, boundary)
         elif isinstance(event, MeshInventory):
             ids = event.peripheral_ids
-            if (
-                boundary.sequence <= self._inventory_sequence
-                or boundary.sequence < self.bus.mesh_creation_floor
-            ):
+            current = boundary.sequence > self._inventory_sequence
+            if current:
+                self._inventory_sequence = boundary.sequence
+                self.inventory_count = event.count or len(ids or ())
+                # Native returns fence creation, not an otherwise winning count.
+                if ids is None:
+                    self._disable(boundary)
+                    return
+            if not current or boundary.sequence < self.bus.mesh_creation_floor:
                 # Readiness/creation may be fenced while independent field
                 # omissions still precede their own watermarks on known owners.
                 if ids is not None:
@@ -230,12 +235,10 @@ class MeshRegistry:
                         if pid not in ids:
                             self._absence(binding, boundary)
                 return
-            self._inventory_sequence = boundary.sequence
             self.bus.advance_mesh_creation_floor(boundary)
-            self.inventory_count = event.count or len(event.peripheral_ids or ())
+            assert ids is not None
             if (
-                ids is None
-                or len(set(self._bindings) | set(self._retired) | self.retained_ids() | ids)
+                len(set(self._bindings) | set(self._retired) | self.retained_ids() | ids)
                 > MESH_RECORD_LIMIT
             ):
                 self._disable(boundary)
@@ -376,8 +379,10 @@ class MeshRegistry:
             binding.owner.metadata
         )
         if binding is None or changed:
-            shadowed = binding is not None and any(
-                boundary.sequence <= binding.owner.field_watermark(name) for name in _FIELDS
+            shadowed = binding is not None and (
+                boundary.sequence <= binding.metadata_sequence
+                or boundary.sequence <= binding.existence_sequence
+                or any(boundary.sequence <= binding.owner.field_watermark(name) for name in _FIELDS)
             )
             if binding is not None:
                 self._revoke(binding.owner, boundary)
@@ -395,7 +400,7 @@ class MeshRegistry:
             ):
                 return
             owner = self._new(metadata, birth)
-            binding = _Binding(owner, boundary.sequence, boundary.sequence)
+            binding = _Binding(owner, birth.sequence, birth.sequence)
             self._bindings[pid] = binding
             if seed:
                 self.dispatch(owner, SeedBinding(self.envelope(owner, birth), event.capture))
