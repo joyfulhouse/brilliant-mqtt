@@ -442,20 +442,54 @@ class Bridge:
 
     async def _repair_mesh_availability(self) -> None:
         registry = self._mesh
-        if registry is None or not registry.enabled or self._panel != _MESH_PANEL:
+        if registry is None or not registry.enabled:
             return
-        # A negative inventory can merge fields on an owner whose newer
-        # existence kept it out of this batch's metadata carriers.
+        # Repair known routes even without a carrier. Initial/in-progress work
+        # and ownerless withdrawal keep their existing repair boundaries.
         for owner in registry.owners:
-            if (
-                registry.live(owner)
-                and owner in self._mesh_descriptors
-                and self._mesh_descriptors[owner]
-                != tuple(entities_for(owner.materialize(self._clock()), self._panel))
+            records = tuple(
+                (topic, self._mesh_routing.records[topic])
+                for topic in self._mesh_routing.topics(owner.metadata.peripheral_id)
+            )
+            if registry.live(owner) and (
+                owner in self._mesh_descriptors
+                or any(record.desired.owner is not self._mesh_routing for _, record in records)
             ):
-                await self._repair_mesh(owner.metadata.peripheral_id, force=False)
-        payload = "online" if self._mesh_online_ready() else "offline"
-        await asyncio.shield(self._queue_mesh_availability(payload))
+                descriptors = tuple(entities_for(owner.materialize(self._clock()), self._panel))
+                if self._mesh_descriptors.get(owner) != descriptors:
+                    await self._repair_mesh(owner.metadata.peripheral_id, force=False)
+                    continue
+                # A settled topic can retry without joining a sibling's live work.
+                tasks = []
+                for topic, record in records:
+                    desired = record.desired
+                    if (
+                        desired.owner is not owner
+                        or (record.worker is not None and not record.worker.done())
+                        or (record.applied is None and not desired.forget)
+                        or record.applied is desired
+                    ):
+                        continue
+                    if desired.payload is not None and not desired.forget:
+                        # Firmware can change without changing descriptor shape.
+                        descriptor = next(
+                            (item for item in descriptors if config_topic(item) == topic), None
+                        )
+                        if descriptor is None:
+                            continue
+                        payload = config_payload(descriptor, sw_version=self._discovery_sw_version)
+                        desired = DesiredTopic(
+                            owner,
+                            partial(self._mesh_topic_current, owner, topic, payload=payload),
+                            payload=payload,
+                        )
+                    if desired.valid():
+                        tasks.append(self._mesh_routing.request(topic, desired))
+                for task in tasks:
+                    await asyncio.shield(task)
+        if self._panel == _MESH_PANEL:
+            payload = "online" if self._mesh_online_ready() else "offline"
+            await asyncio.shield(self._queue_mesh_availability(payload))
 
     def _mesh_revoked(self, owner: MeshSettlement) -> None:
         self._mesh_status_changed()

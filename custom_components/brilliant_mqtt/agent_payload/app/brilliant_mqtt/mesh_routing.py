@@ -245,8 +245,9 @@ class MeshRouting:
             for topic, record in tuple(self.records.items())
         )
 
-    def revoke(self, owner: object) -> None:
-        for record in self.records.values():
+    def revoke(self, owner: MeshSettlement) -> None:
+        for topic in self.topics(owner.metadata.peripheral_id):
+            record = self.records[topic]
             if record.desired.owner is owner and record.child is not None:
                 record.child.cancel()
                 if record.worker is not None and not record.revoking:
