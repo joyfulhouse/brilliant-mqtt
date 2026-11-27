@@ -35,10 +35,10 @@ import json
 import logging
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from brilliant_mqtt.commands import VarSet
 from brilliant_mqtt.desired_state import atomic_write_json
@@ -46,6 +46,7 @@ from brilliant_mqtt.discovery import availability_topic, device_block, state_top
 from brilliant_mqtt.model import BrilliantDevice
 from brilliant_mqtt.protocols import (
     BusClient,
+    MeshBusClient,
     MqttClient,
     VirtualPeripheralHostProtocol,
     VirtualPeripheralSpec,
@@ -57,7 +58,7 @@ from brilliant_mqtt.slider_config import (
 from brilliant_mqtt.slider_config import (
     encode_slider_config as encode_slider_config,
 )
-from brilliant_mqtt.write_admission import Superseded
+from brilliant_mqtt.write_admission import AdmissionTicket, Superseded, WriteCancelled
 
 logger = logging.getLogger(__name__)
 
@@ -304,6 +305,7 @@ class VirtualSliderState:
     event_seq: int = 0
     original_slider_config: str | None = None
     binding_ready: bool = False
+    binding_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -673,17 +675,27 @@ class VirtualSliderController:
                 self._last_exec_scene_ts = exec_dev.variables["last_executed_scene_id"].timestamp_ms
                 return
 
-    async def _restore_orphaned_bindings(self) -> None:
+    async def _restore_orphaned_bindings(self, *, mesh_only: bool = False) -> None:
         """Restore original ``CapTouchSliderConfig`` for sliders removed from config."""
         for sid, orphan in list(self._orphaned_bindings.items()):
+            if mesh_only and orphan.config_device_id != "ble_mesh":
+                continue
             if orphan.config_device_id == "ble_mesh" and not self._is_mesh_leader():
                 continue
+            ticket = AdmissionTicket()
             try:
                 result = await self._bus.set_variables(
                     orphan.config_device_id,
                     orphan.config_peripheral_id,
                     [VarSet(orphan.config_var_name, orphan.original_slider_config)],
+                    ticket=ticket,
                 )
+            except WriteCancelled:
+                if ticket.issued_at is not None:
+                    logger.warning(
+                        "Orphaned slider restore cancelled after native issue for %s", sid
+                    )
+                continue
             except Exception:
                 logger.exception("Failed to restore orphaned slider binding for %s", sid)
                 continue
@@ -764,8 +776,9 @@ class VirtualSliderController:
                 await host.start()
                 self._hosts[sid] = host
 
-                st.binding_ready = await self._apply_slider_binding(spec, st.mode)
-                self._save_state_if_changed()
+                async with st.binding_lock:
+                    st.binding_ready = await self._apply_slider_binding(spec, st.mode)
+                    self._save_state_if_changed()
 
                 await self._publish_discovery(spec)
                 await self._subscribe_commands(spec)
@@ -776,13 +789,23 @@ class VirtualSliderController:
 
     async def on_mesh_leadership_acquired(self) -> None:
         """Apply deferred ``ble_mesh`` slider bindings once mesh leadership is won."""
-        await self._restore_orphaned_bindings()
+        await self.retry_deferred_mesh_bindings()
+
+    async def retry_deferred_mesh_bindings(self) -> None:
+        """Visit standing mesh work on acquisition or an exact capacity recovery."""
+        if not self._is_mesh_leader():
+            return
+        await self._restore_orphaned_bindings(mesh_only=True)
         for sid, spec in self._specs.items():
             st = self._states[sid]
-            if spec.config_device_id != "ble_mesh" and st.binding_ready:
+            if spec.config_device_id != "ble_mesh" or st.binding_ready:
                 continue
-            st.binding_ready = await self._apply_slider_binding(spec, st.mode)
-            await self._publish_state(sid)
+            async with st.binding_lock:
+                if st.binding_ready or not self._is_mesh_leader():
+                    continue
+                st.binding_ready = await self._apply_slider_binding(spec, st.mode)
+                self._save_state_if_changed()
+                await self._publish_state(sid)
         self._save_state_if_changed()
 
     async def shutdown(self) -> None:
@@ -801,9 +824,39 @@ class VirtualSliderController:
     # Bus & MQTT Routing
     # ------------------------------------------------------------------
 
-    async def _apply_slider_binding(self, spec: VirtualSliderSpec, mode: SliderMode) -> bool:
+    async def _apply_slider_binding(
+        self, spec: VirtualSliderSpec, mode: SliderMode, *, ticket: AdmissionTicket | None = None
+    ) -> bool:
+        own_ticket = ticket is None
+        ticket = AdmissionTicket() if ticket is None else ticket
+        remove = self._track_binding_write(spec, ticket) if own_ticket else lambda: None
+        try:
+            return await self._write_slider_binding(spec, mode, ticket)
+        except asyncio.CancelledError:
+            ticket.cancel_waiting()
+            raise
+        finally:
+            remove()
+
+    def _track_binding_write(
+        self, spec: VirtualSliderSpec, ticket: AdmissionTicket
+    ) -> Callable[[], None]:
+        if spec.config_device_id != "ble_mesh":
+            return lambda: None
+        return cast(MeshBusClient, self._bus).register_mesh_write_operation(
+            ticket, spec.config_peripheral_id
+        )
+
+    async def _write_slider_binding(
+        self, spec: VirtualSliderSpec, mode: SliderMode, ticket: AdmissionTicket
+    ) -> bool:
         """Write ``CapTouchSliderConfig`` to the target peripheral after backing up original."""
         st = self._states[spec.slider_id]
+        if ticket.issued_at is None and ticket.settled:
+            return False
+        if spec.config_device_id == "ble_mesh" and not self._is_mesh_leader():
+            ticket.mark_settled(WriteCancelled())
+            return False
         if any(
             orphan.slider_id == spec.slider_id
             or (orphan.slider_id is None and st.original_slider_config is None)
@@ -813,13 +866,6 @@ class VirtualSliderController:
         ):
             logger.warning("Deferring slider binding until pending originals are restored")
             return False
-        if spec.config_device_id == "ble_mesh" and not self._is_mesh_leader():
-            logger.debug(
-                "Deferring ble_mesh slider_config binding for %s until mesh leader",
-                spec.slider_id,
-            )
-            return False
-
         current_b64: str | None = None
         try:
             current_dev = await self._bus.get_peripheral(
@@ -827,6 +873,9 @@ class VirtualSliderController:
             )
         except Exception:
             current_dev = None
+
+        if ticket.issued_at is None and ticket.settled:
+            return False
 
         if current_dev is not None and spec.config_var_name in current_dev.variables:
             current_b64 = current_dev.variables[spec.config_var_name].value
@@ -889,6 +938,9 @@ class VirtualSliderController:
                 )
                 return False
 
+        if spec.config_device_id == "ble_mesh" and not self._is_mesh_leader():
+            ticket.mark_settled(WriteCancelled())
+            return False
         if current_b64 is not None and current_b64 == target_b64:
             return True
 
@@ -897,7 +949,16 @@ class VirtualSliderController:
                 spec.config_device_id,
                 spec.config_peripheral_id,
                 [VarSet(spec.config_var_name, target_b64)],
+                ticket=ticket,
             )
+        except WriteCancelled as error:
+            if ticket.issued_at is None:
+                ticket.mark_settled(error)
+            else:
+                logger.warning(
+                    "slider_config write cancelled after native issue for %s", spec.slider_id
+                )
+            return False
         except Exception:
             logger.exception(
                 "Failed to write %s on %s/%s for slider %s",
@@ -992,14 +1053,28 @@ class VirtualSliderController:
         new_mode = SliderMode(mode_str)
         st = self._states[slider_id]
         spec = self._specs[slider_id]
-        if not await self._apply_slider_binding(spec, new_mode):
-            st.binding_ready = False
-            await self._publish_state(slider_id)
-            return
-        st.binding_ready = True
-        st.mode = new_mode
-        self._save_state_if_changed()
-        await self._publish_state(slider_id, event=None)
+        ticket = AdmissionTicket()
+        remove = self._track_binding_write(spec, ticket)
+        try:
+            async with st.binding_lock:
+                if not await self._apply_slider_binding(spec, new_mode, ticket=ticket):
+                    if (
+                        spec.config_device_id != "ble_mesh"
+                        or ticket.issued_at is not None
+                        or not isinstance(ticket.outcome, WriteCancelled)
+                    ):
+                        st.binding_ready = False
+                    await self._publish_state(slider_id)
+                    return
+                st.binding_ready = True
+                st.mode = new_mode
+                self._save_state_if_changed()
+                await self._publish_state(slider_id, event=None)
+        except asyncio.CancelledError:
+            ticket.cancel_waiting()
+            raise
+        finally:
+            remove()
 
     async def _handle_brightness_command(self, slider_id: str, payload: str) -> None:
         try:
@@ -1432,12 +1507,19 @@ async def restore_all_persisted_slider_bindings(
             if cfg_dev == "ble_mesh" and not is_mesh_leader():
                 all_restored = False
                 continue
+            ticket = AdmissionTicket()
             try:
                 result = await bus.set_variables(
                     cfg_dev,
                     cfg_periph,
                     [VarSet(cfg_var, orig_cfg)],
+                    ticket=ticket,
                 )
+            except WriteCancelled:
+                if ticket.issued_at is not None:
+                    logger.warning("Slider restore cancelled after native issue for %s", sid)
+                all_restored = False
+                continue
             except Exception:
                 logger.exception("Failed to restore slider binding for %s", sid)
                 all_restored = False

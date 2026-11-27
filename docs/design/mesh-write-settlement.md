@@ -1,11 +1,17 @@
 # Mesh write settlement with one owner per peripheral
 
-Status: proposed; design review precedes implementation. Refs #225.
+Status: implemented with off-device validation; live resource and physical
+response acceptance remains outstanding. Refs #225.
 
 This design replaces the distributed mesh confirmation machinery proposed in
-PR #232. That PR remains held. The implementation will be a separate PR from
-current main, after both prescribed reviewers have reviewed this document.
-This document changes no runtime behavior.
+PR #232. That PR remains held; delivery of this implementation is a separate
+PR from current main. Design review and the historical test-only RED baseline
+preceded implementation. The validation schedules below now have committed
+tests; final focused results and preserved baseline evidence are recorded in
+[mesh-regression-port.md](mesh-regression-port.md). Off-device checks do not
+establish physical actuation, response speed or the live CPU budget, and do
+not close #225. The implementation/review sequence at the end remains the
+approved delivery procedure, not a claim that final PR reviews or CI ran.
 
 ## Problem and preserved behavior
 
@@ -58,16 +64,20 @@ Derived motion is rendered from accepted merged fields and hold history.
 Reconnect, removal and withdrawal clear that history. A stale high-score read
 between current low-score captures cannot turn the next render on.
 
-Proposed boundaries:
+Implemented boundaries (the reducer/bridge split uses focused companion modules):
 
 | File | Responsibility |
 | --- | --- |
-| `mesh_settlement.py` (new) | Typed events, slot, pure synchronous transition logic, renderer and effect tokens. |
+| `mesh_settlement.py`, `mesh_settlement_types.py`, `mesh_settlement_render.py` | Typed events, owner state, pure synchronous transitions, demand-only renderer and effect tokens. |
 | `bus.py` | Loop-confined provenance allocation and immediate synchronous ingress for normalized captures, generation changes and native outcomes. Sole panel-library boundary. |
 | `write_admission.py` | Ticket outcome replay and callbacks; identity remains separate from command replacement identity. |
 | `mqttio.py` | Capture opaque owner references at local command ingress; retain them through queues/coalescing and reject cross-owner folds. |
 | `model.py`, `protocols.py` | Immutable provenance and narrow synchronous ingress contracts; no panel types. |
-| `bridge.py` | Slot lifecycle, command translation, timers, bounded publication worker and independent discovery/subscription repair. |
+| `mesh_ingress.py`, `mesh_registry.py` | Primitive synchronous ingress contracts, owner lifecycle, topology/binding admission, capacity and completion holds. |
+| `mesh_commands.py` | Owner/ticket command associations, synchronous folds, native outcome dispatch and auxiliary/maintenance projections. |
+| `mesh_driver.py`, `mesh_routing.py` | Timers and bounded publication lanes; independent current discovery/subscription/availability repair. |
+| `bridge.py` | Orchestrates the registry, commands, driver and routing; preserves wired/desired-state consumers without a second mesh mutator. |
+| `virtual_sliders.py` | Existing resident configuration/mode operations use shared mesh eligibility at preparation and native issue; recover only deferred work. |
 | `__main__.py` | Consume a latched mesh-fatal condition in the existing coordinator tick and rebuild the session with existing teardown/backoff. |
 | `tests/test_mesh_settlement*.py` | Reducer permutations, production-adapter schedules, transport and boundedness contracts. |
 
@@ -160,6 +170,11 @@ new slot atomically from its own validated source snapshot; its floor excludes
 all other work started before the change. It cannot seed request-confirmation
 evidence from a retired command. Freshness rejection of field evidence still
 does not suppress repair of a currently admitted binding.
+If an admitted capability change comes from a capture shadowed by newer field
+evidence, the successor uses a fresh existing binding reservation and starts
+unknown. It inherits neither that older capture nor the previous owner's
+evidence. Other reads already started before replacement cannot rewind the
+successor; a trusted post-replacement capture restores state.
 
 Topology has a separate per-device creation floor. A reliable explicit removal,
 complete inventory removal or binding change advances it; no older-started
@@ -171,6 +186,9 @@ inventory absence. This permits dropping per-ID tombstones after cleanup
 without retaining every peripheral name ever seen. Reappearance requires a
 newer admitted inventory/explicit creation event; stale async state callbacks
 cannot create slots or routes.
+Authoritative absence advances this existing creation floor even for an ID
+without a slot. Each winning complete inventory also advances the floor; its
+own captures remain eligible, and known owners retain independent field merges.
 
 Successful full-device reads also emit an immutable `Inventory` event with
 read-start provenance, successful/complete scope and returned
@@ -189,6 +207,9 @@ topology path with a bounded diagnostic, never an authoritative empty inventory.
 Transport exception/timeout has no inventory/absence contribution. ScopeUnknown
 does not replace newer explicit target evidence; it cannot cause a target echo
 from older evidence. Test all four shapes through actual `get_all()`.
+Its existing creation/inventory ordering fence also excludes older first
+sightings before any slot exists. Until a later complete inventory, readiness
+stays offline; known topology/routes and independent auxiliary merges remain.
 
 For each owned peripheral missing from a complete inventory, reduce versioned
 absence for its fields and primary-confirmation evidence, subject to each
@@ -617,6 +638,19 @@ than leaving a stale descriptor last on the broker. Withdrawal sets desired
 membership to absent synchronously; reacquisition can replace that intent
 without racing an unconditional compensating cleanup. Test delayed old SUBACK
 across reacquisition and retyping, then command delivery without another resync.
+Failed withdrawal membership cleanup remains eligible on existing acquisition,
+poll and reconcile triggers even if no owner or retired slot remains. Repair
+rechecks current owners before retrying that cleanup. Bounded topic lookups and
+outstanding-withdrawal work indexes derive only from existing routing records
+and disappear with them. Ordinary unchanged, fully applied desires reuse their
+completed worker; force repair and genuine outstanding debt still run.
+Withdrawal desires retain a live current-owner-absent validity predicate.
+Membership children recheck that exact desire and its validity immediately
+before issuing MQTT work. Skipped or invalidated work retains its record/debt;
+applied/forget bookkeeping requires a still-valid desire and actual matching
+membership. Reappearance during another ID's repair await may stay offline
+until a later existing trigger repairs its current route, without an obsolete
+unsubscribe being issued in the meantime.
 
 Capture ingress happens before availability/discovery publishes, so a newer
 push during a routing await already updates the slot. Reconcile never resumes

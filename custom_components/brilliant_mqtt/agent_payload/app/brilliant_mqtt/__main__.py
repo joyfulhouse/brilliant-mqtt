@@ -108,6 +108,10 @@ class BusWriteStuckError(RuntimeError):
     """A bus write missed its deadline — rebuild the possibly poisoned session."""
 
 
+class MeshFatalError(RuntimeError):
+    """Mesh ingress or an effect failed closed and requires session recovery."""
+
+
 class BusReconnectStormError(RuntimeError):
     """Bus reconnected past the rate threshold — session torn down to break the
     self-reinforcing storm (live incident, 2026-06-13)."""
@@ -425,9 +429,21 @@ async def _run_session(
                         state_path=vs_state_path,
                         owned_topics=owned_topics,
                         want_device=_is_panel_device,
-                        is_mesh_leader=lambda: leader is not None and leader.is_leader,
+                        is_mesh_leader=lambda: (
+                            leader is not None
+                            and leader.is_leader
+                            and mesh_bridge is not None
+                            and mesh_bridge.mesh_registry is not None
+                            and mesh_bridge.mesh_registry.enabled
+                            and not mesh_bridge.mesh_registry.disabled
+                            and bus.mesh_admission_open
+                        ),
                     )
                     await virtual_slider_controller.start()
+                    if mesh_bridge is not None:
+                        mesh_bridge.on_mesh_capacity_recovered = (
+                            virtual_slider_controller.retry_deferred_mesh_bindings
+                        )
             except Exception:
                 log.exception("virtual slider controller startup failed; continuing without it")
                 if virtual_slider_controller is not None:
@@ -476,6 +492,9 @@ async def _run_session(
             ledger_failure = owned_topics.consume_failure()
             if ledger_failure is not None:
                 raise ledger_failure
+
+            if bus.consume_mesh_fatal():
+                raise MeshFatalError("mesh fatal condition — rebuilding session")
 
             # The MQTT reader is intended to remain alive for the whole
             # session; either an exception or a plain return requires rebuild.

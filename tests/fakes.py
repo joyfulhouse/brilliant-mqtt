@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import threading
+import time
 import types
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import replace
@@ -25,8 +26,32 @@ from brilliant_ha_mirror.mapping import HaEntity, PeripheralSpec, ServiceCall
 from brilliant_mqtt import mqttio
 from brilliant_mqtt import retained_topics as retained_topics_module
 from brilliant_mqtt.commands import VarSet
-from brilliant_mqtt.model import BrilliantDevice, CaptureProvenance, DeviceKind, Variable
-from brilliant_mqtt.write_admission import AdmissionTicket, WriteClass
+from brilliant_mqtt.mesh_ingress import (
+    MeshCapture,
+    MeshGeneration,
+    MeshIngress,
+    MeshInventory,
+    MeshPeripheralAbsent,
+    MeshSink,
+)
+from brilliant_mqtt.mesh_settlement import MeshSettlement
+from brilliant_mqtt.mesh_settlement_types import MeshMetadata
+from brilliant_mqtt.model import (
+    BrilliantDevice,
+    CaptureProvenance,
+    DeviceKind,
+    PrimitiveCapture,
+    PrimitiveField,
+    Variable,
+)
+from brilliant_mqtt.write_admission import (
+    AdmissionTicket,
+    CommandAdmission,
+    TicketAdoptionError,
+    WriteCancelled,
+    WriteClass,
+    command_admission,
+)
 
 
 class FakeBus:
@@ -36,6 +61,8 @@ class FakeBus:
         self,
         devices: list[BrilliantDevice],
         scoped_devices: list[BrilliantDevice] | None = None,
+        *,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._devices = list(devices)
         self._scoped_devices = list(scoped_devices or ())
@@ -68,6 +95,179 @@ class FakeBus:
         self._capture_generation = 1
         self._capture_sequence = 0
         self._field_eras: dict[tuple[str, str, str], int] = {}
+        self._clock = clock
+        self._mesh_sinks: list[MeshSink] = []
+        self._mesh_guard: Callable[[AdmissionTicket, str], bool] | None = None
+        self._mesh_preparing: set[AdmissionTicket] = set()
+        self._mesh_floor = 0
+        self._mesh_open = True
+        self._mesh_fatal = False
+        self.change_callback_metadata_only: list[bool] = []
+
+    @property
+    def capture_source(self) -> str:
+        return f"fake-{id(self)}"
+
+    @property
+    def mesh_admission_open(self) -> bool:
+        return self._mesh_open
+
+    @property
+    def mesh_creation_floor(self) -> int:
+        return self._mesh_floor
+
+    def reserve_mesh_boundary(self, origin: str) -> CaptureProvenance:
+        return replace(self._next_provenance(), origin=origin)
+
+    def advance_mesh_creation_floor(self, boundary: CaptureProvenance) -> None:
+        self._mesh_floor = max(self._mesh_floor, boundary.sequence)
+
+    def mesh_owner_live(self, owner: MeshSettlement) -> bool:
+        return (
+            self._mesh_open
+            and owner.active
+            and owner.source == self.capture_source
+            and owner.generation == self.capture_generation
+        )
+
+    def fail_mesh(self, error: Exception) -> None:
+        if not self._mesh_open:
+            return
+        self._mesh_fatal, self._mesh_open = True, False
+        self.revoke_mesh_waiting()
+
+    def consume_mesh_fatal(self) -> bool:
+        fatal, self._mesh_fatal = self._mesh_fatal, False
+        return fatal
+
+    def revoke_mesh_waiting(self) -> None:
+        for ticket in self._mesh_preparing:
+            if ticket.issued_at is None:
+                ticket.mark_settled(WriteCancelled())
+
+    def register_mesh_write_operation(
+        self, ticket: AdmissionTicket, peripheral_id: str
+    ) -> Callable[[], None]:
+        if ticket._owner is not None or ticket.settled:
+            raise TicketAdoptionError("resident operation ticket is already in use")
+        ticket._owner = self
+        self._mesh_preparing.add(ticket)
+
+        def cancel_waiting() -> None:
+            if ticket.issued_at is None:
+                ticket.mark_settled(WriteCancelled())
+
+        ticket._cancel_waiting = cancel_waiting
+        if (
+            not self._mesh_open
+            or self._mesh_guard is not None
+            and not self._mesh_guard(ticket, peripheral_id)
+        ):
+            ticket.mark_settled(WriteCancelled())
+
+        def remove() -> None:
+            self._mesh_preparing.discard(ticket)
+            ticket._cancel_waiting = None
+
+        return remove
+
+    def register_mesh_sink(
+        self,
+        callback: Callable[[MeshIngress], None],
+        *,
+        want_fields: Callable[[str], frozenset[str] | None],
+        want_inventory: Callable[[], bool] = lambda: True,
+    ) -> Callable[[], None]:
+        sink = MeshSink(callback, want_fields, want_inventory)
+        self._mesh_sinks.append(sink)
+
+        def remove() -> None:
+            if sink in self._mesh_sinks:
+                self._mesh_sinks.remove(sink)
+
+        return remove
+
+    def register_mesh_write_guard(
+        self,
+        guard: Callable[[AdmissionTicket, str], bool],
+    ) -> Callable[[], None]:
+        assert self._mesh_guard is None
+        self._mesh_guard = guard
+
+        def remove() -> None:
+            if self._mesh_guard is guard:
+                self._mesh_guard = None
+
+        return remove
+
+    def _deliver_mesh(self, event: MeshIngress) -> None:
+        for sink in tuple(self._mesh_sinks):
+            if sink.want_inventory():
+                sink.callback(event)
+
+    def _capture_mesh(
+        self,
+        device: BrilliantDevice,
+        boundary: CaptureProvenance,
+        *,
+        complete: bool,
+    ) -> None:
+        for sink in tuple(self._mesh_sinks):
+            fields = sink.want_fields(device.peripheral_id)
+            if fields is not None:
+                sink.callback(
+                    MeshCapture(
+                        boundary,
+                        MeshMetadata(
+                            device.device_id,
+                            device.peripheral_id,
+                            device.name,
+                            device.kind,
+                            device.peripheral_type,
+                        ),
+                        PrimitiveCapture(
+                            tuple(
+                                PrimitiveField(
+                                    name, var.value, var.externally_settable, var.timestamp_ms
+                                )
+                                for name, var in device.variables.items()
+                                if name in fields
+                            ),
+                            complete,
+                            True,
+                            (device.capture_present or frozenset(device.variables)) & fields,
+                            device.capture_unknown & fields,
+                        ),
+                    )
+                )
+
+    def outstanding_mesh_ticket(self, peripheral_id: str) -> AdmissionTicket | None:
+        # This immediate fake never detaches a native operation; production
+        # adapter fixtures exercise physical locks and delayed returns.
+        return None
+
+    def set_mesh_settle_callback(
+        self,
+        ticket: AdmissionTicket,
+        callback: Callable[[str | BaseException], None],
+    ) -> None:
+        ticket.set_settle_callback(callback)
+
+    def bind_mesh_ticket(
+        self,
+        ticket: AdmissionTicket,
+        owner: MeshSettlement,
+        *,
+        on_issue: Callable[[CaptureProvenance], None],
+        on_settle: Callable[[str | BaseException], None],
+        on_refused: Callable[[], None],
+    ) -> None:
+        if ticket.mesh_owner is not None and ticket.mesh_owner is not owner:
+            raise TicketAdoptionError("different mesh owner")
+        ticket.mesh_owner = owner
+        ticket.set_issue_callback(on_issue)
+        ticket._on_refused = on_refused
+        ticket.set_settle_callback(on_settle)
 
     @property
     def capture_generation(self) -> int:
@@ -85,13 +285,37 @@ class FakeBus:
         pass
 
     async def get_all(self) -> list[BrilliantDevice]:
-        return [self._captured(device, complete=True) for device in self._devices]
+        boundary = self.reserve_mesh_boundary("read")
+        self._deliver_mesh(
+            MeshInventory(
+                boundary,
+                frozenset(
+                    device.peripheral_id
+                    for device in self._devices
+                    if device.device_id == "ble_mesh"
+                ),
+            )
+        )
+        devices = []
+        for device in self._devices:
+            if device.device_id == "ble_mesh" and self._mesh_sinks:
+                self._capture_mesh(device, boundary, complete=True)
+                devices.append(replace(device, variables={}, capture_provenance=boundary))
+            else:
+                devices.append(self._captured(device, complete=True))
+        return devices
 
     async def get_peripheral(self, device_id: str, peripheral_id: str) -> BrilliantDevice | None:
         self.scoped_reads.append((device_id, peripheral_id))
         for device in self._devices + self._scoped_devices:
             if device.device_id == device_id and device.peripheral_id == peripheral_id:
+                if device_id == "ble_mesh":
+                    self._capture_mesh(device, self.reserve_mesh_boundary("read"), complete=True)
                 return self._captured(device, complete=True)
+        if device_id == "ble_mesh":
+            self._deliver_mesh(
+                MeshPeripheralAbsent(self.reserve_mesh_boundary("read"), peripheral_id)
+            )
         return None
 
     def _next_provenance(
@@ -111,7 +335,14 @@ class FakeBus:
                 (name, self._field_eras.get((device.device_id, device.peripheral_id, name), 0))
                 for name in fields
             )
-        return CaptureProvenance(self._capture_generation, self._capture_sequence, eras)
+        return CaptureProvenance(
+            self._capture_generation,
+            self._capture_sequence,
+            eras,
+            incarnation=self.capture_source,
+            origin="capture",
+            captured_at=self._clock(),
+        )
 
     def _captured(self, device: BrilliantDevice, *, complete: bool) -> BrilliantDevice:
         if device.kind is DeviceKind.HARDWARE and device.capture_provenance is not None:
@@ -137,10 +368,12 @@ class FakeBus:
         *,
         coalesce_pushes: bool = True,
         want_device: Callable[[str], bool] | None = None,
+        mesh_metadata_only: bool = False,
     ) -> None:
         self._change_cbs.append(cb)
         self.change_callback_modes.append(coalesce_pushes)
         self.change_callback_wants.append(want_device)
+        self.change_callback_metadata_only.append(mesh_metadata_only)
 
     def on_reconnect(self, cb: Callable[[], Awaitable[None]]) -> None:
         self._reconnect_cbs.append(cb)
@@ -169,11 +402,33 @@ class FakeBus:
         write_class: WriteClass = WriteClass.INTERACTIVE_FIFO,
         ticket: AdmissionTicket | None = None,
     ) -> str:
+        if device_id == "ble_mesh" and self._mesh_guard is not None:
+            if ticket is None or not self._mesh_guard(ticket, peripheral_id):
+                if ticket is not None and ticket.issued_at is None:
+                    callback, ticket._on_refused = ticket._on_refused, None
+                    if callback is not None:
+                        callback()
+                    ticket.mark_settled(WriteCancelled())
+                raise WriteCancelled()
         self._mark_issued(device_id, peripheral_id, sets, ticket)
         if self.set_variables_error is not None:
+            self._settle_mesh(device_id, ticket, self.set_variables_error)
             raise self.set_variables_error
         self.commands.append((device_id, peripheral_id, list(sets)))
+        self._settle_mesh(device_id, ticket, self.set_variables_receipt)
         return self.set_variables_receipt
+
+    def _settle_mesh(
+        self,
+        device_id: str,
+        ticket: AdmissionTicket | None,
+        outcome: str | BaseException,
+    ) -> None:
+        if device_id == "ble_mesh":
+            boundary = self.reserve_mesh_boundary("native")
+            self.advance_mesh_creation_floor(boundary)
+            if ticket is not None:
+                ticket.mark_settled(outcome, boundary)
 
     def _mark_issued(
         self,
@@ -211,14 +466,27 @@ class FakeBus:
         assert self._change_cbs, "on_change was never registered"
         if device.capture_provenance is None:
             device = self._captured(device, complete=False)
-        for cb, want in zip(list(self._change_cbs), list(self.change_callback_wants), strict=True):
+        if device.device_id == "ble_mesh":
+            boundary = device.capture_provenance or self.reserve_mesh_boundary("push")
+            self._capture_mesh(device, boundary, complete=device.capture_complete)
+            device = replace(device, capture_provenance=boundary)
+        for cb, want, metadata_only in zip(
+            list(self._change_cbs),
+            list(self.change_callback_wants),
+            list(self.change_callback_metadata_only),
+            strict=True,
+        ):
             if want is None or want(device.device_id):
-                await cb(device)
+                await cb(
+                    replace(device, variables={})
+                    if metadata_only and device.device_id == "ble_mesh"
+                    else device
+                )
 
     async def emit_full(self, device: BrilliantDevice) -> None:
         """Deliver a complete pushed snapshot for full-read semantics tests."""
         if device.capture_provenance is None:
-            device = self._captured(device, complete=True)
+            device = replace(self._captured(device, complete=True), capture_complete=True)
         await self.emit(device)
 
     def set_devices(self, devices: list[BrilliantDevice]) -> None:
@@ -229,8 +497,8 @@ class FakeBus:
         """Test helper: invoke the registered on_reconnect callback."""
         assert self._reconnect_cbs, "on_reconnect was never registered"
         self._capture_generation += 1
-        self._capture_sequence = 0
         self._field_eras.clear()
+        self._deliver_mesh(MeshGeneration(self.reserve_mesh_boundary("reconnect")))
         for reconnect_cb in list(self._reconnect_cbs):
             try:
                 await reconnect_cb()
@@ -339,6 +607,10 @@ class FakeMqtt:
         self.acknowledged_qos1 = 0
         self._connection_lost_cbs: list[Callable[[], None]] = []
         self.connection_lost = False
+        self._mesh_owner_resolver: Callable[[str], object | None] | None = None
+
+    def set_mesh_owner_resolver(self, resolver: Callable[[str], object | None]) -> None:
+        self._mesh_owner_resolver = resolver
 
     async def connect(self) -> None:
         self.connect_count += 1
@@ -397,10 +669,18 @@ class FakeMqtt:
     async def inject(self, topic: str, payload: str, *, retained: bool = False) -> None:
         """Test helper: invoke every registered on_command callback."""
         assert self._command_cbs or self._message_cbs, "no MQTT callback was ever registered"
-        for command_cb in list(self._command_cbs):
-            await command_cb(topic, payload)
-        for message_cb in list(self._message_cbs):
-            await message_cb(topic, payload, retained)
+        owner = self._mesh_owner_resolver(topic) if self._mesh_owner_resolver is not None else None
+        existing = command_admission.get()
+        admission = existing if existing is not None else CommandAdmission()
+        admission.mesh_owner = owner
+        token = command_admission.set(admission)
+        try:
+            for command_cb in list(self._command_cbs):
+                await command_cb(topic, payload)
+            for message_cb in list(self._message_cbs):
+                await message_cb(topic, payload, retained)
+        finally:
+            command_admission.reset(token)
 
 
 class FakeHaClient:

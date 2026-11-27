@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Mesh write feedback now follows one current owner through native late
+  acceptance/rejection, reconnect and queued commands. Confirmation evidence
+  stays scoped to reported fields and fixed windows; bounded publication,
+  routing and slider recovery preserve unknown state for unresolved or
+  abandoned writes. This does not claim faster physical response (Refs #225).
+- Mesh inventory rejects stale first sightings before capacity admission and
+  keeps incomplete acquisition offline while merging independent known-owner
+  field omissions. Current MQTT cleanup waits for normal acknowledgement;
+  topic issue guards recheck current descriptors, and healthy state publication
+  visits only actual revoked children for cancellation ordering (Refs #225).
+- Mesh capacity still disables service when a native return crosses an
+  oversized read. Metadata-only presence survives a delayed capability rebind;
+  existing poll/reconcile repairs known route debt without a carrier in both
+  bridge scopes. Reconnect revocation visits only the owner's indexed topics
+  (Refs #225).
+
 ## [0.13.0] - 2026-11-26
 
 Prerelease candidate. This release updates the Home Assistant integration to

@@ -1247,7 +1247,13 @@ async def test_unresolved_retarget_defers_live_new_target_and_survives_retry(
     write = rig.bus.set_variables
     atomic = atomic_write_json
 
-    async def fail_old_target(device_id: str, peripheral_id: str, sets: list[VarSet]) -> Any:
+    async def fail_old_target(
+        device_id: str,
+        peripheral_id: str,
+        sets: list[VarSet],
+        *,
+        ticket: AdmissionTicket | None = None,
+    ) -> Any:
         if sets[0].name == "slider_config:0":
             if fault == "write":
                 raise OSError("old target offline")
@@ -1257,7 +1263,7 @@ async def test_unresolved_retarget_defers_live_new_target_and_survives_retry(
                 raise asyncio.CancelledError()
             if fault == "readback":
                 return None
-        return await write(device_id, peripheral_id, sets)
+        return await write(device_id, peripheral_id, sets, ticket=ticket)
 
     def fail_disk(path: Path, data: Any) -> None:
         if fault == "disk":
@@ -1373,10 +1379,16 @@ async def test_unrelated_recovery_cannot_block_healthy_slider_passthrough(
     await rig.run(("A", 0), ("B", 1))
     write = rig.bus.set_variables
 
-    async def fail_only_old(device_id: str, peripheral_id: str, sets: list[VarSet]) -> Any:
+    async def fail_only_old(
+        device_id: str,
+        peripheral_id: str,
+        sets: list[VarSet],
+        *,
+        ticket: AdmissionTicket | None = None,
+    ) -> Any:
         if sets[0].name == "slider_config:0":
             raise OSError("only old A offline")
-        return await write(device_id, peripheral_id, sets)
+        return await write(device_id, peripheral_id, sets, ticket=ticket)
 
     with monkeypatch.context() as patcher:
         patcher.setattr(rig.bus, "set_variables", fail_only_old)

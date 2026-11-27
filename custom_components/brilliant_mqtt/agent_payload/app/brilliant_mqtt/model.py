@@ -83,14 +83,44 @@ class Variable:
 class CaptureProvenance:
     """Adapter-local ordering for a native snapshot or write-issue boundary.
 
-    This is not a native revision or a physical timestamp. It only establishes
-    which captures happened before an issued write in one adapter generation.
+    Sequences order boundaries throughout one adapter incarnation; generation
+    fences reconnects. ``captured_at`` is monotonic read-start/push-capture time,
+    never a native variable timestamp. Defaults preserve wired/fake consumers.
     """
 
     source_generation: int
     sequence: int
     field_eras: tuple[tuple[str, int], ...] = ()
     issued_values: tuple[tuple[str, str], ...] = ()
+    incarnation: str = ""
+    origin: str = ""
+    captured_at: float = 0.0
+    completed_at: float | None = None
+
+
+@dataclass(frozen=True)
+class PrimitiveField:
+    """Frozen native scalar, shareable without materializing a Variable."""
+
+    name: str
+    value: str
+    externally_settable: bool = False
+    timestamp_ms: int | None = None
+
+
+@dataclass(frozen=True)
+class PrimitiveCapture:
+    """One peripheral's frozen fields and sanitized native reporting mask.
+
+    A partial mirror can contain copied fields: only ``reported``/``removed``
+    are evidence. A reliable complete read also proves omitted fields absent.
+    """
+
+    fields: tuple[PrimitiveField, ...]
+    complete: bool = True
+    reliable: bool = True
+    reported: frozenset[str] = frozenset()
+    removed: frozenset[str] = frozenset()
 
 
 @dataclass
@@ -109,6 +139,8 @@ class BrilliantDevice:
     capture_unknown: frozenset[str] = frozenset()
     # Notification-wide inventory, captured before per-peripheral callback delivery.
     capture_hardware_count: int | None = None
+    binding_dimmable: bool | None = None
+    binding_max_intensity: int | None = None
 
     # Deliberate asymmetry: is_on collapses an absent "on" variable to False (a load
     # without "on" is just off/uncontrollable), while motion_detected preserves None
@@ -123,7 +155,9 @@ class BrilliantDevice:
 
     @property
     def is_dimmable(self) -> bool:
-        """True iff an "intensity" variable is present."""
+        """Use validated binding capability, or legacy native intensity presence."""
+        if self.binding_dimmable is not None:
+            return self.binding_dimmable
         return "intensity" in self.variables
 
     @property
@@ -136,10 +170,17 @@ class BrilliantDevice:
 
     @property
     def max_intensity(self) -> int:
-        """Parsed "max_intensity_value"; defaults to 1000 when absent, unparseable, or <= 0.
+        """Validated binding scale, or parsed native "max_intensity_value".
 
-        Downstream milestones divide by this value, so non-positive values fall back too.
+        Absent, unparseable or non-positive values default to 1000; consumers divide by it.
         """
+        if self.binding_max_intensity is not None:
+            return (
+                self.binding_max_intensity
+                if not isinstance(self.binding_max_intensity, bool)
+                and self.binding_max_intensity > 0
+                else 1000
+            )
         var = self.variables.get("max_intensity_value")
         if var is None:
             return 1000

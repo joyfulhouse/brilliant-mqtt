@@ -1296,9 +1296,9 @@ async def test_reconnect_retires_preboundary_command_completion() -> None:
 
 
 async def test_mesh_primary_feedback_is_unchanged() -> None:
-    bus = FakeBus([_mesh_dimmer()])
-    mqtt = FakeMqtt()
     clock = FakeClock()
+    bus = FakeBus([_mesh_dimmer()], clock=clock)
+    mqtt = FakeMqtt()
     sleeper = FakeSleeper()
     bridge = Bridge(
         bus,
@@ -1355,4 +1355,8 @@ async def test_mesh_aux_echo_is_unchanged() -> None:
     assert state["enable_motion_score"] is True
     assert state["state"] == "OFF"
     assert "wired_write_status" not in state
-    assert bridge._devices[MESH_PID].variables["enable_motion_score"].timestamp_ms is None
+    registry = bridge.mesh_registry
+    assert registry is not None
+    owner = registry.current(MESH_PID)
+    assert owner is not None
+    assert owner.materialize(0).variables["enable_motion_score"].timestamp_ms is None

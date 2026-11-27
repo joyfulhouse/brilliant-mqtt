@@ -28,6 +28,7 @@ class _Message:
     topic: str
     payload: bytes
     retain: bool
+    mesh_owner: object | None = None
 
 
 class _Messages:
@@ -838,21 +839,24 @@ async def test_mesh_confirmation_never_blocks_the_command_lane() -> None:
         peripheral_type=27,
         variables={"on": Variable("on", "1")},
     )
-    bus = FakeBus([device])
+    clock = FakeClock()
+    bus = FakeBus([device], clock=clock)
     mqtt = FakeMqtt()
     sleeper = FakeSleeper()
-    bridge = Bridge(bus, mqtt, "mesh", clock=FakeClock(), sleep=sleeper)
+    bridge = Bridge(bus, mqtt, "mesh", clock=clock, sleep=sleeper)
     await bridge.reconcile()
     mqtt.published.clear()
 
     topic = "brilliant/mesh/mesh_light_1/set"
+    owner = bridge._resolve_mesh_owner(topic)
+    assert owner is not None
     adapter = object.__new__(AioMqttAdapter)
     adapter._client = cast(
         Any,
         _Client(
             [
-                _Message(topic, json.dumps({"state": "OFF"}).encode(), False),
-                _Message(topic, json.dumps({"state": "ON"}).encode(), False),
+                _Message(topic, json.dumps({"state": "OFF"}).encode(), False, owner),
+                _Message(topic, json.dumps({"state": "ON"}).encode(), False, owner),
             ]
         ),
     )

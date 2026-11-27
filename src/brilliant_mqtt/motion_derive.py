@@ -49,6 +49,10 @@ class MotionDeriver:
         # peripheral_id -> monotonic time of the last score >= threshold.
         self._last_hot: dict[str, float] = {}
 
+    @property
+    def hold_s(self) -> float:
+        return self._hold_s
+
     def apply(self, device: BrilliantDevice) -> BrilliantDevice:
         """Return *device* with ``movement_detected`` rewritten to the derived value.
 

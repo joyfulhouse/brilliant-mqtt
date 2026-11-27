@@ -44,10 +44,16 @@ bidirectional control.
 | `discovery.py` | HA MQTT-Discovery payloads + topic builders. | unit |
 | `commands.py` | Inbound MQTT command → bus variable-set translation. | unit |
 | `desired_state.py` | Operator desired-state store for the motion vars (`RECONCILED_VARS`) — in-memory + durable JSON under `/var`; feeds the bridge's drift re-assertion. | unit |
-| `motion_derive.py` | Score-derived motion for mesh loads: rewrites `movement_detected` from `motion_score` ≥ high-threshold with a hold window (the firmware latch never fires — poc-findings §8c). Applied by the bridge in every snapshot path. | unit |
+| `motion_derive.py` | `MotionDeriver` for nonmesh snapshots, separate from mesh-owned score history and wired-primary feedback. | unit |
 | `heartbeat.py` | Bus-liveness heartbeat: atomically stamps a tmpfs file after every successful `get_all()` so the independent `brilliant_bus_watchdog` package can detect a wedged bus session (see Data Flow). | unit |
 | `bridge.py` | Orchestrator: reconcile, change → state publish, command → bus, desired-state enforcement. | unit (fakes) |
 | `wired_feedback.py` | Pure reducer and renderer for wired-primary native observations, provisional requests, deadlines, and MQTT publication debt. | unit |
+| `mesh_settlement.py`, `mesh_settlement_types.py`, `mesh_settlement_render.py` | One synchronous owner per mesh peripheral: typed transitions, per-field native evidence, primary windows, auxiliary projections, motion history and demand-only rendering. | unit + adapter schedules |
+| `mesh_ingress.py`, `mesh_registry.py` | Primitive capture/inventory events and current owner lifetimes; acquisition, binding, generation and absence fences; bounded capacity admission and completion holds. | unit + adapter schedules |
+| `mesh_driver.py` | Owner effects, one timer and serialized state publication lane per peripheral; bounded child cancellation and terminal/ordinary debt. | unit + adapter schedules |
+| `mesh_routing.py` | Independent discovery/subscription/availability repair, serialized by topic and checked against current ownership. | adapter schedules |
+| `mesh_commands.py` | Translation/admission associations, synchronous latest-command folds, exact ticket settlement and auxiliary/maintenance projections; the owner retains all settlement state. | adapter + MQTT schedules |
+| `virtual_sliders.py` | Resident slider configuration and interactive modes; mesh eligibility is rechecked under the shared native lock, and recovery retries only deferred work. | unit + adapter schedules |
 | `mesh_leader.py` | Fleet-wide mesh leader election over MQTT (retained priority claim + heartbeat); gates the mesh bridge's publishes and writes. | unit |
 | `ha_control_protocol.py` | Versioned `brilliant/ha-control/v1` MQTT wire contract (shared verbatim with the HA integration): topic builders, canonical JSON encoding, strict payload validation. | unit |
 | `thrift_binary.py` | Bounded decoder for base64 Thrift `TBinaryProtocol` structs — no generated Thrift types, explicit read/growth budgets against untrusted input. | unit |
@@ -77,24 +83,35 @@ bidirectional control.
   The 20 s window starts at successful RPC completion and cannot be extended
   by replacements. See
   [wired-write-feedback.md](reference/wired-write-feedback.md). Mesh primaries
-  retain their separate behavior: state is held at `null` (HA `unknown`) until
-  the existing mesh resolver settles the write (issue #66).
+  use their own synchronous settlement owner: primary state stays `null`
+  (HA `unknown`) during the fixed 80-second confirmation window, with a
+  10-second maximum matching-evidence age and no early mirror confirmation.
+  Actual native acceptance, including late return after caller timeout, starts
+  a fresh window at that return. Native rejection fails; settled native
+  timeout/cancellation retains the original window and advances its evidence
+  fence. See [mesh-write-feedback.md](reference/mesh-write-feedback.md).
 - **Bus write path:** every write takes a per-bus-device `asyncio.Lock`
   (the panel's own CONTROL id, `ble_mesh`) so same-device writes serialize
-  and a newer command can never actuate before an older one still in flight;
+  and a newer native call cannot issue before an older one returns;
   reads (`get_all`/`get_device`/`get_peripheral`) never take it, so a stalled
   mesh write cannot freeze the hot poll. The 5 s caller deadline starts only
   once the lock is held (queue wait and RPC time are logged separately). At
   the deadline the caller gets `TimeoutError` but the closed-source RPC is
   **not cancelled**: it runs on detached, keeps its device lock until it
   settles, and logs its late completion or exception with the total latency
-  and receipt. A mesh primary that times out this way arms the normal
-  pending record (placeholder receipt), so HA shows `unknown` until an
-  observation settles it — the last snapshot is never republished as truth.
+  and receipt. The adapter stores and synchronously delivers the actual native
+  outcome before waking the caller or releasing its lock. Caller timeout
+  remains unresolved; it cannot overwrite that stored outcome. Mesh commands
+  carry the owner captured at MQTT ingress through coalescing and folding;
+  admission rechecks the same owner and live generation under the native lock.
+  Issued-worker abandonment is conservatively unconfirmed/unknown through
+  real physical completion and until later trusted primary evidence, without
+  rearming or canceling the RPC.
   Only a write still unresolved at the fixed 15 s hard cap latches the
   write-timeout flag, and the coordinator rebuilds the session on its next
-  tick; a single 5 s timeout no longer triggers a rebuild. No retry,
-  coalescing or batching happens at the bus layer (issue #72).
+  tick; a single 5 s timeout no longer triggers a rebuild. Existing admission
+  scheduling preserves interactive replacement, maintenance priority and
+  nonpreemption; this settlement path adds no native retries or polls.
 - **Availability:** `brilliant/<panel>/availability` with an MQTT LWT —
   `offline` the moment the agent dies; systemd restarts it; reconnect
   re-reconciles.
@@ -128,6 +145,35 @@ bidirectional control.
   entities regardless of which panel serves them. In-process this is a second
   `Bridge` instance (panel slug `mesh`) gated by an include predicate that
   checks leadership, fed by the same bus adapter subscribed to both devices.
+  The adapter captures primitive scoped fields synchronously before async
+  fan-out or routing awaits. Read-start provenance, reliable push masks and
+  per-field watermarks prevent delayed mirrors from refreshing evidence.
+  The registry admits topology before allocating an owner; compatibility
+  snapshots contain discovery metadata and materialized owner views, never a
+  second mesh state authority. Mesh motion history lives in that owner and
+  advances only from admitted score captures, using capture time; reconnect,
+  removal and withdrawal clear it. The separate `MotionDeriver` and wired
+  feedback consumers retain their nonmesh contracts.
+- **Mesh recovery and bounds:** one owner lane holds one current terminal
+  obligation and one replaceable ordinary render, with at most one worker and
+  one publish child. Revocation cancels obsolete work before transport handoff
+  and joins it with the existing bound; handed-off MQTT packets cannot be
+  retracted. Sink errors and noncooperative children latch fatal recovery for
+  the existing coordinator session rebuild. Capacity is separate: the shared
+  ceiling of 256 active/retired records disables mesh admission without
+  rebuilding healthy bus/MQTT sessions or interrupting wired service. An
+  existing fitting complete inventory permits recovery; availability stays
+  offline until current routes and initial state are repaired. Standby hot
+  polling adds no mesh read; existing full-reconcile extra-device scoping is
+  preserved. There are no added native reads, sockets or polling loops.
+  Authoritative absence fences first sighting even without an existing owner.
+  A capability replacement shadowed by newer fields starts unknown behind a
+  fresh binding boundary until later trusted evidence. Retirement publishes
+  and acknowledges its exact absence debt even when its bytes are unchanged.
+  Routing work indexes contain only current records: ordinary applied desires
+  reuse completed workers, and existing sweeps retry failed ownerless withdrawal
+  cleanup with live reappearance checks at membership issue. Skipped cleanup
+  retains its debt until a later existing repair trigger.
 - **Scene/mode bridge (opt-in):** when `SCENE_BRIDGE_ENABLED=1`, a
   `SceneBridge` runs on the *same* bus and MQTT sessions (no second adapter):
   it publishes the panel's scene/mode catalogs and execution events under
@@ -170,8 +216,10 @@ bidirectional control.
   by one `AUX_SPECS` table in `mapping.py` — the single source of truth for
   both discovery payloads and the shared state JSON, so the template ↔
   payload contract cannot drift.
-- **Resource-capped.** systemd `MemoryMax`/`CPUQuota`/`Nice` ensure a bridge
-  bug cannot degrade the panel's touchscreen UI.
+- **Resource-capped.** systemd `MemoryMax=96M`, `CPUQuota=20%` and `Nice=10`
+  constrain the bridge's impact on the panel UI. Off-device operation-count
+  tests establish bounded work; live CPU and physical response acceptance
+  remain outstanding under #225.
 - **HomeKit stays paired** as a fallback control path during and after
   migration.
 

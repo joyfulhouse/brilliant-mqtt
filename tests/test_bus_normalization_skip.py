@@ -122,8 +122,12 @@ class _Leader:
 
 
 def _mesh_state_publishes(mqtt: FakeMqtt) -> list[str]:
-    """Topics published under the mesh namespace (the gated data output)."""
-    return [topic for topic, _payload, _retain in mqtt.published if topic.startswith("brilliant/")]
+    """State topics published under the mesh namespace (the gated data output)."""
+    return [
+        topic
+        for topic, _payload, _retain in mqtt.published
+        if topic.startswith("brilliant/") and topic.endswith("/state")
+    ]
 
 
 class TestMeshStandbySkipsNormalization:
@@ -179,7 +183,7 @@ class TestLeadershipTransitionAdmitsFirstPush:
         mqtt = FakeMqtt()
         leader = _Leader(is_leader=False)
 
-        Bridge(
+        bridge = Bridge(
             adapter,
             mqtt,
             "mesh",
@@ -194,11 +198,14 @@ class TestLeadershipTransitionAdmitsFirstPush:
 
         # Leadership acquired: the VERY NEXT push must be admitted and delivered.
         leader.is_leader = True
+        assert bridge.mesh_registry is not None
+        bridge.mesh_registry.acquire()
         adapter._dispatch_raw_device(_raw_snapshot(_MESH_DEVICE_ID, "leader"))
         await asyncio.gather(*adapter._pending_tasks)
 
-        assert counters.normalizations == _N_PERIPHERALS
-        assert counters.variables == _N_PERIPHERALS * _N_VARIABLES
+        # Mesh ingress owns primitive fields; the bridge receives only metadata.
+        assert counters.normalizations == 0
+        assert counters.variables == 0
         assert len(_mesh_state_publishes(mqtt)) == _N_PERIPHERALS
 
 

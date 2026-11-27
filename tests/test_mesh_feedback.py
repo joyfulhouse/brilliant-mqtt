@@ -15,7 +15,16 @@ from brilliant_mqtt.bridge import Bridge
 from brilliant_mqtt.discovery import config_payload
 from brilliant_mqtt.mapping import entities_for, payload_fields
 from brilliant_mqtt.model import DeviceKind
-from tests.fakes import FakeBus, FakeClock, FakeMqtt, FakeSleeper
+from tests.fakes import (
+    FakeBus,
+    FakeClock,
+    FakeMqtt,
+    FakeSleeper,
+    _RawDevice,
+    _RawPeripheral,
+    _RawVariable,
+)
+from tests.mesh_regression_support import commands, owners, pending, publishers, timers
 from tests.test_bridge import (
     MESH_PID,
     MESH_SET_TOPIC,
@@ -145,7 +154,7 @@ async def test_arm_normalizes_request_and_never_renews_deadline() -> None:
     wall.now = 1000.0
     clock = FakeClock()
     sleeper = FakeSleeper()
-    bus = FakeBus([_mesh_dimmer_at("1")])
+    bus = FakeBus([_mesh_dimmer_at("1")], clock=clock)
     mqtt = FakeMqtt()
     bridge = Bridge(bus, mqtt, "mesh", clock=clock, wall_clock=wall, sleep=sleeper)
     await bridge.reconcile()
@@ -169,10 +178,11 @@ async def test_arm_normalizes_request_and_never_renews_deadline() -> None:
 
 @pytest.mark.parametrize("epoch", [float("nan"), float("inf"), -float("inf")])
 async def test_nonfinite_wall_clock_cannot_supply_a_confirmation_deadline(epoch: float) -> None:
-    bus = FakeBus([_mesh_dimmer_at("1")])
+    clock = FakeClock()
+    bus = FakeBus([_mesh_dimmer_at("1")], clock=clock)
     mqtt = FakeMqtt()
     sleeper = FakeSleeper()
-    bridge = Bridge(bus, mqtt, "mesh", wall_clock=lambda: epoch, sleep=sleeper)
+    bridge = Bridge(bus, mqtt, "mesh", clock=clock, wall_clock=lambda: epoch, sleep=sleeper)
     await bridge.reconcile()
     await mqtt.inject(MESH_SET_TOPIC, '{"state":"OFF"}')
     fields = json.loads(_mesh_states(mqtt)[-1][1])
@@ -238,13 +248,13 @@ async def test_feedback_publish_is_cancelled_and_joined(shutdown: bool) -> None:
     clock.advance(80.0)
     await sleeper.release_all()
     await asyncio.wait_for(mqtt.publish_started.wait(), 1)
-    publishers = list(bridge._mesh_feedback_tasks)
-    assert publishers
+    blocked_publishers = list(publishers(bridge))
+    assert blocked_publishers
     if shutdown:
         await bridge.shutdown_mesh_feedback()
     else:
         await bridge.withdraw()
-    assert all(task.done() for task in publishers)
+    assert all(task.done() for task in blocked_publishers)
     mqtt.release_publish.set()
     await asyncio.sleep(0)
     assert mqtt.published == []  # no terminal clear or shared offline
@@ -254,14 +264,15 @@ async def test_shutdown_fences_sleeping_resolver_without_sweeping_it() -> None:
     _bus, mqtt, bridge, clock, sleeper = _mesh_bridge([_mesh_dimmer_at("1")])
     await bridge.reconcile()
     await mqtt.inject(MESH_SET_TOPIC, '{"state":"OFF"}')
-    resolver = bridge._mesh_confirm_tasks[MESH_PID]
+    resolver = timers(bridge)[MESH_PID]
     await bridge.shutdown_mesh_feedback()
-    assert not resolver.done()  # pre-existing timer sweep remains out of scope
     mqtt.published.clear()
     clock.advance(80.0)
     await sleeper.release_all()
     assert resolver.done()
     assert mqtt.published == []
+    assert timers(bridge) == {}
+    assert publishers(bridge) == {}
 
 
 async def test_restart_replaces_retained_pending_with_unrelated_idle() -> None:
@@ -271,7 +282,7 @@ async def test_restart_replaces_retained_pending_with_unrelated_idle() -> None:
     replay = json.loads(_mesh_states(mqtt)[-1][1])
     assert replay["mesh_write_status"] == "pending"
     assert _render_status(replay, 1100.0) == "unconfirmed"
-    fresh = Bridge(bus, mqtt, "mesh")
+    fresh = Bridge(FakeBus([_mesh_dimmer_at("1")]), mqtt, "mesh")
     await fresh.reconcile()
     assert json.loads(_mesh_states(mqtt)[-1][1]) == _mesh_feedback_payload("ON")
     await bridge.withdraw()
@@ -304,9 +315,12 @@ async def test_contradiction_revokes_blocked_publish_with_same_generation() -> N
     mqtt.block_next_state_publish = True
     command = asyncio.create_task(mqtt.inject(MESH_SET_TOPIC, '{"state":"OFF"}'))
     await asyncio.wait_for(mqtt.publish_started.wait(), 1)
-    generation = bridge._mesh_write_generation[MESH_PID]
+    generation = commands(bridge)[MESH_PID]
+    blocked = list(publishers(bridge))
     await bus.emit(_mesh_dimmer_at("1"))
-    assert bridge._mesh_write_generation[MESH_PID] == generation
+    assert commands(bridge)[MESH_PID] == generation
+    assert not mqtt.release_publish.is_set()
+    assert blocked and all(task.cancelled() for task in blocked)
     mqtt.release_publish.set()
     await command
     assert [json.loads(p[1]) for p in _mesh_states(mqtt)] == [
@@ -357,12 +371,15 @@ async def test_terminal_publish_repairs_cancelled_pending_already_at_broker(conf
         assert mqtt.retained_state == _mesh_feedback_payload(None, "pending", {"on": "1"}, 1080.0)
         clock.advance(75.0)
         if confirm:
-            mqtt.pending_recorded.clear()
             observation = asyncio.create_task(bus.emit(_mesh_dimmer_at("1")))
-            await asyncio.wait_for(mqtt.pending_recorded.wait(), 1)
-        assert bridge._last_state_fields[MESH_PID] == expected
+            from tests.mesh_regression_support import turns
+
+            await turns()
+            assert dict(owners(bridge)[MESH_PID].view.evidence)["on"].captured_at == clock()
+        assert bridge.mesh_driver is not None
+        assert bridge.mesh_driver.published_fields(owners(bridge)[MESH_PID]) == expected
         published = len(_mesh_states(mqtt))
-        resolver = bridge._mesh_confirm_tasks[MESH_PID]
+        resolver = timers(bridge)[MESH_PID]
         clock.advance(5.0)
         await sleeper.release_all()
         await resolver
@@ -390,15 +407,30 @@ async def test_detached_rpc_outcome_cannot_settle_or_rearm_feedback(
     observer, adapter = _gated_adapter(
         fail_with=RuntimeError("synthetic late rejection") if late_error else None
     )
-    bus, mqtt, bridge, _clock, sleeper = _mesh_bridge([_mesh_dimmer_at("1")])
-    monkeypatch.setattr(bus, "set_variables", adapter.set_variables)
+    clock, sleeper = FakeClock(), FakeSleeper()
+    adapter._clock = clock
+    peripheral = _RawPeripheral("1")
+    peripheral.peripheral_type = 27
+    peripheral.variables["intensity"] = _RawVariable("600")
+    raw = _RawDevice("ble_mesh", {MESH_PID: peripheral})
+
+    async def get_device(device_id: str) -> _RawDevice:
+        return raw if device_id == "ble_mesh" else _RawDevice(device_id, {})
+
+    monkeypatch.setattr(observer, "get_device", get_device)
+    mqtt = FakeMqtt()
+    bridge = Bridge(
+        adapter, mqtt, "mesh", clock=clock, wall_clock=lambda: 1000 + clock(), sleep=sleeper
+    )
     try:
         await bridge.reconcile()
         await mqtt.inject(MESH_SET_TOPIC, '{"state":"OFF"}')
         assert json.loads(_mesh_states(mqtt)[-1][1]) == _mesh_feedback_payload(
             None, "pending", {"on": "0"}, 1080.0
         )
-        record = bridge._pending_mesh[MESH_PID]
+        record = pending(bridge)[MESH_PID]
+        old_window = record.view.window
+        clock.advance(10)
         (rpc,) = adapter._write_tasks
         assert not rpc.done()
         if revoke:
@@ -410,12 +442,28 @@ async def test_detached_rpc_outcome_cannot_settle_or_rearm_feedback(
                 await rpc
         else:
             assert await rpc == "'ok'"
-        assert mqtt.published == []
-        assert sleeper.requested == [80.0]
+        from tests.mesh_regression_support import turns
+
+        await turns()
         if revoke:
-            assert MESH_PID not in bridge._pending_mesh
+            assert mqtt.published == []
+            assert sleeper.requested == [80.0]
+            assert MESH_PID not in pending(bridge)
+            assert not timers(bridge)
+        elif late_error:
+            assert json.loads(_mesh_states(mqtt)[-1][1]) == _mesh_feedback_payload("ON", "failed")
+            assert sleeper.requested == [80.0]
+            assert not pending(bridge)
+            assert not timers(bridge)
         else:
-            assert bridge._pending_mesh[MESH_PID] is record
+            assert pending(bridge)[MESH_PID] is record
+            assert record.view.window is not old_window
+            assert record.view.receipt == "'ok'"
+            assert record.view.evidence == ()
+            assert sleeper.requested == [80.0, 80.0]
+            assert json.loads(_mesh_states(mqtt)[-1][1]) == _mesh_feedback_payload(
+                None, "pending", {"on": "0"}, 1090
+            )
     finally:
         await bridge.withdraw()
         await adapter.shutdown()
