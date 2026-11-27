@@ -255,6 +255,7 @@ class Bridge:
         self._devices: dict[str, BrilliantDevice] = {}
         # Only a filtered full reconcile refreshes or clears discovery firmware.
         self._discovery_sw_version: str | None = None
+        self._discovery_capture_order = (-1, -1)
         # Camera permission must not inherit discovery's intentionally unpruned cache.
         self._privacy_off = False
         self._privacy_source_generation = getattr(bus, "capture_generation", 0)
@@ -457,7 +458,9 @@ class Bridge:
             ):
                 descriptors = tuple(entities_for(owner.materialize(self._clock()), self._panel))
                 if self._mesh_descriptors.get(owner) != descriptors:
-                    await self._repair_mesh(owner.metadata.peripheral_id, force=False)
+                    await self._repair_mesh(
+                        owner.metadata.peripheral_id, force=False, changed_only=True
+                    )
                     continue
                 # A settled topic can retry without joining a sibling's live work.
                 tasks = []
@@ -574,7 +577,9 @@ class Bridge:
                 return membership is True
         return membership is False or membership is None and payload == ""
 
-    async def _repair_mesh(self, peripheral_id: str, *, force: bool) -> None:
+    async def _repair_mesh(
+        self, peripheral_id: str, *, force: bool, changed_only: bool = False
+    ) -> None:
         registry = self._mesh
         if registry is None:
             return
@@ -629,9 +634,22 @@ class Bridge:
                     )
                     self._mesh_route_owners.pop(topic, None)
                     self._by_cmd_topic.pop(topic, None)
+            # No-carrier shape repair joins changed topics and settled debt,
+            # leaving unchanged running/initial work at its existing boundary.
             tasks = [
                 self._mesh_routing.request(topic, target, force=force)
                 for topic, target in desired.items()
+                if not (
+                    changed_only
+                    and (existing := self._mesh_routing.records.get(topic)) is not None
+                    and existing.desired == target
+                    and (
+                        existing.worker is not None
+                        and not existing.worker.done()
+                        or existing.applied is None
+                        and not target.forget
+                    )
+                )
             ]
             for task in tasks:
                 await asyncio.shield(task)
@@ -916,16 +934,29 @@ class Bridge:
             return
         if self._mesh is not None:
             self._mesh.acquire()
+        # Empty/excluded HARDWARE results have no carrier. The existing adapter
+        # position before this read conservatively orders their clearing context.
+        capture_order = (self._bus.capture_generation, self._bus.capture_sequence)
         devices = [d for d in await self._bus.get_all() if self._included(d)]
         if not self._feedback_alive(lifecycle):
             return
         self._beat()
         # Refresh before broker awaits so ordinary poll/push repairs and online
         # readiness use the current filtered HARDWARE context, including absence.
-        sw_version = _sw_version_from(devices)
-        if self._discovery_sw_version != sw_version:
-            self._discovery_sw_version = sw_version
-            self._mesh_status_changed()
+        hardware = next((d for d in devices if d.kind is DeviceKind.HARDWARE), None)
+        if hardware is not None and hardware.capture_provenance is not None:
+            provenance = hardware.capture_provenance
+            capture_order = (provenance.source_generation, provenance.sequence)
+        if (
+            capture_order[0] == self._bus.capture_generation
+            and capture_order >= self._discovery_capture_order
+        ):
+            self._discovery_capture_order = capture_order
+            sw_version = _sw_version_from(devices)
+            if self._discovery_sw_version != sw_version:
+                self._discovery_sw_version = sw_version
+                self._mesh_status_changed()
+        sw_version = self._discovery_sw_version
         self._observe_privacy_snapshot(devices)
 
         # A broker await may admit a command or native push. Apply this captured
@@ -1112,6 +1143,7 @@ class Bridge:
         self._last_state_fields.clear()
         self._devices.clear()
         self._discovery_sw_version = None
+        self._discovery_capture_order = (-1, -1)
         if self._deriver is not None:
             self._deriver.clear()
         if self._panel == _MESH_PANEL:

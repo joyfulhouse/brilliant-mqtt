@@ -692,3 +692,38 @@ preserves 75 mapping rows, 16 baseline digests and 33 prior schedule groups.
 Evidence uses only `pr297-r3fix-specfix2-*`; prior artifacts, payload and
 versions remain unchanged. Spec/quality approval and shipping remain deferred
 to the controller.
+
+### Round Four Capacity, Omission And Firmware Ordering
+
+At frozen `33b8dc2fbc049ceca132ba681609df12b2e78b63`, seven typed permanent
+production schedules reproduce seven semantic failures on both source and
+unchanged payload before runtime edits. The final unchanged external probe
+adds three passing controls. Separate `pr297-r4fix-*` evidence preserves both
+RED baselines and the controller-authorized final probe hash; its earlier
+interim hash remains historical evidence.
+
+Capacity classification retains the winning inventory's read boundary. Once
+disabled admission is closed, retirement uses the existing adapter allocator's
+current lifecycle boundary so a binding born during that read also retires.
+A winning fitting read fenced from creation clears old readiness; an older
+inventory cannot demote a newer winner. Negative field merging stays intact.
+
+No-carrier descriptor repair uses the existing desired-topic path, awaiting
+changed topics and eligible settled debt while excluding unchanged running
+or never-applied initial work. Changes on the same topic still serialize
+behind its actual issued operation. Firmware context retains only the
+selected authoritative capture's existing generation/sequence. Empty or
+excluded HARDWARE results use the adapter position before the existing read
+as a conservative clearing boundary. Older reconciles use the accepted
+context rather than rolling it back; ordinary polls do not refresh firmware.
+No new sequence allocator, authority, read, poll or retry loop is introduced.
+
+`tests/test_mesh_round4_corrections.py` contributes 31 cases: the seven
+regressions, three external controls, both-scope firmware clearing races,
+poll/reconcile topic isolation and same-topic ordering, failed-initial
+isolation, and stale inventory readiness. Source validation passes 2,000
+affected cases across 69 files, preserving all 1,969 prior nodes; historical
+148 and 36 unchanged external cases pass. Root Ruff, format check and strict
+mypy pass. The preservation audit retains 75 mapping rows, 16 baseline
+digests and all 33 schedule groups. Payload rebuilding/parity, fresh internal
+reviews and shipping remain controller-owned; this is source completion only.

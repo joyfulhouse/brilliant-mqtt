@@ -228,6 +228,9 @@ class MeshRegistry:
                     self._disable(boundary)
                     return
             if not current or boundary.sequence < self.bus.mesh_creation_floor:
+                if current:
+                    self.inventory_ready = False
+                    self.changed()
                 # Readiness/creation may be fenced while independent field
                 # omissions still precede their own watermarks on known owners.
                 if ids is not None:
@@ -261,6 +264,8 @@ class MeshRegistry:
         self.inventory_ready = False
         logger.warning("MESH_CAPACITY_DISABLED count=%d", self.inventory_count)
         self.bus.revoke_mesh_waiting()
+        # The read orders capacity; disabling now must retire newer bindings too.
+        retirement = self.bus.reserve_mesh_boundary("capacity_disable")
         # Retired owners can publish their own unknown document and finish exact
         # cleanup while command/field admission remains closed.
         for pid, binding in tuple(self._bindings.items()):
@@ -269,7 +274,7 @@ class MeshRegistry:
             self._retired[pid] = owner
             self._release_native_listener(owner)
             self.revoked(owner)
-            self.dispatch(owner, RetireAbsent(self.envelope(owner, boundary)))
+            self.dispatch(owner, RetireAbsent(self.envelope(owner, retirement)))
             self.removed(owner)
         self.bus.advance_mesh_creation_floor(boundary)
         self.changed()
