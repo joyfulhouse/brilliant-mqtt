@@ -944,13 +944,17 @@ class Bridge:
         # Refresh before broker awaits so ordinary poll/push repairs and online
         # readiness use the current filtered HARDWARE context, including absence.
         hardware = next((d for d in devices if d.kind is DeviceKind.HARDWARE), None)
-        if hardware is not None and hardware.capture_provenance is not None:
-            provenance = hardware.capture_provenance
+        provenance = hardware.capture_provenance if hardware is not None else None
+        if provenance is not None:
             capture_order = (provenance.source_generation, provenance.sequence)
         if (
             capture_order[0] == self._bus.capture_generation
-            # A real read can tie a later absence's conservative fallback.
-            and capture_order > self._discovery_capture_order
+            # A fallback may follow the real read it ties; the reverse is stale.
+            and (
+                capture_order > self._discovery_capture_order
+                or provenance is None
+                and capture_order == self._discovery_capture_order
+            )
         ):
             self._discovery_capture_order = capture_order
             sw_version = _sw_version_from(devices)

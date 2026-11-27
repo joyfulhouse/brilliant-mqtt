@@ -760,3 +760,31 @@ The final Kimi round-four probe contributes four passing executions to that
 external selection, including its later F3 recovery assertion; its three
 findings overlap the corrected capacity/readiness/firmware areas. The frozen
 final report/probe hashes are preserved with the spec artifacts.
+
+### Panel-Only Absence Equality Recheck
+
+The spec recheck at `8127dde8cc5d40f10496221d9cdeded2eb7ea391` found that
+unconditional strict ordering delayed a sequential authoritative clear on a
+panel-only adapter with no mesh extra read. The pre-read fallback can equal
+the last completed real HARDWARE capture even though the absence read is later.
+Three typed permanent cases first reproduce semantic failures for absent
+HARDWARE, missing own parent and incomplete own parent. The unchanged external
+probe reproduces those three failures and three passing frozen-parent controls.
+
+Equality now admits an incoming fallback without HARDWARE provenance. An
+incoming real capture still requires strictly newer ordering, so an old real
+read cannot undo a tied accepted clear. The rule uses only existing returned
+carrier provenance and the current metadata pair; no stamp, side bit, state,
+counter, allocator, map, read or retry mechanism is added.
+
+The new `tests/test_mesh_round4_panel_firmware_corrections.py` contributes nine
+cases covering sequential clearing, both overlapping orderings, retained bridge
+and wired config bytes, later F3 restoration, and exact read/zero-write bounds.
+Source gates pass 218 focused, 2,037 affected across 71 files, historical 148,
+and 51 unchanged external executions. The last total includes all prior 45
+plus three current-method and three frozen-parent-method panel-only cases;
+it is not six new current-method cases. All 2,028 prior affected nodes remain.
+Root Ruff, format and strict mypy pass; 75 mapping rows, 16 baseline digests,
+33 schedule groups and prior hashes remain preserved. New evidence uses only
+`pr297-r4fix-specfix2-*`. Fresh spec/quality and payload/shipping gates remain
+controller-owned; this is source completion only.
