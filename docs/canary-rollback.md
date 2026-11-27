@@ -133,6 +133,120 @@ storage window. Until explicitly finalized, the baseline has no automatic expiry
 An in-flight execution journal prevents finalization. Uninstall
 also refuses to destroy a retained baseline; finalize intentionally first.
 
+## Changing a panel's network address with a retained baseline
+
+The current integration does not move a retained baseline when **Change network
+address** updates a panel subentry. The baseline keeps the address recorded at
+capture. Finalize and rollback require that address, the panel slug, and the
+pinned SSH identity to match the current panel configuration. This limitation is
+tracked in [issue #259](https://github.com/joyfulhouse/brilliant-mqtt/issues/259).
+The steps below are a manual workaround for the same physical panel with its
+existing HA panel subentry and unchanged pinned identity.
+
+Before either procedure, download fresh diagnostics. Require
+`provisioning.count: 0`, no `provisioning.storage_error`, and a readable full
+`provisioning.retained` list. Inspect **every retained row, including other
+panels**, before restoring network reachability, saving an address, or starting
+a canary action. If any row is `restore_requested` or `finalizing`, preserve the
+records and let that operation settle or follow
+[If recovery fails](#if-recovery-fails) first. `count: 0` alone does not rule out
+pending intent: those states can exist without an execution journal, and shared
+recovery can process another panel's pending finalization before the target
+panel's rollback. Unrelated panels' ordinary `soak` rows need no action.
+
+Separately require the target's named row to be `state: soak` or a previously
+verified `state: restored`. For `rollback_failed`, any other target state,
+unreadable diagnostics, or an active journal, preserve the records and follow
+recovery guidance before changing addresses or starting another action. A
+verified `restored` row needs finalization after sign-off, rather than another
+rollback. Do not switch a pending finalization to rollback.
+
+For both procedures, finalize accepts the current installation. Rolling back a
+first install with no prior agent removes the new agent and verifies its absence;
+it does not restore a running agent or produce a new `recovery_deployment_id`.
+
+### Before a planned address or DHCP change
+
+1. While the panel is still reachable at its recorded address, download
+   diagnostics and identify its baseline in `provisioning.retained` by `panel`
+   and `name`. Wait until the agreed canary observation and sign-off are complete.
+2. Settle that baseline using the existing actions above, with exactly one panel
+   target and the recorded transaction name: use
+   `brilliant_mqtt.canary_finalize` to accept the current installation, or
+   `brilliant_mqtt.canary_rollback` to restore the prior installation. A successful
+   rollback leaves a `restored` baseline; after reviewing the restored panel and
+   signing off, finalize it as well. Do not finalize a failed recovery.
+3. Download diagnostics again and confirm the transaction name no longer appears
+   in `provisioning.retained` and no execution journal remains
+   (`provisioning.count: 0`). Only then change the router/DHCP assignment. Once
+   the same panel is reachable at the new address, open its subentry under
+   Settings > Devices & services > Brilliant MQTT and choose **Change network
+   address**. Enter the new address; the flow verifies the existing pinned
+   identity before saving it. This flow updates HA's address setting; it does not
+   assign an address on the panel or router.
+
+### If the address already changed
+
+After a successful **Change network address**, an older retained baseline can
+still prevent both canary actions. The action error is exactly:
+
+```text
+canary_operation_failed: see docs/canary-rollback.md
+```
+
+A code-changing agent update that reaches the retained-baseline guard is refused
+with `baseline_retained_finalize_first`. Redeploying an identical bundle can
+return successfully before that guard; it does not settle the baseline. No update
+attempt is needed to recognize the address-change problem. The generic canary
+error can also have other causes; it does not establish an address mismatch on
+its own.
+
+Diagnostics show the current subentry address in
+`panels.<panel-id>.configuration.address`. The `provisioning.retained` list shows
+`name`, `panel`, `state`, and `recovery_deployment_id`, but **does not expose the
+retained baseline's host**. After this address change, the current address can
+therefore be the new one while the baseline internally still refers to the old
+one. Use your prior network records to identify the exact previous address;
+do not inspect or edit private storage to find it.
+
+1. Preserve the integration and panel subentry. Check the diagnostic count and
+   storage status, inspect all retained rows for pending intent on any panel,
+   and check the target's named state as described above before restoring network
+   reachability or changing the subentry. Pending intent can resume as soon as
+   the recorded host and matching HA owner become usable again.
+2. If the baseline recorded an IP address, use the router or DHCP reservation to
+   give the same physical panel that previous IP again. First confirm it is not
+   assigned to another device. If the baseline recorded a hostname, make that
+   exact hostname resolve from HA to the same panel at its current IP; reclaiming
+   the old numeric IP is unnecessary. If the subentry already uses that hostname
+   and it still resolves to the panel, a DHCP change alone does not create this
+   host-string mismatch. If the recorded host cannot be made reachable at this
+   panel, ask for help on #259.
+3. In the existing panel subentry, choose **Change network address** and enter
+   the exact previous address or hostname used at baseline capture. Even if HA
+   already has that address saved, the panel must be reachable there. If the
+   pinned identity check fails, stop and ask for help; do not use **Replace
+   physical panel** to bypass it.
+4. Run finalize or rollback using the single target and transaction name as
+   described above. If rolling back, wait for verified restoration, review the
+   result, and finalize only after sign-off. Confirm the retained name has gone
+   and `provisioning.count` is `0` before proceeding.
+5. If you temporarily restored an old IP, move the panel to the new address in
+   the router/DHCP configuration. Once the intended address or hostname reaches
+   the panel, use **Change network address** again to save it in the subentry.
+   No DHCP move is needed if the original hostname already reaches the panel
+   at the intended IP.
+
+Do not manually edit HA `.storage` files, rewrite the retained host, remove
+baseline artifacts, or delete/recreate the integration or panel subentry while a
+baseline is retained. If the recorded host is unreachable or unknown, the identity
+check fails, an action fails, or the retained record remains after finalization,
+preserve the records and request help on
+[#259](https://github.com/joyfulhouse/brilliant-mqtt/issues/259). Include the
+integration version, redacted diagnostics, exact error text, and the attempted
+step. Review diagnostics before sharing; do not attach private storage files.
+This procedure does not resolve #259's underlying address-change limitation.
+
 ## Storage, limits, and evidence
 
 - Release-link predecessors are verified and pinned in their existing immutable
