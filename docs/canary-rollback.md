@@ -143,6 +143,17 @@ tracked in [issue #259](https://github.com/joyfulhouse/brilliant-mqtt/issues/259
 The steps below are a manual workaround for the same physical panel with its
 existing HA panel subentry and unchanged pinned identity.
 
+Before either procedure, download fresh diagnostics. Require
+`provisioning.count: 0`, no `provisioning.storage_error`, and a readable named
+retained row in `state: soak` or a previously verified `state: restored`.
+`count: 0` alone does not rule out pending recovery: `restore_requested` and
+`finalizing` can exist without an execution journal and resume during
+reconciliation. For those states, `rollback_failed`, any other state, unreadable
+diagnostics, or an active journal, preserve the records and follow
+[If recovery fails](#if-recovery-fails) before changing addresses or starting
+another action. A verified `restored` row needs finalization after sign-off,
+rather than another rollback. Do not switch a pending finalization to rollback.
+
 ### Before a planned address or DHCP change
 
 1. While the panel is still reachable at its recorded address, download
@@ -154,6 +165,9 @@ existing HA panel subentry and unchanged pinned identity.
    `brilliant_mqtt.canary_rollback` to restore the prior installation. A successful
    rollback leaves a `restored` baseline; after reviewing the restored panel and
    signing off, finalize it as well. Do not finalize a failed recovery.
+   Rolling back a first install with no prior agent removes the new agent and
+   verifies its absence; it does not restore a running agent or produce a new
+   `recovery_deployment_id`. Finalize instead if accepting that new installation.
 3. Download diagnostics again and confirm the transaction name no longer appears
    in `provisioning.retained` and no execution journal remains
    (`provisioning.count: 0`). Only then change the router/DHCP assignment. Once
@@ -172,9 +186,12 @@ still prevent both canary actions. The action error is exactly:
 canary_operation_failed: see docs/canary-rollback.md
 ```
 
-An agent update is then refused with `baseline_retained_finalize_first`. Neither
-message means the baseline was finalized. The generic canary error can also have
-other causes; it does not establish an address mismatch on its own.
+A code-changing agent update that reaches the retained-baseline guard is refused
+with `baseline_retained_finalize_first`. Redeploying an identical bundle can
+return successfully before that guard; it does not settle the baseline. No update
+attempt is needed to recognize the address-change problem. The generic canary
+error can also have other causes; it does not establish an address mismatch on
+its own.
 
 Diagnostics show the current subentry address in
 `panels.<panel-id>.configuration.address`. The `provisioning.retained` list shows
@@ -184,14 +201,18 @@ therefore be the new one while the baseline internally still refers to the old
 one. Use your prior network records to identify the exact previous address;
 do not inspect or edit private storage to find it.
 
-1. Preserve the integration and panel subentry. If diagnostics show an active
-   execution journal (`provisioning.count` is not `0`), diagnostics cannot be read,
-   or recovery is already failing, stop and follow [If recovery fails](#if-recovery-fails)
-   before attempting this address workaround.
-2. Using the router or DHCP reservation, give the same physical panel its previous
-   address again. First confirm that address is not assigned to another device.
-   If the saved address was a hostname, restore its resolution to this panel too.
-   If you cannot restore the previous address, ask for help on #259.
+1. Preserve the integration and panel subentry. Check the diagnostic count,
+   storage status, and named retained state as described above before restoring
+   network reachability or changing the subentry. Pending intent can resume as
+   soon as the recorded host and matching HA owner become usable again.
+2. If the baseline recorded an IP address, use the router or DHCP reservation to
+   give the same physical panel that previous IP again. First confirm it is not
+   assigned to another device. If the baseline recorded a hostname, make that
+   exact hostname resolve from HA to the same panel at its current IP; reclaiming
+   the old numeric IP is unnecessary. If the subentry already uses that hostname
+   and it still resolves to the panel, a DHCP change alone does not create this
+   host-string mismatch. If the recorded host cannot be made reachable at this
+   panel, ask for help on #259.
 3. In the existing panel subentry, choose **Change network address** and enter
    the exact previous address or hostname used at baseline capture. Even if HA
    already has that address saved, the panel must be reachable there. If the
@@ -201,12 +222,15 @@ do not inspect or edit private storage to find it.
    described above. If rolling back, wait for verified restoration, review the
    result, and finalize only after sign-off. Confirm the retained name has gone
    and `provisioning.count` is `0` before proceeding.
-5. Move the panel to the new address in the router/DHCP configuration, then use
-   **Change network address** again to save that new address in the subentry.
+5. If you temporarily restored an old IP, move the panel to the new address in
+   the router/DHCP configuration. Once the intended address or hostname reaches
+   the panel, use **Change network address** again to save it in the subentry.
+   No DHCP move is needed if the original hostname already reaches the panel
+   at the intended IP.
 
 Do not manually edit HA `.storage` files, rewrite the retained host, remove
 baseline artifacts, or delete/recreate the integration or panel subentry while a
-baseline is retained. If the old address is unavailable or unknown, the identity
+baseline is retained. If the recorded host is unreachable or unknown, the identity
 check fails, an action fails, or the retained record remains after finalization,
 preserve the records and request help on
 [#259](https://github.com/joyfulhouse/brilliant-mqtt/issues/259). Include the

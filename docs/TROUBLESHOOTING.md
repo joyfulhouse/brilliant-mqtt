@@ -115,12 +115,14 @@ and seek maintainer assistance; preserve files, pins and recovery artifacts.
 ### Canary actions fail after a panel address change
 
 If **Change network address** succeeds but finalize or rollback reports
-`canary_operation_failed: see docs/canary-rollback.md` and an update is refused
-with `baseline_retained_finalize_first`, follow
+`canary_operation_failed: see docs/canary-rollback.md`, follow
 [Changing a panel's network address with a retained baseline](canary-rollback.md#changing-a-panels-network-address-with-a-retained-baseline).
-It covers settling the baseline before a planned DHCP change and temporarily
-restoring the previous address after a change. Preserve the integration and
-panel subentry; do not edit `.storage` or delete retained records by hand.
+It covers settling the baseline before a planned DHCP change and restoring
+reachability at the recorded host after a change. A code-changing update can
+also report `baseline_retained_finalize_first`; no update attempt is required.
+Check the retained state and journal before changing addresses. Preserve the
+integration and panel subentry; do not edit `.storage` or delete retained
+records by hand.
 
 ## Broker host and Add panel
 
