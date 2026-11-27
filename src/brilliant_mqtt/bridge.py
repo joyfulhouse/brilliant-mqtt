@@ -455,21 +455,36 @@ class Bridge:
                 owner in self._mesh_descriptors
                 or any(record.desired.owner is not self._mesh_routing for _, record in records)
             ):
-                if self._mesh_descriptors.get(owner) != tuple(
-                    entities_for(owner.materialize(self._clock()), self._panel)
-                ):
+                descriptors = tuple(entities_for(owner.materialize(self._clock()), self._panel))
+                if self._mesh_descriptors.get(owner) != descriptors:
                     await self._repair_mesh(owner.metadata.peripheral_id, force=False)
                     continue
                 # A settled topic can retry without joining a sibling's live work.
-                tasks = tuple(
-                    self._mesh_routing.request(topic, record.desired)
-                    for topic, record in records
-                    if record.desired.owner is owner
-                    and (record.worker is None or record.worker.done())
-                    and (record.applied is not None or record.desired.forget)
-                    and record.applied is not record.desired
-                    and record.desired.valid()
-                )
+                tasks = []
+                for topic, record in records:
+                    desired = record.desired
+                    if (
+                        desired.owner is not owner
+                        or (record.worker is not None and not record.worker.done())
+                        or (record.applied is None and not desired.forget)
+                        or record.applied is desired
+                    ):
+                        continue
+                    if desired.payload is not None and not desired.forget:
+                        # Firmware can change without changing descriptor shape.
+                        descriptor = next(
+                            (item for item in descriptors if config_topic(item) == topic), None
+                        )
+                        if descriptor is None:
+                            continue
+                        payload = config_payload(descriptor, sw_version=self._discovery_sw_version)
+                        desired = DesiredTopic(
+                            owner,
+                            partial(self._mesh_topic_current, owner, topic, payload=payload),
+                            payload=payload,
+                        )
+                    if desired.valid():
+                        tasks.append(self._mesh_routing.request(topic, desired))
                 for task in tasks:
                     await asyncio.shield(task)
         if self._panel == _MESH_PANEL:

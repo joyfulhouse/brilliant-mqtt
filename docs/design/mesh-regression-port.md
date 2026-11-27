@@ -665,3 +665,30 @@ the new audit again preserves 75 mapping rows, 16 baseline digests and 33 prior
 schedule groups. Separate `pr297-r3fix-specfix-*` evidence preserves all previous
 artifacts. Payload building/parity and spec then quality approval remain
 controller-owned; this correction makes no shipping-readiness claim.
+
+### Current Firmware For Selected Config Debt
+
+A subsequent spec probe found that firmware context could invalidate an
+existing config desire while descriptors stayed equal, leaving eligible debt
+unrepaired without a mesh carrier. Two permanent source cases reproduce that
+failure at `61058539ecbb035804f87cff29c100da51b89910`; the unchanged external
+probe also reports two failures and two passing parent-method controls.
+
+The selected-topic fallback now derives each eligible existing config desire
+from its current owner, matching descriptor and current firmware before
+requesting it. It retains request/child validity checks and the existing
+selection of settled debt. Running siblings, healthy topics, initial work and
+ownerless withdrawal keep their separate boundaries. No read, retry loop or
+additional authority is introduced.
+
+The new module `tests/test_mesh_round3_firmware_debt.py` covers both scopes,
+firmware update/removal/empty values, unchanged running children and healthy
+workers, and firmware changing again before actual child issue. Stale payloads
+stay unsent; the next existing trigger repairs current debt. All 16 new cases
+pass alongside 1,953 preserved prior affected nodes: 1,969 cases across 68 files.
+Focused controls pass 154 cases; historical 148 and 26 untouched external
+probes pass. Root Ruff, format check and strict mypy pass. The new audit again
+preserves 75 mapping rows, 16 baseline digests and 33 prior schedule groups.
+Evidence uses only `pr297-r3fix-specfix2-*`; prior artifacts, payload and
+versions remain unchanged. Spec/quality approval and shipping remain deferred
+to the controller.
