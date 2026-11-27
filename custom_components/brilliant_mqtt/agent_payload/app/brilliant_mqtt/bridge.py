@@ -13,6 +13,7 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
+from functools import partial
 from typing import cast
 
 from brilliant_mqtt import __version__
@@ -443,6 +444,16 @@ class Bridge:
         registry = self._mesh
         if registry is None or not registry.enabled or self._panel != _MESH_PANEL:
             return
+        # A negative inventory can merge fields on an owner whose newer
+        # existence kept it out of this batch's metadata carriers.
+        for owner in registry.owners:
+            if (
+                registry.live(owner)
+                and owner in self._mesh_descriptors
+                and self._mesh_descriptors[owner]
+                != tuple(entities_for(owner.materialize(self._clock()), self._panel))
+            ):
+                await self._repair_mesh(owner.metadata.peripheral_id, force=False)
         payload = "online" if self._mesh_online_ready() else "offline"
         await asyncio.shield(self._queue_mesh_availability(payload))
 
@@ -506,6 +517,29 @@ class Bridge:
             self._mesh is None or peripheral_id is None or self._mesh.current(peripheral_id) is None
         )
 
+    def _mesh_topic_current(
+        self,
+        owner: MeshSettlement,
+        topic: str,
+        *,
+        payload: str | None = None,
+        membership: bool | None = None,
+    ) -> bool:
+        registry = self._mesh
+        pid = owner.metadata.peripheral_id
+        if registry is None or registry.current(pid) is not owner or not registry.live(owner):
+            return False
+        # Check this owner's bounded current descriptors at the child issue
+        # boundary, including an absence selected before an intervening capture.
+        for descriptor in entities_for(owner.materialize(self._clock()), self._panel):
+            if config_topic(descriptor) == topic:
+                return membership is None and payload == config_payload(
+                    descriptor, sw_version=self._discovery_sw_version
+                )
+            if self._command_topic_for(pid, descriptor) == topic:
+                return membership is True
+        return membership is False or membership is None and payload == ""
+
     async def _repair_mesh(self, peripheral_id: str, *, force: bool) -> None:
         registry = self._mesh
         if registry is None:
@@ -523,30 +557,40 @@ class Bridge:
                 self._mesh_driver.wake(owner, force=force)
             desired: dict[str, DesiredTopic] = {}
 
-            def current(owner: MeshSettlement = owner) -> bool:
-                return registry.current(peripheral_id) is owner and registry.live(owner)
-
-            def current_config(sw_version: str | None = sw_version) -> bool:
-                return current() and self._discovery_sw_version == sw_version
-
             for descriptor in descriptors:
-                desired[config_topic(descriptor)] = DesiredTopic(
-                    owner, current_config, payload=config_payload(descriptor, sw_version=sw_version)
+                topic = config_topic(descriptor)
+                payload = config_payload(descriptor, sw_version=sw_version)
+                desired[topic] = DesiredTopic(
+                    owner,
+                    partial(self._mesh_topic_current, owner, topic, payload=payload),
+                    payload=payload,
                 )
-                topic = self._command_topic_for(peripheral_id, descriptor)
+                command = self._command_topic_for(peripheral_id, descriptor)
                 self._register_command_topic(peripheral_id, descriptor)
-                if topic is None:
+                if command is None:
                     continue
-                self._mesh_route_owners[topic] = owner
-                desired[topic] = DesiredTopic(owner, current, membership=True)
+                self._mesh_route_owners[command] = owner
+                desired[command] = DesiredTopic(
+                    owner,
+                    partial(self._mesh_topic_current, owner, command, membership=True),
+                    membership=True,
+                )
             for topic in self._mesh_routing.topics(peripheral_id):
                 record = self._mesh_routing.records[topic]
                 if topic not in desired:
+                    absent_payload = "" if record.desired.membership is None else None
+                    membership = False if record.desired.membership is not None else None
                     desired[topic] = DesiredTopic(
                         owner,
-                        current,
-                        payload="" if record.desired.membership is None else None,
-                        membership=False if record.desired.membership is not None else None,
+                        partial(
+                            self._mesh_topic_current,
+                            owner,
+                            topic,
+                            payload=absent_payload,
+                            membership=membership,
+                        ),
+                        payload=absent_payload,
+                        membership=membership,
                         forget=True,
                     )
                     self._mesh_route_owners.pop(topic, None)

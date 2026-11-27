@@ -562,3 +562,41 @@ proof preserves 4,040 captures, zero native normalization/Variable allocation,
 historical result, not a bound or a claim repeated by this run. HA static checks
 and all 798 affected payload-consumer cases pass before the deterministic build
 pair; the default-temp compatibility selection passes 293 cases.
+
+### Round-Two Inventory, Topic Issue And Publication Corrections
+
+The second independent review confirmed six further ordering/work-bound gaps.
+Permanent typed production-adapter schedules in
+`tests/test_mesh_round2_corrections.py` first produced eight semantic failures
+on unchanged `a11a8f7` source (`pr297-r2-permanent-red.log` in S9), before source
+edits. The expanded module has 19 passing cases, including true current 257th
+capacity disable and known-owner field eligibility controls.
+
+First sightings below the topology creation floor now return before capacity
+reservation or disable. Inventory below that floor cannot complete acquisition
+readiness or recover capacity; an existing trusted poll restores online
+readiness without another read. Rejected readiness/topology inventory still
+merges known-owner omissions at their original per-field sequences, preserving
+newer independent existence and unknown-primary barriers. The existing
+poll/reconcile availability sweep repairs changed previously requested
+owner descriptors even when the negative batch omitted their metadata carrier.
+The auxiliary MQTT schedule checks actual native write rejection.
+
+Current ownerless withdrawal retries wait for ordinary completion and retain
+errors as bounded unapplied debt; the one-second join remains for obsolete
+cancellation and teardown. Config payloads, present memberships and absent
+topic desires validate the individual owner's current descriptors inside the
+existing issue child. A skipped issue neither acknowledges nor forgets debt.
+Already-issued same-owner config and membership operations retain broker order
+before repair. State publication consults a derived index containing only real
+revoked children; actual child completion removes each entry. Healthy changed
+notifications at 10/40 owners enumerate no unrelated state lane and create
+exactly one publication child per change, with no topic-repair task. A blocked
+old-generation child still precedes its successor's publication.
+
+The focused affected selection passes 1,922 cases. The exact historical
+selection remains 148 passing nodes; the audit retains all 75 mapping rows,
+16 baseline digests and 33 prior schedule groups. New correction evidence is
+separate under `pr297-r2-*` in S9, and original reviewer probes and baseline
+artifacts remain unchanged. These off-device schedules establish ordering and
+bounded work, not physical responsiveness or the live i.MX6 CPU budget.

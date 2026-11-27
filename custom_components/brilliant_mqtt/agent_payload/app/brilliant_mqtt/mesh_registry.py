@@ -218,12 +218,21 @@ class MeshRegistry:
             if binding is not None:
                 self._absence(binding, boundary)
         elif isinstance(event, MeshInventory):
-            if boundary.sequence <= self._inventory_sequence:
+            ids = event.peripheral_ids
+            if (
+                boundary.sequence <= self._inventory_sequence
+                or boundary.sequence < self.bus.mesh_creation_floor
+            ):
+                # Readiness/creation may be fenced while independent field
+                # omissions still precede their own watermarks on known owners.
+                if ids is not None:
+                    for pid, binding in tuple(self._bindings.items()):
+                        if pid not in ids:
+                            self._absence(binding, boundary)
                 return
             self._inventory_sequence = boundary.sequence
             self.bus.advance_mesh_creation_floor(boundary)
             self.inventory_count = event.count or len(event.peripheral_ids or ())
-            ids = event.peripheral_ids
             if (
                 ids is None
                 or len(set(self._bindings) | set(self._retired) | self.retained_ids() | ids)
@@ -342,6 +351,8 @@ class MeshRegistry:
             return
         binding = self._bindings.get(pid)
         if binding is None:
+            if boundary.sequence < self.bus.mesh_creation_floor:
+                return
             records = set(self._bindings) | set(self._retired) | self.retained_ids()
             if pid not in records and len(records) >= MESH_RECORD_LIMIT:
                 self._disable(boundary)
@@ -349,8 +360,6 @@ class MeshRegistry:
         if binding is not None and (
             not self.live(binding.owner) or not binding.owner.accepts_capture(boundary)
         ):
-            return
-        if binding is None and boundary.sequence < self.bus.mesh_creation_floor:
             return
         metadata = self._metadata(event, binding)
         if binding is not None and boundary.sequence <= binding.metadata_sequence:

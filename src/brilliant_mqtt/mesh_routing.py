@@ -219,13 +219,15 @@ class MeshRouting:
 
     async def retry_withdrawn(self) -> None:
         """Retry only outstanding withdrawal work after current desires are repaired."""
-        await self.join(
-            tuple(
-                self.request(topic, self.records[topic].desired)
-                for topic in tuple(self._withdrawn)
-                if topic in self.records
-            )
+        tasks = tuple(
+            self.request(topic, self.records[topic].desired)
+            for topic in tuple(self._withdrawn)
+            if topic in self.records
         )
+        if tasks:
+            done, _ = await asyncio.wait(tasks)
+            for task in done:
+                self._retrieve(task)
 
     def withdraw(self, valid: Callable[[str | None], bool]) -> tuple[asyncio.Task[None], ...]:
         """Revoke shared publications immediately; only membership cleanup remains."""

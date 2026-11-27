@@ -56,6 +56,7 @@ class MeshDriver:
         self.registry, self.mqtt, self.panel = registry, mqtt, panel
         self.sleep = sleep
         self._lanes: dict[MeshSettlement, _Lane] = {}
+        self._revoked_children: dict[asyncio.Task[None], MeshSettlement] = {}
         self.cleanup: Callable[[MeshSettlement], Awaitable[None]] | None = None
         registry.effects = self.apply
 
@@ -129,6 +130,7 @@ class MeshDriver:
             self._lanes.pop(owner)
 
     def _child_done(self, owner: MeshSettlement, lane: _Lane, task: asyncio.Task[None]) -> None:
+        self._revoked_children.pop(task, None)
         self._retrieve(task)
         if (lane.worker is None or lane.worker.done()) and self._lanes.get(owner) is lane:
             lane.idle.set()
@@ -149,6 +151,7 @@ class MeshDriver:
         for effect in effects:
             if isinstance(effect, RevokeEffects):
                 if lane.child is not None and not lane.child.done():
+                    self._revoked_children[lane.child] = owner
                     lane.child.cancel()
                     lane.last_fields = None
                     if lane.worker is not None and not lane.revoking:
@@ -360,12 +363,11 @@ class MeshDriver:
     async def _join_obsolete_children(self, owner: MeshSettlement) -> bool:
         while self.registry.live(owner, publication=True):
             children = {
-                other_lane.child
-                for other, other_lane in self._lanes.items()
+                child
+                for child, other in self._revoked_children.items()
                 if other is not owner
                 and not self.registry.live(other, publication=True)
-                and other_lane.child is not None
-                and not other_lane.child.done()
+                and not child.done()
             }
             if not children:
                 return True
