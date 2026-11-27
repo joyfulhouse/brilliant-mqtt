@@ -112,6 +112,16 @@ sign-off. Turn off both watchdog switches, then use the supported
 removing agent files. If there is no HA panel owner, collect redacted diagnostics
 and seek maintainer assistance; preserve files, pins and recovery artifacts.
 
+### Canary actions fail after a panel address change
+
+If **Change network address** succeeds but finalize or rollback reports
+`canary_operation_failed: see docs/canary-rollback.md` and an update is refused
+with `baseline_retained_finalize_first`, follow
+[Changing a panel's network address with a retained baseline](canary-rollback.md#changing-a-panels-network-address-with-a-retained-baseline).
+It covers settling the baseline before a planned DHCP change and temporarily
+restoring the previous address after a change. Preserve the integration and
+panel subentry; do not edit `.storage` or delete retained records by hand.
+
 ## Broker host and Add panel
 
 Use the Home Assistant host's LAN IP, or a hostname the panel can resolve.
