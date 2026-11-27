@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import stat
 import sys
@@ -32,6 +33,57 @@ CORE_TREES = {
     "wifi_watchdog": ("wifi_watchdog/brilliant_wifi_watchdog",),
     "bus_watchdog": ("bus_watchdog/brilliant_bus_watchdog",),
 }
+_VERSION_PATTERN = re.compile(r"[0-9A-Za-z][0-9A-Za-z._+-]{0,127}")
+_IDENTITY_LAYOUTS = ("payload-identities", "component-identities")
+# Qualification policy travels with this helper, including when executed from stdin.
+# Pinned to deploy/{service}{,-release}.service and panel_ops.render_env; parity-tested.
+_STOCK_UNIT_DIGESTS = {
+    "bridge": (
+        "04e32ebf857c70bf06aa64efb0ba322937d96f15f686da20a7f52e8107d24e25",
+        "3d23b0fe139c815e47fd169760af1c3a1fd55a0e4a237fb760b0f34bdc0d356c",
+    ),
+    "wifi_watchdog": (
+        "29213506eccd36332feb07f64cd94df23e049eaceea6d8479625de3c4713a0ca",
+        "092054695b3d69d3fa1301a02cd60085dda69802294078b2bb3eda70445bdbd2",
+    ),
+    "bus_watchdog": (
+        "c919411e1f4960d4bebd50d9e35ac53c1b37bce2c106464ae1dda8f9105e7280",
+        "fcce7d35c953ea491f4417c13cd4ce12e219e314659600cc54b0cc353fd424f3",
+    ),
+}
+_STOCK_ENVIRONMENT_NAMES = frozenset(
+    {
+        "BRILLIANT_PANEL",
+        "BRILLIANT_DEPLOYMENT_ID",
+        "MQTT_HOST",
+        "MQTT_PORT",
+        "MQTT_USERNAME",
+        "MQTT_PASSWORD",
+        "MQTT_TLS_ENABLED",
+        "MQTT_TLS_CA_FILE",
+        "RETAINED_TOPICS_FILE",
+        "MESH_PRIORITY",
+        "SCENE_BRIDGE_ENABLED",
+        "HOT_POLL_SECONDS",
+        "RESYNC_SECONDS",
+        "LOG_LEVEL",
+    }
+)
+_SYSTEMD_SEARCH_PATHS = (
+    "etc/systemd/system.control",
+    "run/systemd/system.control",
+    "run/systemd/transient",
+    "run/systemd/generator.early",
+    "etc/systemd/system",
+    "etc/systemd/system.attached",
+    "run/systemd/system",
+    "run/systemd/system.attached",
+    "run/systemd/generator",
+    "usr/local/lib/systemd/system",
+    "usr/lib/systemd/system",
+    "lib/systemd/system",
+    "run/systemd/generator.late",
+)
 
 
 class ManifestError(RuntimeError):
@@ -375,7 +427,10 @@ def release_ordinal(root: Path) -> int | None:
     if not path.exists():
         return None
     _hash_required_path(path, "RELEASE_ORDINAL")
-    value = path.read_text(encoding="ascii").strip()
+    try:
+        value = path.read_text(encoding="ascii").strip()
+    except UnicodeDecodeError:
+        raise ManifestError("invalid release_ordinal") from None
     if re.fullmatch(r"[1-9][0-9]{0,15}", value) is None:
         raise ManifestError("invalid release_ordinal")
     return int(value)
@@ -410,7 +465,9 @@ def private_record(
     directory = root / ".release-identities"
     if not directory.exists() and value is None:
         return None
-    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if value is not None:
+        # Only a publish may create the store; reads never write.
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     directory_fd, _ = _open_directory_path(directory, "identity store")
     try:
         if stat.S_IMODE(os.fstat(directory_fd).st_mode) != 0o700:
@@ -454,12 +511,96 @@ def private_record(
         os.close(directory_fd)
 
 
+def _reject_unit_dropins(unit: Path) -> None:
+    """Do not claim effective selection without evaluating systemd overrides."""
+    names = [unit.name + ".d", "service.d"]
+    # systemd also applies type-wide and dash-prefix overrides to these services.
+    names.extend(
+        unit.stem[: index + 1] + ".service.d"
+        for index, character in enumerate(unit.stem)
+        if character == "-"
+    )
+    for name in names:
+        directory = unit.parent / name
+        if not os.path.lexists(directory):
+            continue
+        if directory.is_symlink() or not directory.is_dir():
+            raise ManifestError("unhandled installed unit drop-ins")
+        with os.scandir(directory) as entries:
+            if any(entry.name.endswith(".conf") for entry in entries):
+                raise ManifestError("unhandled installed unit drop-ins")
+
+
+def _unit_selects_release(unit: Path) -> bool:
+    """Require one layout in the service's code-bearing directives."""
+    directives: dict[str, list[str]] = {}
+    section = ""
+    pending = ""
+    for raw in unit.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+        line = pending + line
+        if line.endswith("\\"):
+            pending = line[:-1] + " "
+            continue
+        pending = ""
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1]
+            continue
+        key, separator, value = line.partition("=")
+        key, value = key.strip(), value.strip()
+        if section != "Service" or not separator:
+            continue
+        if key not in ("Environment", "WorkingDirectory", "ExecStart"):
+            continue
+        if not value or key == "WorkingDirectory":
+            directives[key] = []
+        if value:
+            directives.setdefault(key, []).append(value)
+    if pending:
+        raise ManifestError("ambiguous installed code selection")
+    layouts: set[bool] = set()
+    for key, values in directives.items():
+        for value in values:
+            try:
+                words = shlex.split(value)
+            except ValueError:
+                raise ManifestError("ambiguous installed code selection") from None
+            if key == "Environment":
+                words = [word.partition("=")[2] for word in words if word.startswith("PYTHONPATH=")]
+            for word in words:
+                for match in re.finditer(
+                    r"/var/brilliant-mqtt/(current/)?(?:app|vendor|wifi_watchdog|bus_watchdog)"
+                    r"(?=/|:|$)",
+                    word,
+                ):
+                    layouts.add(match.group(1) is not None)
+    if len(layouts) != 1:
+        raise ManifestError("ambiguous installed code selection")
+    return layouts.pop()
+
+
 def installed_identities(
     root: Path,
     unit_root: Path = Path("/etc/systemd/system"),
     env_path: Path = Path("/etc/brilliant-mqtt.env"),
+    *,
+    persist: bool = True,
+    components: list[str] | None = None,
 ) -> dict[str, dict[str, object] | None]:
-    """Hash the live selection and enroll legacy installs without claiming age."""
+    """Hash the live selection and enroll legacy installs without claiming age.
+
+    ``persist=False`` is the strictly read-only view used for qualification over
+    SSH: existing records are consulted but nothing is created, updated or made.
+    Only this view may limit its scan to selected components; mutating callers
+    always validate every core component.
+    """
+    if components is not None and persist:
+        raise ManifestError("component selection requires persist=False")
+    selected = list(CORE_TREES) if components is None else components
+    if any(component not in CORE_TREES for component in selected):
+        raise ManifestError("unknown installed component")
     selector = _panel_release_selector(root) if os.path.lexists(root / "current") else None
     output: dict[str, dict[str, object] | None] = {}
     deployment_id = None
@@ -470,21 +611,25 @@ def installed_identities(
                 if re.fullmatch(r"[0-9A-Za-z_-]{1,128}", deployment_id) is None:
                     raise ManifestError("invalid installed deployment identity")
     for component in CORE_TREES:
+        if component not in selected:
+            continue
         service = (
             "brilliant-mqtt"
             if component == "bridge"
             else "brilliant-" + component.replace("_", "-")
         )
         unit = unit_root / (service + ".service")
-        if not unit.exists():
+        # Installed drop-ins still apply when the base unit needs its staged fallback.
+        _reject_unit_dropins(unit)
+        if not os.path.lexists(unit):
             staged_directory = root / ("system" if component == "bridge" else component)
             unit = staged_directory / (service + ".service")
+            _reject_unit_dropins(unit)
         selected_release = selector is not None
-        if selector is not None and unit.exists():
-            unit_bytes = unit.read_bytes()
-            if b"/var/brilliant-mqtt/current/" not in unit_bytes:
-                # A surviving current link must not hide an already selected legacy unit.
-                selected_release = False
+        if os.path.lexists(unit):
+            selected_release = _unit_selects_release(unit)
+            if selected_release and selector is None:
+                raise ManifestError("installed release selector is missing")
         active_root = selector.active_root if selector is not None and selected_release else root
         digest = code_digest(active_root, component)
         if digest is None:
@@ -502,16 +647,23 @@ def installed_identities(
         if component != "bridge" and not selected_release and not version_path.exists():
             bridge = output.get("bridge")
             bridge_version = bridge.get("version") if bridge is not None else None
+            legacy_bridge = bridge is not None and bridge.get("layout") == "legacy_fixed"
+            if (
+                "bridge" not in selected
+                and selector is None
+                and any(os.path.lexists(root / tree) for tree in CORE_TREES["bridge"])
+                and (root / "VERSION").exists()
+            ):
+                bridge_version = (root / "VERSION").read_text().strip()
+                legacy_bridge = True
             match = (
                 re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", bridge_version)
-                if bridge is not None
-                and isinstance(bridge_version, str)
-                and bridge.get("layout") == "legacy_fixed"
+                if legacy_bridge and isinstance(bridge_version, str)
                 else None
             )
             if match is not None and tuple(int(part) for part in match.groups()) < (0, 11, 0):
                 version = match.group(0)
-        if re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z._+-]{0,127}", version) is None:
+        if _VERSION_PATTERN.fullmatch(version) is None:
             raise ManifestError("invalid installed version")
         identity: dict[str, object] = {
             "version": version,
@@ -525,7 +677,7 @@ def installed_identities(
             previous.get(key) == identity[key] for key in ("digest", "layout")
         ):
             identity["release_ordinal"] = previous.get("release_ordinal")
-        if previous != identity:
+        if persist and previous != identity:
             private_record(root, component, identity)
         output[component] = identity
     if selector is not None:
@@ -1029,13 +1181,221 @@ def _panel_release_manifest(
     return manifest
 
 
+def _candidate_version(root: Path) -> str:
+    try:
+        _hash_required_path(root / "VERSION", "VERSION")
+        version = (root / "VERSION").read_text(encoding="ascii").strip()
+    except (OSError, UnicodeDecodeError, ManifestError):
+        raise ManifestError("invalid candidate version") from None
+    if _VERSION_PATTERN.fullmatch(version) is None:
+        raise ManifestError("invalid candidate version")
+    return version
+
+
+def _payload_identities(root: Path, components: list[str]) -> list[str]:
+    ordinal = release_ordinal(root)
+    if ordinal is None:
+        raise ManifestError("payload release_ordinal is missing")
+    version = _candidate_version(root)
+    lines = []
+    for component in components:
+        digest = code_digest(root, component)
+        if digest is None:
+            raise ManifestError(f"payload component {component!r} is missing")
+        lines.append(f"{component}\t{version}\t{ordinal}\t{digest}")
+    return lines
+
+
+def _normalized_unit(text: str) -> str:
+    lines = []
+    for raw in text.split("\n"):
+        line = raw.strip(" \t\r")
+        if not line or line.startswith(("#", ";")):
+            continue
+        key, separator, value = line.partition("=")
+        lines.append(key.strip(" \t") + "=" + value.strip(" \t") if separator else line)
+    return "\n".join(lines)
+
+
+def _qualification_file(path: Path) -> str:
+    parent, _ = _open_directory_path(path.parent, "qualification source")
+    try:
+        descriptor = os.open(path.name, _FILE_FLAGS | os.O_NONBLOCK, dir_fd=parent)
+    finally:
+        os.close(parent)
+    with os.fdopen(descriptor, "r", encoding="utf-8") as source:
+        metadata = os.fstat(source.fileno())
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 65536:
+            raise ValueError("invalid qualification source")
+        text = source.read(65537)
+    if len(text) > 65536:
+        raise ValueError("invalid qualification source")
+    return text
+
+
+def _stock_environment(text: str) -> bool:
+    seen: set[str] = set()
+    for raw in text.split("\n"):
+        line = raw.strip(" \t\r")
+        if not line or line.startswith(("#", ";")):
+            continue
+        key, separator, value = line.partition("=")
+        key, value = key.strip(" \t"), value.strip(" \t")
+        if not separator or key not in _STOCK_ENVIRONMENT_NAMES or key in seen:
+            return False
+        seen.add(key)
+        # Accept the renderer's single-line quoted strings or simple bare values.
+        if (
+            re.fullmatch(r"""(?:"(?:[^"\\\x00-\x1f]|\\["\\])*"|[^\s"'\\\x00-\x1f]*)""", value)
+            is None
+        ):
+            return False
+    return True
+
+
+def _selection_unproven(
+    root: Path, component: str, unit_root: Path, env_path: Path | None
+) -> str | None:
+    """CLI-only proof; never infer effective systemd state from staged files."""
+    if unit_root.parts[-3:] != ("etc", "systemd", "system"):
+        return "systemd root unavailable"
+    filesystem = unit_root.parents[2]
+    service = (
+        "brilliant-mqtt" if component == "bridge" else "brilliant-" + component.replace("_", "-")
+    )
+    unit = unit_root / (service + ".service")
+    try:
+        for relative in _SYSTEMD_SEARCH_PATHS:
+            other = filesystem / relative / unit.name
+            _reject_unit_dropins(other)
+            if other != unit and os.path.lexists(other):
+                return "additional unit source"
+    except (OSError, ManifestError):
+        return "unit drop-ins"
+    if unit.is_symlink():
+        return "unit alias"
+    try:
+        fingerprint = hashlib.sha256(
+            _normalized_unit(_qualification_file(unit)).encode()
+        ).hexdigest()
+    except (OSError, ValueError, ManifestError):
+        return "unit unavailable"
+    templates = _STOCK_UNIT_DIGESTS[component]
+    if fingerprint not in templates:
+        return "unit template differs"
+    try:
+        selector = _panel_release_selector(root) if os.path.lexists(root / "current") else None
+    except (OSError, ValueError, ManifestError):
+        return "release selector unavailable"
+    if fingerprint == templates[1] and selector is None:
+        return "release selector unavailable"
+    # --env maps the one stock EnvironmentFile for disposable/off-device images.
+    if env_path is None or env_path == Path("/etc/brilliant-mqtt.env"):
+        env_path = filesystem / "etc/brilliant-mqtt.env"
+    try:
+        environment = _qualification_file(env_path)
+    except (OSError, ValueError, ManifestError):
+        return "environment unreadable"
+    return None if _stock_environment(environment) else "environment schema"
+
+
+def _component_identities(
+    root: Path,
+    components: list[str],
+    overrides: dict[str, Path],
+) -> list[str]:
+    if not os.path.isdir(root):
+        raise ManifestError("installed root is unavailable")
+    unit_root = overrides.get("unit_root", Path("/etc/systemd/system"))
+    reasons = {
+        component: _selection_unproven(root, component, unit_root, overrides.get("env_path"))
+        for component in components
+    }
+    proven = [component for component in components if reasons[component] is None]
+    scan_overrides = dict(overrides)
+    if (
+        unit_root.parts[-3:] == ("etc", "systemd", "system")
+        and unit_root.parents[2] != Path("/")
+        and overrides.get("env_path", Path("/etc/brilliant-mqtt.env"))
+        == Path("/etc/brilliant-mqtt.env")
+    ):
+        scan_overrides["env_path"] = unit_root.parents[2] / "etc/brilliant-mqtt.env"
+    try:
+        identities = (
+            installed_identities(root, persist=False, components=proven, **scan_overrides)
+            if proven
+            else {}
+        )
+    except (OSError, ValueError, RecursionError) as error:
+        # ValueError covers undecodable files and corrupt JSON identity records.
+        raise ManifestError(f"installed identity unreadable ({type(error).__name__})") from None
+    lines = []
+    for component in components:
+        reason = reasons[component]
+        if reason is not None:
+            lines.append(f"{component}\tunknown")
+            print(f"bundle-manifest: {component} selection unproven ({reason})", file=sys.stderr)
+            continue
+        identity = identities[component]
+        if identity is None:
+            lines.append(f"{component}\tmissing")
+            continue
+        ordinal = identity["release_ordinal"]
+        shown = str(ordinal) if type(ordinal) is int and ordinal > 0 else "unknown"
+        lines.append(
+            f"{component}\t{identity['version']}\t{shown}\t{identity['digest']}"
+            f"\t{identity['layout']}"
+        )
+    return lines
+
+
+def _identity_lines(
+    layout: str,
+    root: Path,
+    components: list[str] | None,
+    unit_root: Path | None,
+    env_path: Path | None,
+) -> list[str]:
+    if layout == "payload-identities" and (unit_root is not None or env_path is not None):
+        raise ManifestError("--unit-root and --env are valid only for component-identities")
+    if not components:
+        raise ManifestError(f"--component is required for {layout}")
+    seen: set[str] = set()
+    for component in components:
+        if component in seen:
+            raise ManifestError(f"duplicate --component {component!r}")
+        if component not in CORE_TREES:
+            raise ManifestError(f"unknown component {component!r}")
+        seen.add(component)
+    if layout == "payload-identities":
+        return _payload_identities(root, components)
+    overrides: dict[str, Path] = {}
+    if unit_root is not None:
+        overrides["unit_root"] = unit_root
+    if env_path is not None:
+        overrides["env_path"] = env_path
+    return _component_identities(root, components, overrides)
+
+
 def build_manifest(
     layout: str,
     root: Path,
     unit: Path | None = None,
     wifi_unit: Path | None = None,
     bus_unit: Path | None = None,
+    *,
+    components: list[str] | None = None,
+    unit_root: Path | None = None,
+    env_path: Path | None = None,
 ) -> list[str]:
+    if layout in _IDENTITY_LAYOUTS:
+        if any(value is not None for value in (unit, wifi_unit, bus_unit)):
+            raise ManifestError("unit arguments are valid only for panel-release")
+        return _identity_lines(layout, root, components, unit_root, env_path)
+    if any(value is not None for value in (components, unit_root, env_path)):
+        raise ManifestError(
+            "--component, --unit-root, and --env are valid only for identity layouts"
+        )
     if layout == "integration":
         if any(value is not None for value in (unit, wifi_unit, bus_unit)):
             raise ManifestError("unit arguments are valid only for panel-release")
@@ -1057,16 +1417,34 @@ def build_manifest(
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description=("Emit <logical-path><TAB><sha256> without file contents or host metadata.")
+        prog="bundle-manifest",
+        description=("Emit <logical-path><TAB><sha256> without file contents or host metadata."),
     )
     parser.add_argument(
         "layout",
-        choices=("integration", "payload-release", "panel-release"),
+        choices=("integration", "payload-release", "panel-release", *_IDENTITY_LAYOUTS),
     )
     parser.add_argument("root", type=Path)
     parser.add_argument("--unit", type=Path)
     parser.add_argument("--wifi-unit", type=Path)
     parser.add_argument("--bus-unit", type=Path)
+    parser.add_argument(
+        "--component",
+        action="append",
+        dest="components",
+        help="identity layouts: a core component to report (repeatable, ordered)",
+    )
+    parser.add_argument(
+        "--unit-root",
+        type=Path,
+        help="component-identities: systemd unit directory override",
+    )
+    parser.add_argument(
+        "--env",
+        type=Path,
+        dest="env_path",
+        help="component-identities: installed environment file override",
+    )
     return parser
 
 
@@ -1079,6 +1457,9 @@ def main(argv: list[str] | None = None) -> int:
             arguments.unit,
             arguments.wifi_unit,
             arguments.bus_unit,
+            components=arguments.components,
+            unit_root=arguments.unit_root,
+            env_path=arguments.env_path,
         )
     except ManifestError as error:
         print(f"bundle-manifest: {error}", file=sys.stderr)
