@@ -144,15 +144,26 @@ The steps below are a manual workaround for the same physical panel with its
 existing HA panel subentry and unchanged pinned identity.
 
 Before either procedure, download fresh diagnostics. Require
-`provisioning.count: 0`, no `provisioning.storage_error`, and a readable named
-retained row in `state: soak` or a previously verified `state: restored`.
-`count: 0` alone does not rule out pending recovery: `restore_requested` and
-`finalizing` can exist without an execution journal and resume during
-reconciliation. For those states, `rollback_failed`, any other state, unreadable
-diagnostics, or an active journal, preserve the records and follow
-[If recovery fails](#if-recovery-fails) before changing addresses or starting
-another action. A verified `restored` row needs finalization after sign-off,
-rather than another rollback. Do not switch a pending finalization to rollback.
+`provisioning.count: 0`, no `provisioning.storage_error`, and a readable full
+`provisioning.retained` list. Inspect **every retained row, including other
+panels**, before restoring network reachability, saving an address, or starting
+a canary action. If any row is `restore_requested` or `finalizing`, preserve the
+records and let that operation settle or follow
+[If recovery fails](#if-recovery-fails) first. `count: 0` alone does not rule out
+pending intent: those states can exist without an execution journal, and shared
+recovery can process another panel's pending finalization before the target
+panel's rollback. Unrelated panels' ordinary `soak` rows need no action.
+
+Separately require the target's named row to be `state: soak` or a previously
+verified `state: restored`. For `rollback_failed`, any other target state,
+unreadable diagnostics, or an active journal, preserve the records and follow
+recovery guidance before changing addresses or starting another action. A
+verified `restored` row needs finalization after sign-off, rather than another
+rollback. Do not switch a pending finalization to rollback.
+
+For both procedures, finalize accepts the current installation. Rolling back a
+first install with no prior agent removes the new agent and verifies its absence;
+it does not restore a running agent or produce a new `recovery_deployment_id`.
 
 ### Before a planned address or DHCP change
 
@@ -165,9 +176,6 @@ rather than another rollback. Do not switch a pending finalization to rollback.
    `brilliant_mqtt.canary_rollback` to restore the prior installation. A successful
    rollback leaves a `restored` baseline; after reviewing the restored panel and
    signing off, finalize it as well. Do not finalize a failed recovery.
-   Rolling back a first install with no prior agent removes the new agent and
-   verifies its absence; it does not restore a running agent or produce a new
-   `recovery_deployment_id`. Finalize instead if accepting that new installation.
 3. Download diagnostics again and confirm the transaction name no longer appears
    in `provisioning.retained` and no execution journal remains
    (`provisioning.count: 0`). Only then change the router/DHCP assignment. Once
@@ -201,10 +209,11 @@ therefore be the new one while the baseline internally still refers to the old
 one. Use your prior network records to identify the exact previous address;
 do not inspect or edit private storage to find it.
 
-1. Preserve the integration and panel subentry. Check the diagnostic count,
-   storage status, and named retained state as described above before restoring
-   network reachability or changing the subentry. Pending intent can resume as
-   soon as the recorded host and matching HA owner become usable again.
+1. Preserve the integration and panel subentry. Check the diagnostic count and
+   storage status, inspect all retained rows for pending intent on any panel,
+   and check the target's named state as described above before restoring network
+   reachability or changing the subentry. Pending intent can resume as soon as
+   the recorded host and matching HA owner become usable again.
 2. If the baseline recorded an IP address, use the router or DHCP reservation to
    give the same physical panel that previous IP again. First confirm it is not
    assigned to another device. If the baseline recorded a hostname, make that
