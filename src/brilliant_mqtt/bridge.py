@@ -448,27 +448,30 @@ class Bridge:
         # and ownerless withdrawal keep their existing repair boundaries.
         for owner in registry.owners:
             records = tuple(
-                self._mesh_routing.records[topic]
+                (topic, self._mesh_routing.records[topic])
                 for topic in self._mesh_routing.topics(owner.metadata.peripheral_id)
             )
-            if (
-                registry.live(owner)
-                and (
-                    owner in self._mesh_descriptors
-                    or any(record.desired.owner is not self._mesh_routing for record in records)
-                )
-                and (
-                    self._mesh_descriptors.get(owner)
-                    != tuple(entities_for(owner.materialize(self._clock()), self._panel))
-                    or any(
-                        (record.worker is None or record.worker.done())
-                        and (record.applied is not None or record.desired.forget)
-                        and record.applied is not record.desired
-                        for record in records
-                    )
-                )
+            if registry.live(owner) and (
+                owner in self._mesh_descriptors
+                or any(record.desired.owner is not self._mesh_routing for _, record in records)
             ):
-                await self._repair_mesh(owner.metadata.peripheral_id, force=False)
+                if self._mesh_descriptors.get(owner) != tuple(
+                    entities_for(owner.materialize(self._clock()), self._panel)
+                ):
+                    await self._repair_mesh(owner.metadata.peripheral_id, force=False)
+                    continue
+                # A settled topic can retry without joining a sibling's live work.
+                tasks = tuple(
+                    self._mesh_routing.request(topic, record.desired)
+                    for topic, record in records
+                    if record.desired.owner is owner
+                    and (record.worker is None or record.worker.done())
+                    and (record.applied is not None or record.desired.forget)
+                    and record.applied is not record.desired
+                    and record.desired.valid()
+                )
+                for task in tasks:
+                    await asyncio.shield(task)
         if self._panel == _MESH_PANEL:
             payload = "online" if self._mesh_online_ready() else "offline"
             await asyncio.shield(self._queue_mesh_availability(payload))

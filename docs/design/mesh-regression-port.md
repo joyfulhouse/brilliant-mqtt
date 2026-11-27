@@ -646,3 +646,22 @@ mapping rows, 16 baseline digests and 33 prior schedule groups. Logs/XML and
 exact command JSON remain separate under `pr297-r3fix-*` in S9, including
 intermediate failures and the interrupted initial affected run. Generated
 payload and versions remain unchanged in this source-only continuation.
+
+### Settled Topic Debt Spec Correction
+
+The subsequent spec review found that retrying settled debt through full
+peripheral repair still joined unrelated running topics. Four typed permanent
+cases in `tests/test_mesh_round3_debt_corrections.py` reproduce the failure at
+`9800d8c12b9087d128c9962e885cb81ef2445fbf` across both scopes and poll/reconcile.
+The fallback now requests and awaits only eligible settled indexed topic debt
+with the exact current owner and valid current desire. Descriptor/successor
+repair retains its existing full path; initial, running and ownerless work keep
+their existing boundaries. The blocked auxiliary child and healthy workers
+remain unchanged while the primary retry completes with two existing reads.
+
+Source validation passes 1,953 affected cases across 67 files, historical 148,
+and 22 unchanged external probes. Root Ruff, format check and strict mypy pass;
+the new audit again preserves 75 mapping rows, 16 baseline digests and 33 prior
+schedule groups. Separate `pr297-r3fix-specfix-*` evidence preserves all previous
+artifacts. Payload building/parity and spec then quality approval remain
+controller-owned; this correction makes no shipping-readiness claim.
